@@ -1,0 +1,91 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "persona.schema.json",
+  "title": "NATLClaw External Persona Manifest",
+  "description": "Standalone persona.json manifest for a persona developed in a 3rd-party repository. Place this file in the persona directory and point to the directory via personasPaths in the host mcp.json.",
+  "type": "object",
+  "required": ["description", "heartbeatTask"],
+  "additionalProperties": false,
+  "properties": {
+
+    "name": {
+      "description": "Persona identifier. Defaults to the directory name if omitted.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+
+    "description": {
+      "description": "Short human-readable label for the persona.",
+      "type": "string"
+    },
+
+    "instructions": {
+      "description": "Path to the markdown system-prompt file. Relative paths resolve from this persona.json's directory. Defaults to 'instructions.md'.",
+      "type": "string",
+      "default": "instructions.md"
+    },
+
+    "heartbeatTask": {
+      "description": "Prompt injected during the capture step. Required for second_brain and freeform; optional for steps.",
+      "type": "string"
+    },
+    "workflow": {
+      "description": "Heartbeat workflow mode. second_brain (default): structured JSON knowledge capture. freeform: free-form execution with tool use, plain-text note. steps: fully custom steps array.",
+      "type": "string",
+      "enum": ["second_brain", "freeform", "steps"],
+      "default": "second_brain"
+    },
+    "steps": {
+      "description": "Custom workflow steps (required when workflow=steps).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "prompt"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "prompt": { "type": "string", "description": "Use {prev} for previous step output, {brain} for brain summary." },
+          "storeToBrain": { "type": "boolean", "default": false }
+        }
+      }
+    },
+    "stepwise": {
+      "description": "When true (and workflow=steps), run exactly ONE step per heartbeat. Progress persists across cycles via agent state. Defaults to false (all steps run each heartbeat).",
+      "type": "boolean",
+      "default": false
+    },
+
+    "mcpServers": {
+      "description": "Names of MCP servers to attach. These must be defined in the host mcp.json mcpServers pool — the persona does not define servers itself.",
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true
+    },
+
+    "tools": {
+      "description": "Python tool configuration. Use 'file' for a local .py file (recommended for 3rd-party repos) or 'module' for an installed package.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "description": "Path to a .py file containing tool functions. Relative to this persona.json. Use this when the persona is not an installed Python package.",
+          "type": "string"
+        },
+        "module": {
+          "description": "Dotted Python module path (e.g. 'my_persona_pkg.tools'). The package must be installed in the agent's Python environment.",
+          "type": "string"
+        },
+        "functions": {
+          "description": "Specific function names to expose as tools. If omitted, all public functions in the file/module are used.",
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
+      },
+      "oneOf": [
+        { "required": ["file"] },
+        { "required": ["module"] }
+      ]
+    }
+  }
+}

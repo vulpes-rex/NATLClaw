@@ -1,0 +1,167 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "mcp.schema.json",
+  "title": "NATLClaw MCP + Persona Configuration",
+  "description": "Defines MCP server connections and external personas for the NATLClaw agent.",
+  "type": "object",
+  "required": ["personas"],
+  "additionalProperties": false,
+  "properties": {
+
+    "mcpServers": {
+      "description": "Shared pool of MCP server definitions, referenced by name from personas.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/mcpServer"
+      }
+    },
+
+    "personasPaths": {
+      "description": "Additional directories to scan for external persona.json manifests. Each entry can be an absolute path or a path relative to this mcp.json. Inline personas take precedence over external ones of the same name.",
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true
+    },
+
+    "personas": {
+      "description": "Persona definitions keyed by name. Each persona is an external personality the agent can adopt.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/persona"
+      },
+      "minProperties": 1
+    }
+  },
+
+  "$defs": {
+
+    "mcpServer": {
+      "description": "An MCP server connection — either a local stdio process or a remote HTTP endpoint.",
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "description": "Transport type: 'stdio' for a local process, 'http' for a remote endpoint.",
+          "type": "string",
+          "enum": ["stdio", "http"]
+        },
+        "command": {
+          "description": "Executable to spawn (required for stdio).",
+          "type": "string"
+        },
+        "args": {
+          "description": "Command-line arguments for the stdio process.",
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "env": {
+          "description": "Environment variables passed to the stdio process.",
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "default": {}
+        },
+        "url": {
+          "description": "Remote MCP server URL (required for http).",
+          "type": "string",
+          "format": "uri"
+        },
+        "headers": {
+          "description": "HTTP headers sent with requests (e.g. authorization).",
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "default": {}
+        },
+        "timeout": {
+          "description": "Connection timeout in seconds (converted to milliseconds internally). Default 30.",
+          "type": "integer",
+          "minimum": 1,
+          "default": 30
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "stdio" } } },
+          "then": { "required": ["command"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "http" } } },
+          "then": { "required": ["url"] }
+        }
+      ]
+    },
+
+    "persona": {
+      "description": "An externally-defined persona the agent can adopt at runtime.",
+      "type": "object",
+      "required": ["description", "instructions", "heartbeatTask"],
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "description": "Short human-readable label for the persona.",
+          "type": "string"
+        },
+        "instructions": {
+          "description": "Relative path to a markdown file containing the system prompt.",
+          "type": "string"
+        },
+        "heartbeatTask": {
+          "description": "Prompt injected during the capture step of each heartbeat cycle. Required for second_brain and freeform workflows; optional for steps workflow.",
+          "type": "string"
+        },
+        "workflow": {
+          "description": "Heartbeat workflow mode. second_brain (default): 4-step structured knowledge capture with JSON notes. freeform: 4-step free-form execution with tool use, plain-text brain note. steps: fully custom steps defined in the steps array.",
+          "type": "string",
+          "enum": ["second_brain", "freeform", "steps"],
+          "default": "second_brain"
+        },
+        "steps": {
+          "description": "Custom workflow steps (required when workflow=steps). Each step runs in sequence; {prev} in prompt is replaced with the previous step's output.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "prompt"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string", "description": "Step label used in logs." },
+              "prompt": { "type": "string", "description": "Prompt text. Use {prev} to inject previous step output, {brain} for brain summary." },
+              "storeToBrain": { "type": "boolean", "default": false, "description": "If true, the agent distils a brain note from this step's output." }
+            }
+          }
+        },
+        "stepwise": {
+          "description": "When true (and workflow=steps), run exactly ONE step per heartbeat cycle. Progress is tracked in agent state and persists across heartbeats. When false (default), all steps run in a single heartbeat.",
+          "type": "boolean",
+          "default": false
+        },
+        "mcpServers": {
+          "description": "Names of MCP servers from the top-level mcpServers pool to attach to this persona.",
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "tools": {
+          "description": "Python tool configuration.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "file": {
+              "description": "Path to a .py file relative to this mcp.json's directory (alternative to module).",
+              "type": "string"
+            },
+            "module": {
+              "description": "Dotted Python module path to import (e.g. 'personas.devops_engineer.tools').",
+              "type": "string"
+            },
+            "functions": {
+              "description": "Specific function names to load. If omitted, all public functions are imported.",
+              "type": "array",
+              "items": { "type": "string" },
+              "uniqueItems": true
+            }
+          }
+        }
+      }
+    }
+  }
+}

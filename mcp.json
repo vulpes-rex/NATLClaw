@@ -1,0 +1,127 @@
+{
+  "$schema": "./mcp.schema.json",
+
+  "mcpServers": {
+    "docker": {
+      "type":    "stdio",
+      "command": "docker",
+      "args":    ["mcp", "server"]
+    }
+  },
+
+  "personas": {
+
+    "default": {
+      "description":   "Autonomous second-brain knowledge agent",
+      "instructions":  "personas/default/instructions.md",
+      "workflow":      "second_brain",
+      "heartbeatTask": "Research one new insight about AI agents, autonomous systems, or knowledge management that is NOT already captured in the brain."
+    },
+
+    "react_site_builder": {
+      "description":   "Senior React/TypeScript developer building a multi-page portfolio site step by step",
+      "instructions":  "personas/react_developer/instructions.md",
+      "workflow":      "steps",
+      "stepwise":      true,
+      "tools": {
+        "module": "personas.react_developer.tools"
+      },
+      "steps": [
+        {
+          "name":   "plan",
+          "prompt": "You are a senior React/TypeScript developer. You will build a personal portfolio website in the workspace/react-portfolio/ directory across several sessions.\n\nThis is step 1: PLANNING.\n\nDesign a clean, dark-themed personal portfolio site with these sections: Hero (name 'Alex Chen', tagline, CTA), About (short bio), Skills (tech grid), Projects (3 cards), and Footer.\n\nOutput a complete plan including:\n1. Full directory structure under workspace/react-portfolio/\n2. Every component filename and its responsibility\n3. TypeScript interfaces needed (Project, Skill)\n4. Dependencies: React 18, TypeScript, Vite — no UI libraries\n5. CSS approach: single App.css with CSS variables\n\nBe precise — this plan drives the next 6 build steps.",
+          "storeToBrain": true
+        },
+        {
+          "name":   "scaffold",
+          "prompt": "You are a senior React/TypeScript developer building a portfolio site.\n\nStep 2: SCAFFOLD CONFIG FILES.\n\nPlan from previous step:\n{prev}\n\nUse write_source_file to create ALL of the following under workspace/react-portfolio/:\n- package.json  (name: react-portfolio, React 18, TypeScript, Vite)\n- vite.config.ts\n- tsconfig.json\n- tsconfig.node.json\n- index.html  (at root, NOT public/ — Vite requires this)\n\nWrite each file in full with correct content. Then use list_files on workspace/react-portfolio to verify all 5 files were created."
+        },
+        {
+          "name":   "entry_shell",
+          "prompt": "You are a senior React/TypeScript developer building a portfolio site.\n\nStep 3: ENTRY POINT AND APP SHELL.\n\nPrevious step output:\n{prev}\n\nFirst use list_files on workspace/react-portfolio to confirm the config files exist.\n\nThen use write_source_file to create:\n- workspace/react-portfolio/src/main.tsx  (React 18 createRoot)\n- workspace/react-portfolio/src/App.tsx   (shell with placeholder <section> divs for hero, about, skills, projects)\n- workspace/react-portfolio/src/types.ts  (Project interface: id, title, description, tags, githubUrl, liveUrl; Skill interface: name, level)\n- workspace/react-portfolio/src/index.css (CSS reset: *, box-sizing, body margin 0, font-family system-ui)\n\nWrite each file completely with correct TypeScript. Then use list_files on workspace/react-portfolio/src to verify."
+        },
+        {
+          "name":   "header_footer",
+          "prompt": "You are a senior React/TypeScript developer building a portfolio site.\n\nStep 4: HEADER AND FOOTER COMPONENTS.\n\nPrevious step output:\n{prev}\n\nUse read_source_file on workspace/react-portfolio/src/App.tsx to see the current shell.\n\nThen use write_source_file to create:\n- workspace/react-portfolio/src/components/Header.tsx  (sticky nav: logo 'AC', nav links that smooth-scroll to #about #skills #projects)\n- workspace/react-portfolio/src/components/Footer.tsx  (centered text: © {year} Alex Chen)\n\nAlso update workspace/react-portfolio/src/App.tsx to import Header and Footer and wrap the content with them.\n\nWrite each file completely. Use list_files on workspace/react-portfolio/src/components to verify the components directory was created."
+        },
+        {
+          "name":   "hero_about_skills",
+          "prompt": "You are a senior React/TypeScript developer building a portfolio site.\n\nStep 5: HERO, ABOUT, AND SKILLS SECTIONS.\n\nPrevious step output:\n{prev}\n\nUse read_source_file on workspace/react-portfolio/src/types.ts to check the Skill interface.\n\nThen use write_source_file to create:\n- workspace/react-portfolio/src/components/Hero.tsx    (full-height section: h1 'Alex Chen', subtitle 'Full Stack Developer', <a href='#projects'> CTA button)\n- workspace/react-portfolio/src/components/About.tsx   (section id='about': short bio + placeholder avatar div)\n- workspace/react-portfolio/src/components/Skills.tsx  (section id='skills': grid of 8 SkillCard items — React, TypeScript, Python, Node.js, Docker, Git, AWS, PostgreSQL — using the Skill type)\n\nUpdate workspace/react-portfolio/src/App.tsx to import and render Hero, About, Skills with correct section ids.\n\nWrite every file completely."
+        },
+        {
+          "name":   "projects",
+          "prompt": "You are a senior React/TypeScript developer building a portfolio site.\n\nStep 6: PROJECTS SECTION.\n\nPrevious step output:\n{prev}\n\nUse read_source_file on workspace/react-portfolio/src/types.ts to check the Project interface.\n\nThen use write_source_file to create:\n- workspace/react-portfolio/src/components/ProjectCard.tsx  (card with title, description, tags as badges, GitHub and Live links)\n- workspace/react-portfolio/src/components/Projects.tsx     (section id='projects': heading + grid of 3 hardcoded Project objects using the Project type)\n\nUpdate workspace/react-portfolio/src/App.tsx to import and render Projects.\n\nWrite every file completely."
+        },
+        {
+          "name":   "style_and_build",
+          "prompt": "You are a senior React/TypeScript developer building a portfolio site.\n\nStep 7: STYLING AND FINAL BUILD.\n\nPrevious step output:\n{prev}\n\nFirst use list_files on workspace/react-portfolio/src and workspace/react-portfolio/src/components to confirm all files exist.\n\nThen use write_source_file to write workspace/react-portfolio/src/App.css with full CSS:\n- CSS variables: --bg #0f172a, --surface #1e293b, --accent #38bdf8, --text #e2e8f0, --muted #94a3b8\n- body: background var(--bg), color var(--text)\n- Header: fixed top, backdrop-filter blur, border-bottom, flexbox nav\n- Hero: min-height 100vh, flex center, large h1, accent-colored button\n- About, Skills, Projects: section padding 80px 40px, max-width 1100px centered\n- Skills grid: display grid, auto-fill, minmax(130px,1fr), card with border-radius\n- Projects grid: 3 columns, card hover lift (transform translateY(-4px)), tags as inline badges\n- Footer: padding 24px, text-align center, color var(--muted)\n- Responsive: @media (max-width: 768px) single column, smaller type\n\nThen run this command exactly: cd workspace/react-portfolio && npm install && npm run build\n\nIf the build fails, use read_source_file to inspect the failing file(s), fix them with write_source_file, and re-run: cd workspace/react-portfolio && npm run build\n\nReport the final build status clearly.",
+          "storeToBrain": true
+        }
+      ]
+    },
+
+    "react_developer": {
+      "description":   "Senior React / TypeScript developer",
+      "instructions":  "personas/react_developer/instructions.md",
+      "workflow":      "steps",
+      "tools": {
+        "module": "personas.react_developer.tools"
+      },
+      "steps": [
+        {
+          "name":   "status_check",
+          "prompt": "You are a senior React/TypeScript developer. List all files in the workspace/ directory and give a 2-sentence summary of what you see."
+        },
+        {
+          "name":   "code_review",
+          "prompt": "Previous status:\n{prev}\n\nReview the React workspace for one concrete improvement — a missing pattern, accessibility issue, performance concern, or TypeScript gap. Use list_files and read_source_file to investigate. Describe the issue and how to fix it.",
+          "storeToBrain": true
+        },
+        {
+          "name":   "review",
+          "prompt": "Summarise this heartbeat cycle as a React developer:\n{prev}\n\nWrite 2-3 sentences on what was found and what to focus on next cycle."
+        }
+      ]
+    },
+
+    "project_manager": {
+      "description":   "Experienced project manager",
+      "instructions":  "personas/project_manager/instructions.md",
+      "workflow":      "freeform",
+      "heartbeatTask": "Review the current project task board using your tools. Identify overdue or at-risk items, suggest priority changes, and generate a brief status update.",
+      "tools": {
+        "module": "personas.project_manager.tools"
+      }
+    },
+
+    "researcher": {
+      "description":   "Research analyst",
+      "instructions":  "personas/researcher/instructions.md",
+      "workflow":      "second_brain",
+      "heartbeatTask": "Research one emerging topic in your domain of focus. Provide a structured summary with key findings, implications, and open questions. Capture it as a knowledge note."
+    },
+
+    "python_developer": {
+      "description":   "Senior Python developer",
+      "instructions":  "personas/python_developer/instructions.md",
+      "workflow":      "freeform",
+      "heartbeatTask": "Review the project workspace for Python files. Identify one code quality improvement, missing test, or refactor opportunity. Use your tools to inspect the codebase.",
+      "tools": {
+        "module":    "personas.python_developer.tools",
+        "functions": ["list_files", "read_source_file", "write_source_file", "run_shell_command"]
+      }
+    },
+
+    "devops_engineer": {
+      "description":   "DevOps / infrastructure engineer",
+      "instructions":  "personas/devops_engineer/instructions.md",
+      "workflow":      "freeform",
+      "heartbeatTask": "Check the local development environment for running containers, Docker health, and infrastructure status. Capture any operational insights.",
+      "mcpServers": ["docker"],
+      "tools": {
+        "module":    "personas.devops_engineer.tools",
+        "functions": ["list_files", "read_source_file", "run_shell_command"]
+      }
+    }
+  }
+}
