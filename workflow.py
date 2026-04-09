@@ -138,19 +138,24 @@ async def run_task_heartbeat(
     config: AppConfig,
     persona: Persona,
     task,
-) -> None:
+) -> list:
     """One heartbeat cycle dedicated to a task.
 
     Flow: plan → execute → check verdict → capture insight to brain.
 
     The *task* object is mutated in place (status, heartbeats_spent, etc.)
     and the caller is responsible for persisting it.
+
+    Returns a list of :class:`messaging.Message` objects generated during
+    this heartbeat (task completed, blocked, failed).  The caller is
+    responsible for appending them to the outbox and persisting.
     """
     from tasks import (
         advance_task, block_task, build_task_context,
         complete_task, fail_task, start_task,
     )
 
+    _outbox: list = []  # collects Message objects for the caller
     try:
         seen_fps: set[str] = set()
         start_task(task)
@@ -208,21 +213,34 @@ async def run_task_heartbeat(
             agent, "task_check", check_prompt, state, seen_fps=seen_fps,
         )
 
-        # Step 4: Apply verdict
+        # Step 4: Apply verdict and emit messages
+        from messaging import (
+            emit_task_blocked, emit_task_completed, emit_task_failed,
+        )
+
         verdict_upper = verdict.strip().upper()
         if verdict_upper.startswith("DONE"):
             # Extract deliverables from the verdict text
             deliverables = _extract_deliverables(verdict)
             complete_task(task, deliverables)
             logger.info("[task] Completed: %s (%d heartbeats)", task.title, task.heartbeats_spent + 1)
+            _outbox.append(emit_task_completed(
+                task, persona=persona.name, heartbeat=state.execution_count,
+            ))
         elif verdict_upper.startswith("BLOCKED:"):
             question = verdict.split(":", 1)[1].strip() if ":" in verdict else verdict
             block_task(task, question, state.execution_count)
             logger.info("[task] Blocked: %s — %s", task.title, question[:100])
+            _outbox.append(emit_task_blocked(
+                task, question, persona=persona.name, heartbeat=state.execution_count,
+            ))
         elif verdict_upper.startswith("FAILED:"):
             reason = verdict.split(":", 1)[1].strip() if ":" in verdict else verdict
             fail_task(task, reason)
             logger.info("[task] Failed: %s — %s", task.title, reason[:100])
+            _outbox.append(emit_task_failed(
+                task, reason, persona=persona.name, heartbeat=state.execution_count,
+            ))
         else:
             # CONTINUE or unrecognized → advance
             advance_task(task, execute_result[:300])
@@ -262,6 +280,8 @@ async def run_task_heartbeat(
         logger.error("Error in task heartbeat for '%s': %s", task.title, e)
         logger.debug("Task heartbeat error:", exc_info=True)
         advance_task(task, f"ERROR: {e}")
+
+    return _outbox
 
 
 def _extract_deliverables(verdict: str) -> list[str]:

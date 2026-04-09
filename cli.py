@@ -22,6 +22,12 @@ Usage
     python cli.py brain add "insight"    # Manually add a note
     python cli.py brain export           # Dump brain to markdown
     python cli.py brain lint             # Run health check
+    python cli.py inbox list                # Show unread messages
+    python cli.py inbox list -a            # Show all messages
+    python cli.py inbox show m1a2b3        # View message detail (marks read)
+    python cli.py inbox dismiss m1a2b3     # Dismiss a message
+    python cli.py inbox dismiss -a         # Dismiss all read messages
+    python cli.py inbox clear              # Clear all messages
     python cli.py task add "Fix the login bug" -p high   # Create a task
     python cli.py task list                # List all tasks
     python cli.py task list -s blocked     # List blocked tasks
@@ -658,6 +664,80 @@ def cmd_task_answer(args: argparse.Namespace, config: AppConfig) -> None:
     asyncio.run(_answer())
 
 
+def cmd_inbox_list(args: argparse.Namespace, config: AppConfig) -> None:
+    """List messages in the inbox."""
+    from messaging import format_inbox, get_unread, load_outbox
+
+    async def _list():
+        messages = await load_outbox(config.state_file)
+        show_all = getattr(args, "all", False)
+        if show_all:
+            print(format_inbox(messages, show_read=True))
+        else:
+            print(format_inbox(messages))
+        unread = get_unread(messages)
+        if unread:
+            needs_response = sum(1 for m in unread if m.requires_response)
+            print(f"\n{len(unread)} unread message(s)", end="")
+            if needs_response:
+                print(f", {needs_response} need response", end="")
+            print()
+
+    asyncio.run(_list())
+
+
+def cmd_inbox_show(args: argparse.Namespace, config: AppConfig) -> None:
+    """Show a message in detail and mark it as read."""
+    from messaging import find_message, format_message_detail, load_outbox, mark_read, save_outbox
+
+    async def _show():
+        messages = await load_outbox(config.state_file)
+        msg = find_message(messages, args.message_id)
+        if msg is None:
+            print(f"Message '{args.message_id}' not found.")
+            sys.exit(1)
+        mark_read(msg)
+        await save_outbox(messages, config.state_file)
+        print(format_message_detail(msg))
+
+    asyncio.run(_show())
+
+
+def cmd_inbox_dismiss(args: argparse.Namespace, config: AppConfig) -> None:
+    """Dismiss a message or all read messages."""
+    from messaging import dismiss_all_read, find_message, load_outbox, mark_dismissed, save_outbox
+
+    async def _dismiss():
+        messages = await load_outbox(config.state_file)
+        if getattr(args, "all", False):
+            count = dismiss_all_read(messages)
+            await save_outbox(messages, config.state_file)
+            print(f"Dismissed {count} read message(s).")
+        else:
+            msg = find_message(messages, args.message_id)
+            if msg is None:
+                print(f"Message '{args.message_id}' not found.")
+                sys.exit(1)
+            mark_dismissed(msg)
+            await save_outbox(messages, config.state_file)
+            print(f"Dismissed message {msg.id}.")
+
+    asyncio.run(_dismiss())
+
+
+def cmd_inbox_clear(args: argparse.Namespace, config: AppConfig) -> None:
+    """Clear all messages from the outbox."""
+    from messaging import load_outbox, save_outbox
+
+    async def _clear():
+        messages = await load_outbox(config.state_file)
+        count = len(messages)
+        await save_outbox([], config.state_file)
+        print(f"Cleared {count} message(s) from inbox.")
+
+    asyncio.run(_clear())
+
+
 def cmd_task_cancel(args: argparse.Namespace, config: AppConfig) -> None:
     """Cancel a task."""
     from tasks import cancel_task, find_task, load_tasks, save_tasks
@@ -1279,6 +1359,25 @@ def build_parser() -> argparse.ArgumentParser:
     code_p.add_argument("-y", "--yes", action="store_true",
                         help="Auto-continue without asking (non-interactive)")
 
+    # inbox — messaging
+    inbox_p = sub.add_parser("inbox", help="View agent messages and notifications")
+    inbox_sub = inbox_p.add_subparsers(dest="inbox_command")
+
+    inbox_list_p = inbox_sub.add_parser("list", help="List messages (default: unread only)")
+    inbox_list_p.add_argument("-a", "--all", action="store_true",
+                              help="Show all messages including dismissed")
+
+    inbox_show_p = inbox_sub.add_parser("show", help="Show a message in detail (marks as read)")
+    inbox_show_p.add_argument("message_id", help="Message ID to view")
+
+    inbox_dismiss_p = inbox_sub.add_parser("dismiss", help="Dismiss a message or all read messages")
+    inbox_dismiss_p.add_argument("message_id", nargs="?", default=None,
+                                 help="Message ID to dismiss (omit with --all)")
+    inbox_dismiss_p.add_argument("-a", "--all", action="store_true",
+                                 help="Dismiss all read messages")
+
+    inbox_sub.add_parser("clear", help="Clear all messages from inbox")
+
     # brain
     brain_p = sub.add_parser("brain", help="Brain management commands")
     brain_sub = brain_p.add_subparsers(dest="brain_command")
@@ -1403,6 +1502,12 @@ def main(argv: list[str] | None = None) -> None:
         "chat": cmd_chat,
         "brief": cmd_brief,
         "code": cmd_code,
+        "inbox": {
+            "list": cmd_inbox_list,
+            "show": cmd_inbox_show,
+            "dismiss": cmd_inbox_dismiss,
+            "clear": cmd_inbox_clear,
+        },
         "task": {
             "add": cmd_task_add,
             "list": cmd_task_list,

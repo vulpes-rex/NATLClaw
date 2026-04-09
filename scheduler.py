@@ -15,9 +15,19 @@ from metrics import MetricsStore
 from persona_loader import load_persona
 from second_brain import build_brain_summary, decay_stale_notes, load_brain, save_brain
 from state import AgentState, load_state, save_state
+from messaging import (
+    build_inbox_summary,
+    emit_alert,
+    emit_task_started,
+    emit_task_timed_out,
+    load_outbox,
+    prune_old_messages,
+    save_outbox,
+)
 from tasks import (
     assign_task,
     auto_timeout_tasks,
+    find_task,
     get_active_task,
     get_pending_tasks,
     load_tasks,
@@ -84,6 +94,8 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0) -> None:
     _save_brain = retry()(save_brain)
     _load_tasks = retry()(load_tasks)
     _save_tasks = retry()(save_tasks)
+    _load_outbox = retry()(load_outbox)
+    _save_outbox = retry()(save_outbox)
 
     # Point execution log DB next to the state file
     import os as _os
@@ -141,9 +153,18 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0) -> None:
         if expired_goals:
             logger.info("Auto-expired %d overdue goals: %s", len(expired_goals), expired_goals)
 
-        # ── Task queue management ─────────────────────────────────
+        # ── Outbox + task queue management ───────────────────────
+        outbox = await _load_outbox(config.state_file)
+        prune_old_messages(outbox)
+
         tasks = await _load_tasks(config.state_file)
         timed_out = auto_timeout_tasks(tasks)
+        for tid in timed_out:
+            t = find_task(tasks, tid)
+            if t:
+                outbox.append(emit_task_timed_out(
+                    t, persona=persona.name, heartbeat=state.execution_count,
+                ))
         if timed_out:
             logger.info("Auto-timed-out %d task(s): %s", len(timed_out), timed_out)
 
@@ -156,6 +177,9 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0) -> None:
                 active_task = pending[0]
                 assign_task(active_task, persona.name)
                 start_task(active_task)
+                outbox.append(emit_task_started(
+                    active_task, persona=persona.name, heartbeat=state.execution_count,
+                ))
                 logger.info(
                     "Picked up task %s: %s (priority=%s)",
                     active_task.id, active_task.title, active_task.priority,
@@ -218,13 +242,15 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0) -> None:
                 )
                 if config.provider == "copilot":
                     async with agent:
-                        await run_task_heartbeat(
+                        task_msgs = await run_task_heartbeat(
                             agent, state, brain, config, persona, active_task,
                         )
                 else:
-                    await run_task_heartbeat(
+                    task_msgs = await run_task_heartbeat(
                         agent, state, brain, config, persona, active_task,
                     )
+                if task_msgs:
+                    outbox.extend(task_msgs)
             elif config.provider == "copilot":
                 async with agent:
                     await run_heartbeat(agent, state, brain, config, persona)
@@ -267,6 +293,15 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0) -> None:
                 await _save_tasks(tasks, config.state_file)
             except Exception as e:
                 logger.error("Failed to save tasks after retries: %s", str(e))
+            try:
+                await _save_outbox(outbox, config.state_file)
+            except Exception as e:
+                logger.error("Failed to save outbox after retries: %s", str(e))
+
+        # Log inbox summary if there are unread messages
+        inbox_line = build_inbox_summary(outbox)
+        if inbox_line:
+            logger.info(inbox_line)
 
         # Adaptive interval: score productivity, scale sleep accordingly
         new_notes = len(brain.notes) - notes_before

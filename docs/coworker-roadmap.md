@@ -11,9 +11,10 @@
 | Move 1: Observe your work | **Done** | `workspace_observer` persona with git, diff, branch, TODO scanning, recently-modified tools. Event queue drain integrated. |
 | Move 2: File/Git event queue | **Done** | `event_watcher.py` — watchdog + polling fallback, NDJSON queue, git post-commit hook installer, 24h auto-prune, `natl watch start/stop/status` |
 | Move 3: Daily digest | **Done** | `daily_digest.py` — git log, task board, event queue, brain summary. `natl brief` CLI. First-run-of-day auto-detection in scheduler. |
-| Move 4: Background task queue | **Not started** | No `data/tasks.json`, no `natl task` commands, no task-aware scheduler |
-| Move 5: Coordinator mode | **Partially done** | Round-robin and all-at-once modes work in `workflow.py`. Missing: task dependency graph, inter-persona messaging, file locks (coordinator-mcp from CodeIntel would add this) |
-| Move 6: Richer context model | **Partially done** | Brain has note_type, status, confidence, evidence fields (brain-evolution Phase 1). No project registry or active-work tracking yet. |
+| Move 4: Background task queue | **Done** | `tasks.py` — full lifecycle (pending→completed/failed), cancel/retry, task-aware scheduler, `natl task add/list/status/answer/cancel/retry`, `run_task_heartbeat()` plan→execute→check→capture |
+| Move 5: Outbox + Notifications | **Done** | `messaging.py` — Message dataclass, outbox persistence, auto-emit on task completion/blocked/failed/started/timed-out, `natl inbox list/show/dismiss/clear`, scheduler wiring, inbox summary logging |
+| Move 6 (roadmap): Coordinator mode | **Partially done** | Round-robin and all-at-once modes work in `workflow.py`. Missing: task dependency graph, inter-persona messaging, file locks (coordinator-mcp from CodeIntel would add this) |
+| Move 7 (roadmap): Richer context model | **Partially done** | Brain has note_type, status, confidence, evidence fields (brain-evolution Phase 1). No project registry or active-work tracking yet. |
 
 **Other improvements completed (from improvements.md):**
 
@@ -233,9 +234,9 @@ These depend on the foundation above being solid:
 
 | Phase | Move | Scope | Depends On | Est. Effort |
 |---|---|---|---|---|
-| **Next** | #4 — Task queue + delegation | Task dataclass, scheduler, CLI | Nothing | 3-4 days |
-| **Then** | #5 — Outbox + notifications | Messaging, inbox CLI, OS toast | Move 4 | 2-3 days |
-| **Then** | #6 — Event-driven scheduler | asyncio.wait_for, priority queue | Moves 4-5 | 2-3 days |
+| **Done** | #4 — Task queue + delegation | Task dataclass, scheduler, CLI | Nothing | 3-4 days |
+| **Done** | #5 — Outbox + notifications | Messaging, inbox CLI, scheduler wiring | Move 4 | 2-3 days |
+| **Next** | #6 — Event-driven scheduler | asyncio.wait_for, priority queue | Moves 4-5 | 2-3 days |
 | **After** | #7 — Project context model | Auto-detect, active-work tracking | Moves 1-3 (done) | 2-3 days |
 | **After** | #8 — Coordinator-MCP | Task board orchestration, file locks | Move 4 | 3-5 days |
 | **Later** | Semantic search | Embedding index, relevance retrieval | Brain SQLite migration | 2-3 days |
