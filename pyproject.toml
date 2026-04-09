@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "natlclaw"
+version = "0.1.0"
+description = "NATLClaw - Autonomous Second-Brain Agent"
+readme = "README.md"
+authors = [{name = "Your Name"}]
+license = {file = "LICENSE"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+keywords = ["agent", "second-brain", "automation", "memory", "learning"]
+requires-python = ">=3.8"
+dependencies = [
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+natl = "cli:main"
+
+[project.urls]
+"Homepage" = "https://github.com/yourusername/natlclaw"
+"Documentation" = "https://github.com/yourusername/natlclaw#readme"
+"Issues" = "https://github.com/yourusername/natlclaw/issues"
+
+[tool.setuptools]
+py-modules = [
+    "cli", "config", "agent_setup", "workflow", "scheduler",
+    "second_brain", "state", "learning", "persona_loader",
+    "prompts", "goals", "ingest", "metrics", "dump_brain",
+    "copilot_auth", "event_watcher", "daily_digest",
+]
+include-package-data = true

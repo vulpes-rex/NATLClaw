@@ -6,6 +6,14 @@
       "type":    "stdio",
       "command": "docker",
       "args":    ["mcp", "server"]
+    },
+    "codenav": {
+      "type":    "stdio",
+      "command": "node",
+      "args":    ["C:/Users/kvwul/source/repos/CodeIntel/src/codenav-mcp/dist/index.js"],
+      "env": {
+        "CODENAV_GRAMMARS_DIR": "C:/Users/kvwul/source/repos/CodeIntel/src/codenav-mcp/grammars"
+      }
     }
   },
 
@@ -105,6 +113,7 @@
       "description":   "Senior Python developer",
       "instructions":  "personas/python_developer/instructions.md",
       "workflow":      "freeform",
+      "promptDir":     "coding_agent",
       "heartbeatTask": "Review the project workspace for Python files. Identify one code quality improvement, missing test, or refactor opportunity. Use your tools to inspect the codebase.",
       "tools": {
         "module":    "personas.python_developer.tools",
@@ -122,6 +131,69 @@
         "module":    "personas.devops_engineer.tools",
         "functions": ["list_files", "read_source_file", "run_shell_command"]
       }
+    },
+
+    "workspace_observer": {
+      "description":   "Background agent that observes your actual workspace activity and captures work insights",
+      "instructions":  "personas/workspace_observer/instructions.md",
+      "workflow":      "steps",
+      "stepwise":      false,
+      "mcpServers":    ["codenav"],
+      "tools": {
+        "module": "personas.workspace_observer.tools"
+      },
+      "consolidation": { "interval": 10, "threshold": 15 },
+      "steps": [
+        {
+          "name":   "gather",
+          "prompt": "You are a workspace observer. Gather signals about what the user is working on.\n\n1. Use drain_events to check for pending file/git events.\n2. Use read_git_log (last 5 commits) to see recent activity.\n3. Use read_git_branch to see the current branch context.\n4. Use list_recently_modified to spot files the user touched recently.\n\nSummarise what you see in 3-5 bullet points: what is the user actively working on? What changed? What branch are they on?",
+          "storeToBrain": false
+        },
+        {
+          "name":   "analyse",
+          "prompt": "Based on what you just gathered:\n{prev}\n\nAnd the current brain knowledge:\n{brain}\n\nDig deeper into the most interesting signal:\n- If files changed, use read_git_diff to see the actual changes.\n- If there are TODOs, use scan_todos to find action items.\n\nIdentify ONE concrete, specific insight about the user's current work. This must reference specific files, commits, or code.\n\nReturn as JSON:\n{\"content\": \"1-3 sentence insight about what the user is doing and why\", \"tags\": [\"tag1\", \"tag2\"], \"category\": \"resources\"}",
+          "storeToBrain": true
+        },
+        {
+          "name":   "connect",
+          "prompt": "Review these recent brain notes:\n{brain}\n\nLook for a pattern in the user's work:\n- Are they focused on one area or scattered?\n- Is there a recurring file or module they keep touching?\n- Have they been working on the same feature across multiple commits?\n\nIf you see a meaningful pattern, return as JSON:\n{\"from\": \"<id>\", \"to\": \"<id>\", \"reason\": \"...\"}\n\nIf there is no meaningful connection yet, return: {\"skip\": true}",
+          "storeToBrain": false
+        }
+      ]
+    },
+
+    "codebase_learner": {
+      "description":   "Background agent that learns codebase patterns, architecture, and conventions",
+      "instructions":  "personas/codebase_learner/instructions.md",
+      "workflow":      "steps",
+      "stepwise":      false,
+      "mcpServers":    ["codenav"],
+      "tools": {
+        "module": "personas.codebase_learner.tools"
+      },
+      "consolidation": { "interval": 10, "threshold": 15 },
+      "steps": [
+        {
+          "name":   "ingest",
+          "prompt": "You are a codebase learning agent. Gather observations about the target codebase.\n\nFirst, check for pending events using drain_events.\nThen, read the recent git log using read_git_log.\n\nIf this is the first heartbeat (no prior brain knowledge), use the codenav tools to get an initial picture:\n- Use list_files to discover the project file tree\n- Use get_file_structure on 2-3 key source files to understand the code layout\n\nSummarise what you observed in 3-5 bullet points. Focus on: what changed recently, what the project structure looks like, and what language/frameworks are used.",
+          "storeToBrain": false
+        },
+        {
+          "name":   "analyse",
+          "prompt": "Based on the observations you just gathered:\n{prev}\n\nAnd the current brain knowledge:\n{brain}\n\nUse codenav tools to investigate deeper:\n- Use get_symbols to find classes and functions in files that changed\n- Use get_call_graph on key functions to understand dependencies\n- Use find_references to check if a pattern you noticed appears in multiple files\n\nIdentify ONE of the following:\n1. A recurring code pattern (appears in 2+ files)\n2. An architectural insight (how modules depend on each other)\n3. A coding convention (naming, error handling, import style)\n4. A dependency relationship (which modules call which)\n\nReturn as JSON:\n{\"note_type\": \"pattern|convention|architecture|dependency\", \"content\": \"2-3 sentence description\", \"evidence\": [\"file paths or symbol names\"], \"tags\": [\"tag1\", \"tag2\"], \"category\": \"resources\"}",
+          "storeToBrain": true
+        },
+        {
+          "name":   "connect",
+          "prompt": "Review these recent brain notes:\n{brain}\n\nFind ONE meaningful connection between any two notes. For example:\n- A pattern that supports an architectural decision\n- A convention that is consistently applied across a dependency chain\n- Two modules that share a common pattern but aren't directly connected\n\nReturn as JSON: {\"from\": \"<id>\", \"to\": \"<id>\", \"reason\": \"...\"}",
+          "storeToBrain": false
+        },
+        {
+          "name":   "context_export",
+          "prompt": "Generate a CODEBASE_CONTEXT.md file from the current brain state.\n\n{brain}\n\nThe file should contain these sections:\n1. ## Architecture — 3-5 bullet points on project structure and key modules\n2. ## Patterns — recurring code patterns with file references\n3. ## Conventions — coding style rules with examples\n4. ## Dependencies — key module relationships (which calls/imports which)\n\nKeep it under 150 lines. Be specific — include file paths and symbol names.\nWrite it using the write_context_file tool.",
+          "storeToBrain": false
+        }
+      ]
     }
   }
 }
