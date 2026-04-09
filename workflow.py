@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timezone
 
 from config import AppConfig
+from execution_log import append_entry as _log_entry
 from goals import build_goals_block
 from learning import extract_lessons
 from prompts import load_prompt
@@ -62,14 +63,8 @@ async def _run_step(
         logger.error("[%s] Failed to execute step: %s", step_name, str(e))
         logger.debug("Step execution error details:", exc_info=True)
         text = f"ERROR: Step failed - {str(e)}"
-        # Still record the error in history
-        now = datetime.now(timezone.utc).isoformat()
-        state.execution_history.append({
-            "timestamp": now,
-            "step": step_name,
-            "prompt": prompt[:300],
-            "response": text[:500],
-        })
+        # Still record the error in execution log (full text)
+        _log_entry(step_name, prompt, text)
         raise  # Re-raise after logging for higher-level handling
 
     elapsed = time.monotonic() - start
@@ -77,13 +72,7 @@ async def _run_step(
     logger.info("[%s] completed in %.1fs", step_name, elapsed)
     logger.info("[%s] response: %s", step_name, text[:200])
 
-    now = datetime.now(timezone.utc).isoformat()
-    state.execution_history.append({
-        "timestamp": now,
-        "step": step_name,
-        "prompt": prompt[:300],
-        "response": text[:500],
-    })
+    _log_entry(step_name, prompt, text)
 
     try:
         lessons = extract_lessons(

@@ -19,6 +19,15 @@ from config import AppConfig
 from state import AgentState
 from second_brain import BrainState
 from workflow import _run_step
+from execution_log import set_db_path, recent_entries, total_count, clear_log
+
+
+@pytest.fixture(autouse=True)
+def _use_temp_db(tmp_path):
+    """Point the execution log at a per-test temp DB."""
+    set_db_path(str(tmp_path / "execution_log.db"))
+    yield
+    clear_log()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -87,13 +96,14 @@ class TestPersonaToolsLoadedAndCallable:
     @pytest.mark.asyncio
     async def test_workflow_step_can_invoke_tool_and_record_history(self):
         """Simulate a workflow step whose response references a tool result,
-        then verify state.execution_history records it."""
+        then verify execution log records it."""
         agent = _make_agent("Tool result: files listed successfully")
         state = AgentState()
         result = await _run_step(agent, "tool_invocation", "List project files", state)
         assert "files listed" in result
-        assert len(state.execution_history) == 1
-        assert state.execution_history[0]["step"] == "tool_invocation"
+        log_entries = recent_entries(100)
+        assert len(log_entries) == 1
+        assert log_entries[0]["step"] == "tool_invocation"
 
 
 # ──────────────────────────────────────────────────────────────────────

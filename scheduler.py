@@ -8,6 +8,7 @@ from typing import Callable, TypeVar, cast
 
 from agent_setup import create_agent
 from config import AppConfig
+from execution_log import set_db_path as _set_log_db_path
 from goals import auto_expire_goals, build_goals_block
 from learning import build_context_block
 from metrics import MetricsStore
@@ -72,6 +73,10 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0) -> None:
     _load_brain = retry()(load_brain)
     _save_state = retry()(save_state)
     _save_brain = retry()(save_brain)
+
+    # Point execution log DB next to the state file
+    import os as _os
+    _set_log_db_path(_os.path.join(_os.path.dirname(config.state_file), "execution_log.db"))
 
     persona = load_persona(config.persona)
     logger.info(

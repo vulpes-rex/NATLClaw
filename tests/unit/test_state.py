@@ -58,29 +58,31 @@ def test_agent_state_dataclass():
 
 def test_load_state_file_exists():
     """Test loading state from existing file."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-        json.dump({
-            "last_heartbeat": "2024-01-01T00:00:00Z",
-            "execution_count": 42,
-            "memory": {"key": "value"},
-            "context": {"some": "data"},
-            "execution_history": [{"timestamp": "2024-01-01T00:00:00Z", "step": "test", "prompt": "test", "response": "test"}],
-            "lessons_learned": [{"description": "Test lesson", "category": "insight"}]
-        }, f, indent=2)
-        state_file = f.name
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_file = os.path.join(tmpdir, "state.json")
+        with open(state_file, "w") as f:
+            json.dump({
+                "last_heartbeat": "2024-01-01T00:00:00Z",
+                "execution_count": 42,
+                "memory": {"key": "value"},
+                "context": {"some": "data"},
+                "execution_history": [{"timestamp": "2024-01-01T00:00:00Z", "step": "test", "prompt": "test", "response": "test"}],
+                "lessons_learned": [{"description": "Test lesson", "category": "insight"}]
+            }, f, indent=2)
 
-    try:
+        from execution_log import set_db_path, total_count
+        set_db_path(os.path.join(tmpdir, "execution_log.db"))
+
         state = _run(load_state(state_file))
         assert state.last_heartbeat == "2024-01-01T00:00:00Z"
         assert state.execution_count == 42
         assert state.memory == {"key": "value"}
         assert state.context == {"some": "data"}
-        assert len(state.execution_history) == 1
-        assert state.execution_history[0]["step"] == "test"
+        # execution_history migrated to SQLite — state field is empty
+        assert state.execution_history == []
+        assert total_count() == 1
         assert len(state.lessons_learned) == 1
         assert state.lessons_learned[0]["description"] == "Test lesson"
-    finally:
-        os.remove(state_file)
 
 
 def test_load_state_file_not_exists():
@@ -147,15 +149,17 @@ def test_save_state_creates_parent_directories():
 
 
 def test_save_state_history_truncation():
-    """Test that save_state truncates history to max_history."""
+    """Test that save_state truncates lessons_learned to max_history.
+
+    execution_history is now in SQLite and no longer stored in the JSON.
+    """
     state = AgentState(
         last_heartbeat="2024-01-01T00:00:00Z",
         execution_count=0,
-        execution_history=[{"timestamp": "2024-01-01T00:00:00Z", "step": f"step_{i}", "prompt": f"prompt_{i}", "response": f"response_{i}"} for i in range(150)],
+        execution_history=[],
         lessons_learned=[{"description": f"Lesson {i}", "category": "insight"} for i in range(150)]
     )
 
-    assert len(state.execution_history) == 150
     assert len(state.lessons_learned) == 150
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -164,18 +168,17 @@ def test_save_state_history_truncation():
 
         # Reload and check truncation
         loaded_state = _run(load_state(state_file))
-        assert len(loaded_state.execution_history) == 100
+        assert loaded_state.execution_history == [], "execution_history should be empty in JSON"
         assert len(loaded_state.lessons_learned) == 100
 
 
 def test_save_state_default_max_history():
-    """Test that save_state uses default max_history of 100."""
+    """Test that save_state uses default max_history of 100 for lessons."""
     state = AgentState(
-        execution_history=[{"timestamp": "2024-01-01T00:00:00Z", "step": f"step_{i}", "prompt": f"prompt_{i}", "response": f"response_{i}"} for i in range(150)],
+        execution_history=[],
         lessons_learned=[{"description": f"Lesson {i}", "category": "insight"} for i in range(150)]
     )
 
-    assert len(state.execution_history) == 150
     assert len(state.lessons_learned) == 150
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -183,7 +186,7 @@ def test_save_state_default_max_history():
         _run(save_state(state, state_file))
 
         loaded_state = _run(load_state(state_file))
-        assert len(loaded_state.execution_history) == 100
+        assert loaded_state.execution_history == [], "execution_history should be empty in JSON"
         assert len(loaded_state.lessons_learned) == 100
 
 
@@ -271,24 +274,28 @@ def test_agent_state_copy():
 
 
 def test_load_state_with_large_history():
-    """Test loading state with very large history (performance)."""
+    """Test loading state with very large history migrates to SQLite."""
     large_history = [{"timestamp": "2024-01-01T00:00:00Z", "step": f"step_{i}", "prompt": "x"*1000, "response": "y"*1000} for i in range(10000)]
 
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-        json.dump({
-            "last_heartbeat": "2024-01-01T00:00:00Z",
-            "execution_count": 1000,
-            "execution_history": large_history,
-            "lessons_learned": []
-        }, f, indent=2)
-        state_file = f.name
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_file = os.path.join(tmpdir, "state.json")
+        with open(state_file, "w") as f:
+            json.dump({
+                "last_heartbeat": "2024-01-01T00:00:00Z",
+                "execution_count": 1000,
+                "execution_history": large_history,
+                "lessons_learned": []
+            }, f, indent=2)
 
-    try:
+        from execution_log import set_db_path, total_count
+        set_db_path(os.path.join(tmpdir, "execution_log.db"))
+
         state = _run(load_state(state_file))
-        assert len(state.execution_history) == 10000
+        # execution_history is empty in state (migrated to SQLite)
+        assert state.execution_history == []
         assert state.execution_count == 1000
-    finally:
-        os.remove(state_file)
+        # Entries were migrated to SQLite
+        assert total_count() == 10000
 
 
 def test_save_state_with_large_data():

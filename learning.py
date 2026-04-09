@@ -18,6 +18,7 @@ import json
 import logging
 from datetime import datetime, timezone
 
+from execution_log import recent_entries as _recent_log_entries
 from state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -322,8 +323,8 @@ def build_context_block(state: AgentState, max_recent: int = 5) -> str:
                 f"bonus={cal.get('confidence_bonus', 0)}"
             )
 
-    # Recent activity
-    recent_activity = state.execution_history[-max_recent:]
+    # Recent activity (from SQLite execution log)
+    recent_activity = _recent_log_entries(max_recent)
     if recent_activity:
         lines.append("\nRecent activity:")
         for entry in recent_activity:

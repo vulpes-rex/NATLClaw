@@ -48,11 +48,19 @@ from workflow import (
 from learning import extract_lessons, build_context_block
 from config import AppConfig
 from persona_loader import load_persona
+from execution_log import set_db_path, clear_log
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════
+
+@pytest.fixture(autouse=True)
+def _use_temp_execution_db(tmp_path):
+    """Point the execution log at a per-test temp DB."""
+    set_db_path(str(tmp_path / "execution_log.db"))
+    yield
+    clear_log()
 
 @pytest.fixture
 def tmp_data_dir():
@@ -295,15 +303,13 @@ class TestLessonsEnrichContext:
 
     def test_error_lesson_appears_in_context_block(self):
         """An error in step 1 generates a lesson that appears in the context block."""
+        from execution_log import append_entry
         state = AgentState(execution_count=1)
 
-        # Simulate a step that produced an error
-        state.execution_history.append({
-            "timestamp": "2026-04-07T10:00:00Z",
-            "step": "deploy",
-            "prompt": "Deploy to production",
-            "response": "Error: failed to connect to the database cluster",
-        })
+        # Simulate a step that produced an error (stored in SQLite)
+        append_entry("deploy", "Deploy to production",
+                     "Error: failed to connect to the database cluster",
+                     timestamp="2026-04-07T10:00:00Z")
         lessons = extract_lessons(
             "deploy", "Deploy to production",
             "Error: failed to connect to the database cluster"
@@ -592,18 +598,23 @@ class TestKnowledgeQuality:
 
     def test_context_block_shows_trajectory(self):
         """Context block reveals the agent's trajectory — what it did and learned."""
+        from execution_log import append_entry
+        history_entries = [
+            {"timestamp": "2026-04-07T17:00:00Z", "step": "capture",
+             "prompt": "...", "response": "Discovered pod eviction patterns"},
+            {"timestamp": "2026-04-07T17:30:00Z", "step": "review",
+             "prompt": "...", "response": "Knowledge gaps in monitoring"},
+            {"timestamp": "2026-04-07T18:00:00Z", "step": "capture",
+             "prompt": "...", "response": "Prometheus alerting best practices"},
+        ]
+        for e in history_entries:
+            append_entry(e["step"], e["prompt"], e["response"], timestamp=e["timestamp"])
+
         state = AgentState(
             execution_count=10,
             last_heartbeat="2026-04-07T18:00:00Z",
             memory={"focus": "infrastructure reliability"},
-            execution_history=[
-                {"timestamp": "2026-04-07T17:00:00Z", "step": "capture",
-                 "prompt": "...", "response": "Discovered pod eviction patterns"},
-                {"timestamp": "2026-04-07T17:30:00Z", "step": "review",
-                 "prompt": "...", "response": "Knowledge gaps in monitoring"},
-                {"timestamp": "2026-04-07T18:00:00Z", "step": "capture",
-                 "prompt": "...", "response": "Prometheus alerting best practices"},
-            ],
+            execution_history=[],
             lessons_learned=[
                 {"type": "error_encountered", "step": "deploy",
                  "description": "Error signal during 'deploy': Timeout connecting to API gateway",

@@ -33,6 +33,6 @@ py-modules = [
     "cli", "config", "agent_setup", "workflow", "scheduler",
     "second_brain", "state", "learning", "persona_loader",
     "prompts", "goals", "ingest", "metrics", "dump_brain",
-    "copilot_auth", "event_watcher", "daily_digest",
+    "copilot_auth", "event_watcher", "daily_digest", "execution_log",
 ]
 include-package-data = true

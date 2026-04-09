@@ -20,9 +20,17 @@ from config import AppConfig
 from state import AgentState
 from second_brain import BrainState
 from persona_loader import Persona
+from execution_log import set_db_path, clear_log
 
 # Set up logging to avoid warnings during tests
 logging.basicConfig(level=logging.DEBUG)
+
+@pytest.fixture(autouse=True)
+def _use_temp_execution_db(tmp_path):
+    """Point the execution log at a per-test temp DB."""
+    set_db_path(str(tmp_path / "execution_log.db"))
+    yield
+    clear_log()
 
 @pytest.fixture
 def mock_agent():
@@ -86,14 +94,11 @@ def test_run_step_success():
     agent.run = AsyncMock(return_value=MagicMock(text="Test response"))
     
     state = AgentState()
-    result = asyncio.run(_run_step(agent, "test_step", "Test prompt", state))
+    with patch("workflow._log_entry") as mock_log:
+        result = asyncio.run(_run_step(agent, "test_step", "Test prompt", state))
     
     assert result == "Test response"
-    assert len(state.execution_history) == 1
-    history_entry = state.execution_history[0]
-    assert history_entry["step"] == "test_step"
-    assert "Test prompt" in history_entry["prompt"]
-    assert "Test response" in history_entry["response"]
+    mock_log.assert_called_once_with("test_step", "Test prompt", "Test response")
 
 def test_run_step_handles_agent_exception():
     """Test that _run_step handles exceptions from agent.run."""
@@ -103,13 +108,14 @@ def test_run_step_handles_agent_exception():
     state = AgentState()
     
     with pytest.raises(Exception):
-        asyncio.run(_run_step(agent, "test_step", "Test prompt", state))
+        with patch("workflow._log_entry") as mock_log:
+            asyncio.run(_run_step(agent, "test_step", "Test prompt", state))
     
-    assert len(state.execution_history) == 1
-    history_entry = state.execution_history[0]
-    assert history_entry["step"] == "test_step"
-    assert "Test prompt" in history_entry["prompt"]
-    assert "ERROR: Step failed" in history_entry["response"]
+    mock_log.assert_called_once()
+    call_args = mock_log.call_args[0]
+    assert call_args[0] == "test_step"
+    assert "Test prompt" in call_args[1]
+    assert "ERROR: Step failed" in call_args[2]
 
 def test_run_step_extracts_lessons():
     """Test that _run_step extracts lessons from successful execution."""
@@ -142,28 +148,31 @@ def test_run_step_handles_lesson_extraction_failure():
         assert result == "Test response"
         # lessons_learned should be empty
 
-def test_run_step_response_truncation():
-    """Test that responses are truncated in history."""
+def test_run_step_stores_full_response():
+    """Test that responses are stored without truncation."""
     agent = MagicMock()
-    agent.run = AsyncMock(return_value=MagicMock(text="a" * 1000))
+    long_response = "a" * 5000
+    agent.run = AsyncMock(return_value=MagicMock(text=long_response))
     
     state = AgentState()
-    asyncio.run(_run_step(agent, "test_step", "Test prompt", state))
+    with patch("workflow._log_entry") as mock_log:
+        asyncio.run(_run_step(agent, "test_step", "Test prompt", state))
     
-    history_entry = state.execution_history[0]
-    assert len(history_entry["response"]) <= 500, "Response should be truncated to 500 chars"
+    stored_response = mock_log.call_args[0][2]
+    assert len(stored_response) == 5000, "Full response should be stored"
 
-def test_run_step_prompt_truncation():
-    """Test that prompts are truncated in history."""
+def test_run_step_stores_full_prompt():
+    """Test that prompts are stored without truncation."""
     agent = MagicMock()
     agent.run = AsyncMock(return_value=MagicMock(text="Test response"))
     
     state = AgentState()
-    long_prompt = "a" * 1000
-    asyncio.run(_run_step(agent, "test_step", long_prompt, state))
+    long_prompt = "a" * 5000
+    with patch("workflow._log_entry") as mock_log:
+        asyncio.run(_run_step(agent, "test_step", long_prompt, state))
     
-    history_entry = state.execution_history[0]
-    assert len(history_entry["prompt"]) <= 300, "Prompt should be truncated to 300 chars"
+    stored_prompt = mock_log.call_args[0][1]
+    assert len(stored_prompt) == 5000, "Full prompt should be stored"
 
 def test_run_heartbeat_second_brain_mode():
     """Test that run_heartbeat works with second_brain mode."""
@@ -379,7 +388,7 @@ def test_run_step_handles_attribute_error():
     assert isinstance(result, str)
 
 def test_run_step_history_maintained():
-    """Test that execution history is properly maintained across multiple steps."""
+    """Test that execution history is properly maintained across multiple steps in SQLite."""
     agent = MagicMock()
     agent.run = AsyncMock(return_value=MagicMock(text="Response"))
     
@@ -389,8 +398,10 @@ def test_run_step_history_maintained():
     for i in range(3):
         asyncio.run(_run_step(agent, f"step_{i}", f"Prompt {i}", state))
     
-    assert len(state.execution_history) == 3
-    for i, entry in enumerate(state.execution_history):
+    from execution_log import recent_entries
+    log_entries = recent_entries(100)
+    assert len(log_entries) == 3
+    for i, entry in enumerate(log_entries):
         assert entry["step"] == f"step_{i}"
         assert f"Prompt {i}" in entry["prompt"]
 

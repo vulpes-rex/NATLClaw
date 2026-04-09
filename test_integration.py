@@ -58,11 +58,19 @@ from scheduler import retry
 from learning import extract_lessons, build_context_block
 from config import AppConfig, load_config
 from persona_loader import load_persona, list_personas, Persona
+from execution_log import set_db_path, recent_entries, total_count, clear_log
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # Fixtures
 # ═══════════════════════════════════════════════════════════════════════
+
+@pytest.fixture(autouse=True)
+def _use_temp_execution_db(tmp_path):
+    """Point the execution log at a per-test temp DB."""
+    set_db_path(str(tmp_path / "execution_log.db"))
+    yield
+    clear_log()
 
 @pytest.fixture
 def tmp_data_dir():
@@ -142,7 +150,8 @@ class TestStateBrainRoundTrip:
         assert loaded.execution_count == populated_state.execution_count
         assert loaded.memory == populated_state.memory
         assert loaded.context == populated_state.context
-        assert len(loaded.execution_history) == len(populated_state.execution_history)
+        # execution_history is now in SQLite — state field is always empty
+        assert loaded.execution_history == []
         assert len(loaded.lessons_learned) == len(populated_state.lessons_learned)
 
     def test_brain_save_load_roundtrip(self, populated_brain, state_file):
@@ -175,13 +184,9 @@ class TestStateBrainRoundTrip:
         assert len(loaded_brain.notes) == 3
 
     def test_state_history_truncation_on_save_reload(self, state_file):
-        """History beyond max_history is trimmed on save, and the trimmed version loads back."""
+        """Lessons beyond max_history are trimmed on save. execution_history is in SQLite."""
         state = AgentState(
-            execution_history=[
-                {"timestamp": f"2026-04-07T{i:02d}:00:00Z", "step": f"step_{i}",
-                 "prompt": "p", "response": "r"}
-                for i in range(200)
-            ],
+            execution_history=[],
             lessons_learned=[
                 {"type": "info", "step": "s", "description": f"lesson_{i}",
                  "timestamp": "2026-04-07T00:00:00Z"}
@@ -192,10 +197,9 @@ class TestStateBrainRoundTrip:
         loop.run_until_complete(save_state(state, state_file, max_history=50))
         loaded = loop.run_until_complete(load_state(state_file))
 
-        assert len(loaded.execution_history) == 50
+        assert loaded.execution_history == []  # always empty in JSON
         assert len(loaded.lessons_learned) == 50
         # Should keep the LAST 50 (most recent)
-        assert loaded.execution_history[0]["step"] == "step_150"
         assert loaded.lessons_learned[0]["description"] == "lesson_150"
 
     def test_brain_review_log_truncation(self, state_file):
@@ -388,7 +392,7 @@ class TestWorkflowBrainIntegration:
         assert len(populated_brain.connections) == initial
 
     def test_run_step_records_history_in_state(self, fresh_state):
-        """_run_step appends to state.execution_history with real timestamps."""
+        """_run_step records entries in SQLite execution log."""
         mock_agent = MagicMock()
         mock_agent.run = AsyncMock(return_value=MagicMock(text="Step completed successfully"))
 
@@ -397,8 +401,9 @@ class TestWorkflowBrainIntegration:
         )
 
         assert result == "Step completed successfully"
-        assert len(fresh_state.execution_history) == 1
-        entry = fresh_state.execution_history[0]
+        log_entries = recent_entries(100)
+        assert len(log_entries) == 1
+        entry = log_entries[0]
         assert entry["step"] == "test_step"
         assert entry["prompt"] == "Do something"
         assert "timestamp" in entry
@@ -421,7 +426,7 @@ class TestWorkflowBrainIntegration:
         assert "db_check" in error_lessons[0]["step"]
 
     def test_run_step_chains_build_state_history(self, fresh_state):
-        """Multiple _run_step calls accumulate in execution_history."""
+        """Multiple _run_step calls accumulate in SQLite execution log."""
         mock_agent = MagicMock()
         mock_agent.run = AsyncMock(return_value=MagicMock(text="ok"))
 
@@ -430,8 +435,9 @@ class TestWorkflowBrainIntegration:
         loop.run_until_complete(_run_step(mock_agent, "step_2", "Second", fresh_state))
         loop.run_until_complete(_run_step(mock_agent, "step_3", "Third", fresh_state))
 
-        assert len(fresh_state.execution_history) == 3
-        assert [e["step"] for e in fresh_state.execution_history] == ["step_1", "step_2", "step_3"]
+        log_entries = recent_entries(100)
+        assert len(log_entries) == 3
+        assert [e["step"] for e in log_entries] == ["step_1", "step_2", "step_3"]
 
     def test_full_capture_then_persist_cycle(self, fresh_brain, state_file):
         """Capture a note via workflow helper, then persist to disk and reload."""
@@ -478,13 +484,20 @@ class TestLearningStateIntegration:
 
     def test_build_context_block_with_populated_state(self, populated_state):
         """build_context_block produces a coherent context string from real state."""
+        from execution_log import append_entry
+        # Populate SQLite with the history from the populated_state fixture
+        for entry in populated_state.execution_history:
+            append_entry(entry["step"], entry["prompt"], entry["response"],
+                         timestamp=entry["timestamp"])
+        populated_state.execution_history = []  # cleared since it's in SQLite
+
         context = build_context_block(populated_state)
 
         assert "AGENT MEMORY" in context
         assert "2026-04-07T10:00:00Z" in context  # last heartbeat
         assert "Total executions: 5" in context
         assert "success_achieved" in context  # from lessons
-        assert "status_check" in context  # from history
+        assert "status_check" in context  # from history in SQLite
 
     def test_context_block_with_empty_state(self, fresh_state):
         """build_context_block handles a fresh state without crashing."""
@@ -509,14 +522,11 @@ class TestLearningStateIntegration:
 
     def test_context_block_after_multiple_steps(self, fresh_state):
         """Context block reflects accumulated history from multiple steps."""
-        # Simulate 3 heartbeat steps
+        from execution_log import append_entry
+        # Simulate 3 heartbeat steps in SQLite
         for i in range(3):
-            fresh_state.execution_history.append({
-                "timestamp": f"2026-04-07T{10+i}:00:00Z",
-                "step": f"step_{i}",
-                "prompt": f"prompt_{i}",
-                "response": f"response_{i}",
-            })
+            append_entry(f"step_{i}", f"prompt_{i}", f"response_{i}",
+                         timestamp=f"2026-04-07T{10+i}:00:00Z")
         fresh_state.execution_count = 3
 
         context = build_context_block(fresh_state, max_recent=2)
@@ -706,7 +716,7 @@ class TestEndToEnd:
         result = loop.run_until_complete(
             _run_step(mock_agent, "capture", "Capture an insight", fresh_state)
         )
-        assert len(fresh_state.execution_history) == 1
+        assert total_count() == 1
 
         # Store the capture in the brain
         note_id = _store_capture(fresh_brain, result)
@@ -738,7 +748,8 @@ class TestEndToEnd:
         loaded_state = loop.run_until_complete(load_state(state_file))
         loaded_brain = loop.run_until_complete(load_brain(state_file))
 
-        assert loaded_state.execution_history[0]["step"] == "capture"
+        log_entries = recent_entries(100)
+        assert log_entries[0]["step"] == "capture"
         assert len(loaded_brain.notes) == 2
         assert len(loaded_brain.connections) == 1
 
@@ -764,24 +775,23 @@ class TestEndToEnd:
 
     def test_state_accumulates_across_simulated_heartbeats(self, state_file):
         """State grows across multiple save/load cycles (simulating multiple heartbeats)."""
+        from execution_log import append_entry
         loop = asyncio.get_event_loop()
 
         for heartbeat_num in range(1, 4):
             state = loop.run_until_complete(load_state(state_file))
             state.execution_count = heartbeat_num
             state.last_heartbeat = f"2026-04-07T{10 + heartbeat_num}:00:00Z"
-            state.execution_history.append({
-                "timestamp": state.last_heartbeat,
-                "step": f"heartbeat_{heartbeat_num}",
-                "prompt": "p", "response": "r",
-            })
+            append_entry(f"heartbeat_{heartbeat_num}", "p", "r",
+                         timestamp=state.last_heartbeat)
             loop.run_until_complete(save_state(state, state_file))
 
-        # Final reload should have all 3 heartbeats
+        # Final reload should reflect all 3 heartbeats
         final = loop.run_until_complete(load_state(state_file))
         assert final.execution_count == 3
-        assert len(final.execution_history) == 3
-        assert final.execution_history[-1]["step"] == "heartbeat_3"
+        log_entries = recent_entries(100)
+        assert len(log_entries) == 3
+        assert log_entries[-1]["step"] == "heartbeat_3"
 
     def test_brain_accumulates_across_simulated_heartbeats(self, state_file):
         """Brain grows across multiple save/load cycles."""
@@ -950,9 +960,10 @@ class TestSecondBrainWorkflow:
             _run_second_brain_heartbeat(agent, state, brain, config, persona)
         )
 
-        # Verify state: 4 steps recorded
-        assert len(state.execution_history) == 4
-        steps = [e["step"] for e in state.execution_history]
+        # Verify state: 4 steps recorded in SQLite
+        log_entries = recent_entries(100)
+        assert len(log_entries) == 4
+        steps = [e["step"] for e in log_entries]
         assert steps == ["status_check", "capture", "connect", "review"]
 
         # Verify brain: original 2 + 1 captured = 3 notes
@@ -991,7 +1002,7 @@ class TestSecondBrainWorkflow:
         loaded_brain = loop.run_until_complete(load_brain(state_file))
 
         # 3 steps: status, capture, review (connect skipped — brain has < 2 notes)
-        assert len(loaded_state.execution_history) == 3
+        assert total_count() == 3
         assert len(loaded_brain.notes) == 1
         assert loaded_brain.notes["n0001"]["summary"] == "Persist test"
 
@@ -1020,8 +1031,9 @@ class TestFreeformWorkflow:
         )
 
         # 4 steps: status_check, task, capture, review
-        assert len(state.execution_history) == 4
-        steps = [e["step"] for e in state.execution_history]
+        log_entries = recent_entries(100)
+        assert len(log_entries) == 4
+        steps = [e["step"] for e in log_entries]
         assert steps == ["status_check", "task", "capture", "review"]
 
         # Brain got the captured note
@@ -1058,8 +1070,8 @@ class TestStepsWorkflow:
             _run_steps_heartbeat(agent, state, brain, config, persona)
         )
 
-        # All steps should be in execution_history
-        assert len(state.execution_history) >= num_steps
+        # All steps should be in execution log
+        assert total_count() >= num_steps
 
     def test_stepwise_one_per_heartbeat(self):
         """stepwise=True runs exactly one step per heartbeat."""
@@ -1089,7 +1101,7 @@ class TestStepsWorkflow:
 
         # After 3 heartbeats, 3 steps executed
         # Each step produces at least 1 history entry
-        assert len(state.execution_history) >= 3
+        assert total_count() >= 3
 
     def test_stepwise_resets_after_completion(self):
         """After all stepwise steps complete, index resets to 0."""
@@ -1142,8 +1154,9 @@ class TestStepsWorkflow:
         )
 
         # Should have executed freeform (4 steps)
-        assert len(state.execution_history) == 4
-        steps = [e["step"] for e in state.execution_history]
+        log_entries = recent_entries(100)
+        assert len(log_entries) == 4
+        steps = [e["step"] for e in log_entries]
         assert "task" in steps  # freeform-specific step name
 
 
@@ -1166,9 +1179,10 @@ class TestDistilToBrain:
 
         assert len(brain.notes) == 1
         assert brain.notes["n0001"]["summary"] == "Distilled insight"
-        # _distil_to_brain calls _run_step internally, recording in history
-        assert len(state.execution_history) == 1
-        assert state.execution_history[0]["step"] == "test_step_capture"
+        # _distil_to_brain calls _run_step internally, recording in SQLite log
+        log_entries = recent_entries(100)
+        assert len(log_entries) == 1
+        assert log_entries[0]["step"] == "test_step_capture"
 
     def test_distil_handles_bad_json_gracefully(self):
         """_distil_to_brain handles non-JSON agent output without crashing."""
@@ -1231,7 +1245,7 @@ class TestSchedulerLoop:
 
         assert loaded_state.execution_count == 1
         # 3 steps: status, capture, review (connect skipped — brain starts empty, < 2 notes)
-        assert len(loaded_state.execution_history) == 3
+        assert total_count() == 3
         assert loaded_brain.notes.get("n0001") is not None
         assert loaded_brain.notes["n0001"]["summary"] == "scheduler test"
     def test_scheduler_persists_state_even_on_heartbeat_error(self, state_file):
@@ -1284,9 +1298,9 @@ class TestHeartbeatDispatcher:
         loop.run_until_complete(run_heartbeat(agent, state, brain, config, persona))
 
         # second_brain mode: status_check, capture, connect, review
-        steps = [e["step"] for e in state.execution_history]
-        assert "status_check" in steps
-        assert "capture" in steps
+        log_steps = [e["step"] for e in recent_entries(100)]
+        assert "status_check" in log_steps
+        assert "capture" in log_steps
 
     def test_dispatches_to_freeform(self):
         """Persona with workflow='freeform' routes to the freeform heartbeat."""
@@ -1301,8 +1315,8 @@ class TestHeartbeatDispatcher:
         loop.run_until_complete(run_heartbeat(agent, state, brain, config, persona))
 
         # freeform mode: status_check, task, capture, review
-        steps = [e["step"] for e in state.execution_history]
-        assert "task" in steps  # freeform-specific
+        log_steps = [e["step"] for e in recent_entries(100)]
+        assert "task" in log_steps  # freeform-specific
 
     def test_dispatches_to_steps(self):
         """Persona with workflow='steps' routes to the steps heartbeat."""
@@ -1323,4 +1337,4 @@ class TestHeartbeatDispatcher:
         loop.run_until_complete(run_heartbeat(agent, state, brain, config, persona))
 
         # Steps mode runs the persona-defined steps
-        assert len(state.execution_history) >= num_steps
+        assert total_count() >= num_steps

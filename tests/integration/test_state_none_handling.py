@@ -14,6 +14,15 @@ from unittest.mock import AsyncMock, MagicMock
 from learning import build_context_block
 from state import AgentState, load_state, save_state
 from workflow import _run_step
+from execution_log import set_db_path, recent_entries, total_count, clear_log
+
+
+@pytest.fixture(autouse=True)
+def _use_temp_db(tmp_path):
+    """Point the execution log at a per-test temp DB."""
+    set_db_path(str(tmp_path / "execution_log.db"))
+    yield
+    clear_log()
 
 
 def _make_agent(response_text: str = "OK") -> AsyncMock:
@@ -49,14 +58,15 @@ class TestNoneListsSurviveHeartbeat:
         await save_state(state, state_file)
         loaded = await load_state(state_file)
 
-        # Run a workflow step — should append to the now-initialized lists
+        # Run a workflow step — _log_entry writes to SQLite, not state list
         agent = _make_agent("completed successfully")
-        await _run_step(agent, "test_step", "Test prompt", loaded)
+        db_path = str(tmp_path / "execution_log.db")
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("workflow._log_entry", lambda step, prompt, resp, **kw: None)
+            await _run_step(agent, "test_step", "Test prompt", loaded)
 
-        assert len(loaded.execution_history) == 1
-        assert loaded.execution_history[0]["step"] == "test_step"
-        # Lessons should be extracted (success signal)
-        assert len(loaded.lessons_learned) >= 1
+        # execution_history stays empty (it's in SQLite now)
+        assert loaded.execution_history == []
 
     @pytest.mark.asyncio
     async def test_none_lists_survive_multiple_save_load_cycles(self, tmp_path):
@@ -71,9 +81,10 @@ class TestNoneListsSurviveHeartbeat:
             await _run_step(agent, f"step_{i}", f"Prompt {i}", loaded)
             await save_state(loaded, state_file)
 
-        final = await load_state(state_file)
-        assert len(final.execution_history) == 3
-        assert final.execution_history[2]["step"] == "step_2"
+        # execution_history is in SQLite now
+        log_entries = recent_entries(100)
+        assert len(log_entries) == 3
+        assert log_entries[2]["step"] == "step_2"
 
 
 class TestCorruptedStateRecovery:
@@ -115,11 +126,9 @@ class TestCorruptedStateRecovery:
 
         loaded = await load_state(state_file)
 
-        # Fix None → [] before workflow step
-        if loaded.execution_history is None:
-            loaded.execution_history = []
-        if loaded.lessons_learned is None:
-            loaded.lessons_learned = []
+        # load_state now normalizes None → []
+        assert loaded.execution_history == []
+        assert loaded.lessons_learned == []
 
         agent = _make_agent("Task done, error: some issue encountered")
         await _run_step(agent, "recovery_step", "Recover from corrupted state", loaded)
@@ -127,7 +136,9 @@ class TestCorruptedStateRecovery:
         # Save should work fine
         await save_state(loaded, state_file)
 
-        # Reload and verify
+        # Reload and verify — execution_history is in SQLite
         final = await load_state(state_file)
-        assert len(final.execution_history) == 1
-        assert final.execution_history[0]["step"] == "recovery_step"
+        assert final.execution_history == []  # always empty in state
+        log_entries = recent_entries(100)
+        assert len(log_entries) == 1
+        assert log_entries[0]["step"] == "recovery_step"

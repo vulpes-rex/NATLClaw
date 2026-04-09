@@ -16,6 +16,7 @@ from config import AppConfig
 from second_brain import BrainState, add_note, save_brain, load_brain
 from state import AgentState, save_state, load_state
 from workflow import _run_step, _run_second_brain_heartbeat
+from execution_log import set_db_path, recent_entries, total_count, clear_log
 
 # Import retry from scheduler — must mock agent_setup's external deps first
 # to avoid missing dependencies
@@ -26,6 +27,14 @@ for _mod in ("agent_framework_github_copilot", "copilot", "agent_framework",
     if _mod not in sys.modules:
         sys.modules[_mod] = _MagicMock()
 from scheduler import retry
+
+
+@pytest.fixture(autouse=True)
+def _use_temp_db(tmp_path):
+    """Point the execution log at a per-test temp DB."""
+    set_db_path(str(tmp_path / "execution_log.db"))
+    yield
+    clear_log()
 
 
 def _make_config(**overrides) -> AppConfig:
@@ -97,9 +106,10 @@ class TestPartialFailurePreservesState:
                           heartbeat_task="Capture something")
         await _run_second_brain_heartbeat(agent, state, brain, config, persona)
 
-        # Status check should have been recorded before the crash
-        assert len(state.execution_history) >= 1
-        assert state.execution_history[0]["step"] == "status_check"
+        # Status check should have been recorded before the crash (in SQLite)
+        log_entries = recent_entries(100)
+        assert len(log_entries) >= 1
+        assert log_entries[0]["step"] == "status_check"
 
 
 class TestBrainSaveFailurePreservesState:
@@ -109,12 +119,6 @@ class TestBrainSaveFailurePreservesState:
     async def test_state_saved_when_brain_save_raises(self, tmp_path):
         state_file = str(tmp_path / "state.json")
         state = AgentState(execution_count=5)
-        state.execution_history.append({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "step": "test",
-            "prompt": "test",
-            "response": "test",
-        })
 
         # Save state succeeds
         await save_state(state, state_file)
@@ -122,7 +126,7 @@ class TestBrainSaveFailurePreservesState:
         # Verify state is persisted
         loaded = await load_state(state_file)
         assert loaded.execution_count == 5
-        assert len(loaded.execution_history) == 1
+        assert loaded.execution_history == []  # execution_history is in SQLite now
 
         # Even if brain save would fail, state is already safe
         brain = BrainState()

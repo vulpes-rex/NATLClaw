@@ -38,6 +38,11 @@ from pathlib import Path
 from typing import Any
 
 from config import AppConfig, load_config, validate_config
+from execution_log import (
+    append_entry as _log_entry,
+    clear_log as _clear_log,
+    set_db_path as _set_log_db_path,
+)
 from persona_loader import load_persona  # ADD THIS IMPORT
 
 
@@ -775,7 +780,7 @@ def cmd_chat(args: argparse.Namespace, config: AppConfig) -> None:
                         print("\n👋 Goodbye! Happy automating!")
                         break
                     elif user_input.startswith('/clear'):
-                        state.execution_history = []
+                        _clear_log()
                         nonlocal session
                         session = AgentSession()  # Reset conversation history
                         print("🧹 Conversation history cleared.")
@@ -871,16 +876,11 @@ def cmd_chat(args: argparse.Namespace, config: AppConfig) -> None:
                         print(f"\nError running agent: {str(e)}\n")
                         continue
                     
-                    # Record the interaction
+                    # Record the interaction (full text — no truncation)
                     now = datetime.now(timezone.utc).isoformat()
                     state.execution_count += 1
                     state.last_heartbeat = now
-                    state.execution_history.append({
-                        "timestamp": now,
-                        "step": "chat_message",
-                        "prompt": user_input[:300],
-                        "response": text[:500],
-                    })
+                    _log_entry("chat_message", user_input, text)
                     
                     print(f"\nAgent: {text}\n")
                     
@@ -999,6 +999,10 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     _setup_logging(args.verbose)
     config = load_config(args.env)
+
+    # Point the execution log at the same data directory as the state file
+    import os as _os
+    _set_log_db_path(_os.path.join(_os.path.dirname(config.state_file), "execution_log.db"))
 
     dispatch = {
         "run": cmd_run,

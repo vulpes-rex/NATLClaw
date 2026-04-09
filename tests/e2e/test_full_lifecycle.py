@@ -43,6 +43,7 @@ for _mod in (
     sys.modules.setdefault(_mod, MagicMock())
 
 from config import AppConfig
+from execution_log import recent_entries, set_db_path, total_count
 from persona_loader import Persona, load_persona
 from second_brain import (
     BrainState,
@@ -69,6 +70,8 @@ logger = logging.getLogger(__name__)
 def _make_config(tmp_dir: str, *, persona: str = "default", **overrides) -> AppConfig:
     """Build a real AppConfig pointing state/brain files at tmp_dir."""
     state_file = os.path.join(tmp_dir, "agent_state.json")
+    # Point the execution log SQLite DB at the temp directory
+    set_db_path(os.path.join(tmp_dir, "execution_log.db"))
     return AppConfig(
         provider="foundry",   # anything other than copilot to skip async ctx mgr
         model="test-model",
@@ -157,8 +160,9 @@ class TestSecondBrainFullLifecycle:
 
         # Verify state
         assert state.execution_count == 1
-        assert len(state.execution_history) >= 3  # status + capture + review (no connect < 2 notes)
-        step_names_1 = {h["step"] for h in state.execution_history}
+        log_entries = recent_entries(100)
+        assert len(log_entries) >= 3  # status + capture + review (no connect < 2 notes)
+        step_names_1 = {h["step"] for h in log_entries}
         assert "status_check" in step_names_1
         assert "capture" in step_names_1
         assert "review" in step_names_1
@@ -193,7 +197,7 @@ class TestSecondBrainFullLifecycle:
 
         assert state2.execution_count == 2
         # Now we should have connect step
-        step_names_2 = {h["step"] for h in state2.execution_history}
+        step_names_2 = {h["step"] for h in recent_entries(100)}
         assert "connect" in step_names_2
 
         # Brain should have >= 3 notes and >= 1 connection
@@ -239,14 +243,14 @@ class TestSecondBrainFullLifecycle:
 
         # Final assertions — full lifecycle
         assert state3.execution_count == 3
-        assert len(state3.execution_history) >= 9   # ~3-4 per heartbeat × 3
+        assert total_count() >= 9   # ~3-4 per heartbeat × 3
 
         # Reload one more time to prove disk round-trip
         final_state = await load_state(config.state_file)
         final_brain = await load_brain(config.state_file)
 
         assert final_state.execution_count == 3
-        assert len(final_state.execution_history) >= 9
+        assert total_count() >= 9
         assert len(final_brain.notes) >= 4
         assert len(final_brain.connections) >= 1
         assert any(n.get("category") == "archive" for n in final_brain.notes.values())
@@ -296,7 +300,7 @@ class TestFreeformFullLifecycle:
         await save_state(state, config.state_file)
         await save_brain(brain, config.state_file)
 
-        steps = {h["step"] for h in state.execution_history}
+        steps = {h["step"] for h in recent_entries(100)}
         assert "status_check" in steps
         assert "task" in steps
         assert "capture" in steps
@@ -371,7 +375,7 @@ class TestStepsFullLifecycle:
         await save_brain(brain, config.state_file)
 
         # All steps should have run
-        assert len(state.execution_history) == total_calls
+        assert total_count() == total_calls
 
         # If any step had storeToBrain, brain should have notes
         if store_count > 0:
@@ -379,7 +383,7 @@ class TestStepsFullLifecycle:
 
         # Disk round-trip
         final = await load_state(config.state_file)
-        assert len(final.execution_history) == total_calls
+        assert total_count() == total_calls
 
 
 # =====================================================================
@@ -629,17 +633,18 @@ class TestFailureRecoveryEndToEnd:
         await save_state(state, config.state_file)
 
         # status_check should have succeeded before the failure
-        assert len(state.execution_history) >= 1
-        assert state.execution_history[0]["step"] == "status_check"
+        log_entries = recent_entries(100)
+        assert len(log_entries) >= 1
+        assert log_entries[0]["step"] == "status_check"
 
         # The capture step should have recorded the failure
-        if len(state.execution_history) >= 2:
-            assert "ERROR" in state.execution_history[1]["response"]
+        if len(log_entries) >= 2:
+            assert "ERROR" in log_entries[1]["response"]
 
         # State survives disk round-trip
         reloaded = await load_state(config.state_file)
         assert reloaded.execution_count == 1
-        assert len(reloaded.execution_history) >= 1
+        assert total_count() >= 1
 
 
 # =====================================================================
@@ -738,7 +743,7 @@ class TestSchedulerLoopSimulation:
         final_brain = await load_brain(config.state_file)
 
         assert final_state.execution_count == 2
-        assert len(final_state.execution_history) >= 6  # ~3 per iteration
+        assert total_count() >= 6  # ~3 per iteration
         assert len(final_brain.notes) >= 2
         assert final_brain.last_review is not None
 
@@ -746,7 +751,7 @@ class TestSchedulerLoopSimulation:
         with open(config.state_file, "r") as f:
             raw = json.load(f)
         assert raw["execution_count"] == 2
-        assert isinstance(raw["execution_history"], list)
+        assert isinstance(raw["execution_history"], list)  # empty list (moved to SQLite)
 
         # Brain JSON is valid and readable
         brain_path = os.path.join(str(tmp_path), "brain.json")

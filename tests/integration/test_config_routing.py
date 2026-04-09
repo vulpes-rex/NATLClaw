@@ -16,6 +16,15 @@ from persona_loader import Persona, load_persona
 from second_brain import BrainState, build_brain_summary
 from state import AgentState
 from workflow import run_heartbeat, _run_step
+from execution_log import set_db_path, recent_entries, total_count, clear_log
+
+
+@pytest.fixture(autouse=True)
+def _use_temp_db(tmp_path):
+    """Point the execution log at a per-test temp DB."""
+    set_db_path(str(tmp_path / "execution_log.db"))
+    yield
+    clear_log()
 
 
 def _make_config(**overrides) -> AppConfig:
@@ -77,8 +86,8 @@ class TestConfigPersonaRoutesToWorkflow:
 
         await run_heartbeat(agent, state, brain, config, persona)
 
-        # Verify freeform steps were executed
-        step_names = [h["step"] for h in state.execution_history]
+        # Verify freeform steps were executed (execution log is in SQLite now)
+        step_names = [h["step"] for h in recent_entries(100)]
         assert "status_check" in step_names
         assert "task" in step_names
         assert "capture" in step_names
@@ -109,7 +118,7 @@ class TestConfigPersonaRoutesToWorkflow:
 
         await run_heartbeat(agent, state, brain, config, persona)
 
-        step_names = [h["step"] for h in state.execution_history]
+        step_names = [h["step"] for h in recent_entries(100)]
         assert "status_check" in step_names
         assert "capture" in step_names
         assert "connect" in step_names
@@ -137,7 +146,7 @@ class TestConfigPersonaRoutesToWorkflow:
         await run_heartbeat(agent, state, brain, config, persona)
 
         # All steps + capture entries for storeToBrain steps
-        assert len(state.execution_history) == expected_entries
+        assert total_count() == expected_entries
 
     @pytest.mark.asyncio
     async def test_researcher_routes_to_second_brain(self):
@@ -187,7 +196,7 @@ class TestStepwiseStatePersistence:
 
         idx_key = f"steps_{persona.name}_idx"
         assert state.context.get(idx_key) == 1
-        assert len(state.execution_history) == first_hb_entries
+        assert total_count() == first_hb_entries
 
         # Second heartbeat — should execute step 1 ("scaffold" has no storeToBrain)
         step_1_has_store = persona.steps[1].get("storeToBrain", False)
@@ -196,7 +205,7 @@ class TestStepwiseStatePersistence:
         await run_heartbeat(agent, state, brain, config, persona)
 
         assert state.context.get(idx_key) == 2
-        assert len(state.execution_history) == second_hb_entries
+        assert total_count() == second_hb_entries
 
     @pytest.mark.asyncio
     async def test_stepwise_resets_after_all_steps_complete(self):

@@ -44,6 +44,7 @@ ENGINE_FILES = [
     "metrics.py",
     "event_watcher.py",
     "daily_digest.py",
+    "execution_log.py",
 ]
 
 # Domain-specific terms that should NOT appear in engine files.
