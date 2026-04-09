@@ -156,7 +156,9 @@ class TestSecondBrainFullLifecycle:
         # Verify files written
         assert os.path.isfile(config.state_file)
         brain_file = os.path.join(str(tmp_path), "brain.json")
+        brain_db = os.path.join(str(tmp_path), "brain.db")
         assert os.path.isfile(brain_file)
+        assert os.path.isfile(brain_db)
 
         # Verify state
         assert state.execution_count == 1
@@ -759,3 +761,4 @@ class TestSchedulerLoopSimulation:
             raw_brain = json.load(f)
         assert isinstance(raw_brain["notes"], dict)
         assert len(raw_brain["notes"]) >= 2
+        assert os.path.isfile(os.path.join(str(tmp_path), "brain.db"))

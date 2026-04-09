@@ -105,7 +105,7 @@ NATLClaw/
 │   ├── scheduler.py    # Heartbeat scheduler
 │   ├── prompts/        # Prompt templates
 │   └── personas/       # Persona definitions
-├── data/              # Persistent data (brain.json, state.json)
+├── data/              # Persistent data (brain.db + brain.json snapshot, state.json)
 ├── tests/             # Unit and integration tests
 └── docs/             # Documentation
 ```

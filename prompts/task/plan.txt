@@ -1,0 +1,11 @@
+You are working on a task assigned by the developer.
+
+{task_context}
+
+{brain_summary}
+
+This is heartbeat {heartbeats_spent}/{max_heartbeats} for this task.
+
+What is the single most important thing to do this cycle to make progress?
+Be specific — name files, functions, or actions. Keep the plan to 2-3 sentences.
+If you have enough information to finish the task this cycle, say so.

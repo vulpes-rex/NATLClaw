@@ -27,7 +27,7 @@ with patch.dict("sys.modules", {
     from cli import build_parser, main
     from config import AppConfig, validate_config
     from metrics import MetricsStore, JsonFormatter
-    from second_brain import BrainState, add_note
+    from second_brain import BrainState, add_note, assign_note_to_topic, load_brain, relate_topics, save_brain
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -77,11 +77,50 @@ class TestCLIParser:
         assert args.brain_command == "search"
         assert args.query == "React"
 
+    def test_brain_show_subcommand(self):
+        parser = build_parser()
+        args = parser.parse_args(["brain", "show", "n0001"])
+        assert args.command == "brain"
+        assert args.brain_command == "show"
+        assert args.note_id == "n0001"
+
+    def test_brain_topics_subcommand(self):
+        parser = build_parser()
+        args = parser.parse_args(["brain", "topics", "--limit", "5"])
+        assert args.brain_command == "topics"
+        assert args.limit == 5
+
+    def test_brain_trace_subcommand(self):
+        parser = build_parser()
+        args = parser.parse_args(["brain", "trace", "React", "--depth", "2", "--limit", "3"])
+        assert args.brain_command == "trace"
+        assert args.topic == "React"
+        assert args.depth == 2
+        assert args.limit == 3
+
     def test_brain_add_subcommand(self):
         parser = build_parser()
-        args = parser.parse_args(["brain", "add", "some note", "--tags", "a,b"])
+        args = parser.parse_args(["brain", "add", "some note", "--tags", "a,b", "--type", "pattern", "--confidence", "90"])
         assert args.content == "some note"
         assert args.tags == "a,b"
+        assert args.note_type == "pattern"
+        assert args.confidence == 90
+
+    def test_brain_feedback_subcommand(self):
+        parser = build_parser()
+        args = parser.parse_args(["brain", "feedback", "n0001", "--relevant", "--reason", "confirmed in docs"])
+        assert args.brain_command == "feedback"
+        assert args.note_id == "n0001"
+        assert args.relevant
+        assert args.reason == "confirmed in docs"
+
+    def test_brain_contradict_subcommand(self):
+        parser = build_parser()
+        args = parser.parse_args(["brain", "contradict", "n0001", "n0002", "--supersede"])
+        assert args.brain_command == "contradict"
+        assert args.note_id == "n0001"
+        assert args.by_note_id == "n0002"
+        assert args.supersede
 
     def test_brain_export_subcommand(self):
         parser = build_parser()
@@ -126,21 +165,22 @@ class TestCLIParser:
 # ======================================================================
 
 class TestCLIBrainCommands:
-    def test_brain_stats_output(self, capsys):
+    def test_brain_stats_output(self, capsys, tmp_path):
         brain = _fresh_brain()
         add_note(brain, content="Note about Python development", tags=["python"])
         add_note(brain, content="Note about React components", tags=["react"], category="projects")
 
-        config = _fresh_config()
+        config = _fresh_config(state_file=str(tmp_path / "state.json"))
         args = MagicMock()
+        asyncio.run(save_brain(brain, config.state_file))
 
-        with patch.object(cli_mod, "_load_brain_sync", return_value=brain):
-            cli_mod.cmd_brain_stats(args, config)
+        cli_mod.cmd_brain_stats(args, config)
 
         out = capsys.readouterr().out
         assert "Notes:" in out
         assert "2" in out
         assert "Connections:" in out
+        assert "Connection density:" in out
 
     def test_brain_lint_healthy(self, capsys):
         brain = _fresh_brain()
@@ -193,6 +233,124 @@ class TestCLIBrainCommands:
         assert os.path.isfile(out_file)
         content = Path(out_file).read_text(encoding="utf-8")
         assert "Export test content" in content
+
+    def test_brain_show_output(self, capsys, tmp_path):
+        brain = _fresh_brain()
+        note_id = add_note(
+            brain,
+            content="Rollouts need feature flags",
+            summary="Rollout guidance",
+            note_type="decision",
+            confidence=87,
+            evidence=["docs/release.md"],
+            tags=["deploy"],
+        )
+        config = _fresh_config(state_file=str(tmp_path / "state.json"))
+        args = MagicMock(note_id=note_id)
+        asyncio.run(save_brain(brain, config.state_file))
+
+        cli_mod.cmd_brain_show(args, config)
+
+        out = capsys.readouterr().out
+        loaded = asyncio.run(load_brain(config.state_file))
+        assert note_id in out
+        assert "decision" in out
+        assert "Confidence: 87" in out
+        assert "Evidence:" in out
+        assert "Recall count: 1" in out
+        assert loaded.notes[note_id]["recall_count"] == 1
+
+    def test_brain_topics_output(self, capsys, tmp_path):
+        brain = _fresh_brain()
+        note_id = add_note(brain, content="React hook pattern")
+        assign_note_to_topic(brain, note_id, "React")
+        config = _fresh_config(state_file=str(tmp_path / "state.json"))
+        args = MagicMock(limit=10)
+        asyncio.run(save_brain(brain, config.state_file))
+
+        cli_mod.cmd_brain_topics(args, config)
+
+        out = capsys.readouterr().out
+        assert "Top topics" in out
+        assert "React" in out
+
+    def test_brain_trace_output(self, capsys, tmp_path):
+        brain = _fresh_brain()
+        n1 = add_note(brain, content="React hooks reduce boilerplate", summary="Hooks")
+        n2 = add_note(brain, content="Context avoids prop drilling", summary="Context")
+        assign_note_to_topic(brain, n1, "React")
+        assign_note_to_topic(brain, n2, "State")
+        relate_topics(brain, "React", "State")
+        config = _fresh_config(state_file=str(tmp_path / "state.json"))
+        args = MagicMock(topic="React", depth=1, limit=10)
+        asyncio.run(save_brain(brain, config.state_file))
+
+        cli_mod.cmd_brain_trace(args, config)
+
+        out = capsys.readouterr().out
+        assert "Topic trace: React" in out
+        assert n1 in out
+        assert n2 in out
+
+    def test_brain_search_output(self, capsys, tmp_path):
+        brain = _fresh_brain()
+        note_id = add_note(
+            brain,
+            content="Deploy strategy with feature flags",
+            summary="Deploy decision",
+            note_type="decision",
+            confidence=93,
+            tags=["deploy"],
+        )
+        config = _fresh_config(state_file=str(tmp_path / "state.json"))
+        args = MagicMock(query="deploy strategy", limit=10)
+        asyncio.run(save_brain(brain, config.state_file))
+
+        cli_mod.cmd_brain_search(args, config)
+
+        out = capsys.readouterr().out
+        loaded = asyncio.run(load_brain(config.state_file))
+        assert "Found 1 matching note" in out
+        assert "Deploy decision" in out
+        assert "confidence: 93" in out
+        assert loaded.notes[note_id]["recall_count"] == 1
+
+    def test_brain_feedback_command_updates_note(self, capsys, tmp_path):
+        brain = _fresh_brain()
+        note_id = add_note(brain, content="Use named exports by default", note_type="preference")
+        config = _fresh_config(state_file=str(tmp_path / "state.json"))
+        args = MagicMock(note_id=note_id, relevant=True, irrelevant=False, reason="Seen in two modules")
+        asyncio.run(save_brain(brain, config.state_file))
+
+        cli_mod.cmd_brain_feedback(args, config)
+
+        out = capsys.readouterr().out
+        loaded = asyncio.run(load_brain(config.state_file))
+        assert "Recorded relevant feedback" in out
+        assert loaded.notes[note_id]["positive_feedback"] == 1
+        assert loaded.notes[note_id]["last_confirmed_at"]
+
+    def test_brain_contradict_command_updates_note(self, capsys, tmp_path):
+        brain = _fresh_brain()
+        note_id = add_note(brain, content="Release on Fridays", summary="Old release policy", confidence=85)
+        by_note_id = add_note(brain, content="Do not release on Fridays", summary="Current release policy", confidence=70)
+        config = _fresh_config(state_file=str(tmp_path / "state.json"))
+        args = MagicMock(
+            note_id=note_id,
+            by_note_id=by_note_id,
+            reason="Ops policy changed",
+            supersede=True,
+        )
+        asyncio.run(save_brain(brain, config.state_file))
+
+        cli_mod.cmd_brain_contradict(args, config)
+
+        out = capsys.readouterr().out
+        loaded = asyncio.run(load_brain(config.state_file))
+        assert "contradicted by" in out
+        assert loaded.notes[note_id]["contradiction_count"] == 1
+        assert loaded.notes[note_id]["status"] == "superseded"
+        assert by_note_id in loaded.notes[note_id]["contradicted_by"]
 
 
 # ======================================================================

@@ -1,0 +1,15 @@
+Execute this plan for the current task:
+
+{plan}
+
+{task_context}
+
+Use your tools to do the actual work. Be thorough but focused.
+
+If you need information or a decision from the developer that you cannot
+determine on your own, respond with BLOCKED: followed by your question.
+Only block if you genuinely cannot proceed — prefer making a reasonable
+decision when the answer is likely obvious.
+
+When done with this cycle's work, summarise what you accomplished in
+2-3 sentences.

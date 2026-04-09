@@ -55,7 +55,7 @@ NATLClaw is a **knowledge-centric autonomous agent** written in Python. A heartb
 
 ### Key subsystems
 
-- **Second brain** — PARA-categorised atomic notes with bidirectional connections, stored in `data/brain.json`.
+- **Second brain** — PARA-categorised atomic notes with bidirectional connections, stored primarily in `data/brain.db` with a readable `data/brain.json` snapshot for compatibility.
 - **Heartbeat loop** — `scheduler.py` drives periodic wakeups; `workflow.py` dispatches three modes (second-brain, freeform, persona-defined steps).
 - **Persona system** — `mcp.json` defines personas with instructions, steps, workflow modes, and MCP server bindings.
 - **Learning engine** — signal-word detection extracts lessons from execution history; `build_context_block()` injects them into every prompt.
@@ -68,7 +68,7 @@ NATLClaw is a **knowledge-centric autonomous agent** written in Python. A heartb
 | Language | Python |
 | LLM providers | GitHub Copilot (default), Azure AI Foundry, OpenAI, Ollama |
 | Config | `.env` + `config.py` (`AppConfig` dataclass) |
-| Storage | `data/brain.json` (brain), `data/agent_state.json` (state) |
+| Storage | `data/brain.db` + `data/brain.json` snapshot (brain), `data/agent_state.json` (state) |
 | Size | ~2,000 LOC |
 
 ---

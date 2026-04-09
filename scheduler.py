@@ -15,7 +15,16 @@ from metrics import MetricsStore
 from persona_loader import load_persona
 from second_brain import build_brain_summary, decay_stale_notes, load_brain, save_brain
 from state import AgentState, load_state, save_state
-from workflow import run_heartbeat
+from tasks import (
+    assign_task,
+    auto_timeout_tasks,
+    get_active_task,
+    get_pending_tasks,
+    load_tasks,
+    save_tasks,
+    start_task,
+)
+from workflow import run_heartbeat, run_task_heartbeat
 
 T = TypeVar('T')
 R = TypeVar('R')
@@ -73,6 +82,8 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0) -> None:
     _load_brain = retry()(load_brain)
     _save_state = retry()(save_state)
     _save_brain = retry()(save_brain)
+    _load_tasks = retry()(load_tasks)
+    _save_tasks = retry()(save_tasks)
 
     # Point execution log DB next to the state file
     import os as _os
@@ -130,6 +141,26 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0) -> None:
         if expired_goals:
             logger.info("Auto-expired %d overdue goals: %s", len(expired_goals), expired_goals)
 
+        # ── Task queue management ─────────────────────────────────
+        tasks = await _load_tasks(config.state_file)
+        timed_out = auto_timeout_tasks(tasks)
+        if timed_out:
+            logger.info("Auto-timed-out %d task(s): %s", len(timed_out), timed_out)
+
+        # Determine if there's a task to work on this cycle
+        active_task = get_active_task(tasks, persona.name)
+        if active_task is None:
+            # Pick the highest-priority pending task and assign it
+            pending = get_pending_tasks(tasks)
+            if pending:
+                active_task = pending[0]
+                assign_task(active_task, persona.name)
+                start_task(active_task)
+                logger.info(
+                    "Picked up task %s: %s (priority=%s)",
+                    active_task.id, active_task.title, active_task.priority,
+                )
+
         # ── Daily digest: first heartbeat of a new day ────────────
         from daily_digest import is_first_run_today, build_digest, save_digest
         if is_first_run_today(state.last_heartbeat):
@@ -179,7 +210,22 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0) -> None:
 
         try:
             # GitHubCopilotAgent requires async context manager for start/stop
-            if config.provider == "copilot":
+            if active_task:
+                logger.info(
+                    "Working on task %s (%d/%d heartbeats): %s",
+                    active_task.id, active_task.heartbeats_spent + 1,
+                    active_task.max_heartbeats, active_task.title,
+                )
+                if config.provider == "copilot":
+                    async with agent:
+                        await run_task_heartbeat(
+                            agent, state, brain, config, persona, active_task,
+                        )
+                else:
+                    await run_task_heartbeat(
+                        agent, state, brain, config, persona, active_task,
+                    )
+            elif config.provider == "copilot":
                 async with agent:
                     await run_heartbeat(agent, state, brain, config, persona)
             else:
@@ -217,6 +263,10 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0) -> None:
                 await _save_brain(brain, config.state_file)
             except Exception as e:
                 logger.error("Failed to save brain after retries: %s", str(e))
+            try:
+                await _save_tasks(tasks, config.state_file)
+            except Exception as e:
+                logger.error("Failed to save tasks after retries: %s", str(e))
 
         # Adaptive interval: score productivity, scale sleep accordingly
         new_notes = len(brain.notes) - notes_before

@@ -26,14 +26,28 @@ with patch.dict('sys.modules', {
         BrainState,
         Note,
         add_note,
+        apply_relevance_feedback,
+        assign_note_to_topic,
+        build_brain_stats,
+        build_brain_stats_from_store,
         connect_notes,
+        describe_note,
+        describe_note_from_store,
         get_notes_by_category,
         get_recent_notes,
+        get_topic_map,
+        get_topic_map_from_store,
         build_brain_summary,
         load_brain,
+        record_contradiction,
         save_brain,
         find_duplicate,
         decay_stale_notes,
+        search_notes,
+        search_notes_from_store,
+        trace_topic,
+        trace_topic_from_store,
+        _brain_db_path,
         _brain_path,
     )
 from state import AgentState
@@ -60,6 +74,9 @@ def temp_state_file():
     brain_file = _brain_path(state_file)
     if os.path.exists(brain_file):
         os.remove(brain_file)
+    brain_db = _brain_db_path(state_file)
+    if os.path.exists(brain_db):
+        os.remove(brain_db)
 
 
 @pytest.fixture
@@ -91,16 +108,33 @@ def test_note_dataclass():
         content="Test content",
         summary="Test summary",
         source="agent",
+        note_type="pattern",
+        status="active",
+        confidence=85,
+        evidence=["commit abc123"],
         tags=["test", "example"],
         category="resources",
         connections=["n0002"],
         created_at="2024-01-01T00:00:00Z",
-        updated_at="2024-01-01T00:00:00Z"
+        updated_at="2024-01-01T00:00:00Z",
+        last_accessed_at="2024-01-01T00:00:00Z",
+        last_confirmed_at="2024-01-01T00:00:00Z",
+        recall_count=3,
+        positive_feedback=2,
+        negative_feedback=1,
+        contradiction_count=1,
+        contradicted_by=["n0003"],
+        feedback_log=[{"timestamp": "2024-01-02T00:00:00Z", "relevant": True, "reason": "validated"}],
+        contradiction_log=[{"timestamp": "2024-01-03T00:00:00Z", "by_note_id": "n0003", "reason": "replaced"}],
     )
     assert note.id == "n0001"
     assert note.content == "Test content"
     assert note.tags == ["test", "example"]
     assert note.category == "resources"
+    assert note.note_type == "pattern"
+    assert note.confidence == 85
+    assert note.recall_count == 3
+    assert note.positive_feedback == 2
 
 
 def test_add_note_success():
@@ -125,6 +159,28 @@ def test_add_note_success():
     assert note_data["updated_at"] is not None
 
 
+def test_add_note_with_metadata_fields():
+    """Notes can store type, status, confidence, and evidence."""
+    brain = BrainState()
+    note_id = add_note(
+        brain,
+        content="User prefers named exports",
+        summary="Named export preference",
+        note_type="preference",
+        status="confirmed",
+        confidence=92,
+        evidence=["src/foo.ts", "src/bar.ts"],
+        tags=["preference", "imports"],
+    )
+
+    note = brain.notes[note_id]
+    assert note["note_type"] == "preference"
+    assert note["status"] == "confirmed"
+    assert note["confidence"] == 92
+    assert note["evidence"] == ["src/foo.ts", "src/bar.ts"]
+    assert note["last_accessed_at"]
+
+
 def test_add_note_fallback_on_error():
     """Test that add_note falls back to minimal note on error."""
     brain = BrainState()
@@ -132,8 +188,11 @@ def test_add_note_fallback_on_error():
     note_id = add_note(brain, content="Test content")
     assert note_id != "n0000"
 
-    # Simulate error in second attempt by patching Note
-    with patch("second_brain.Note", side_effect=Exception("Dataclass error")):
+    # Simulate serialization failure in both normal and fallback paths.
+    def _broken_asdict(_value):
+        raise Exception("Dataclass error")
+
+    with patch.dict(add_note.__globals__, {"asdict": _broken_asdict}):
         note_id = add_note(brain, content="This should fail")
         assert note_id == "n0000"
 
@@ -260,11 +319,193 @@ def test_build_brain_summary_empty():
     assert "Last review: never" in summary
 
 
+def test_build_brain_stats_includes_types_topics_and_orphans():
+    """Stats surface note types, top topics, and orphan counts."""
+    brain = BrainState()
+    n1 = add_note(brain, content="React hooks pattern", note_type="pattern", tags=["react", "hooks"])
+    n2 = add_note(brain, content="User prefers named exports", note_type="preference", tags=["imports"])
+    assign_note_to_topic(brain, n1, "React")
+    assign_note_to_topic(brain, n1, "Hooks")
+    assign_note_to_topic(brain, n2, "Style")
+    connect_notes(brain, n1, n2, reason="frontend conventions")
+
+    stats = build_brain_stats(brain)
+
+    assert stats["notes"] == 2
+    assert stats["connections"] == 1
+    assert stats["note_types"]["pattern"] == 1
+    assert stats["note_types"]["preference"] == 1
+    assert stats["orphans"] == 0
+    assert stats["top_topics"]
+    assert any(topic["name"] == "React" for topic in stats["top_topics"])
+
+
+def test_describe_note_returns_topics_pages_and_connections():
+    """describe_note returns rich note context for inspection."""
+    brain = BrainState()
+    n1 = add_note(
+        brain,
+        content="Use feature flags for risky deploys",
+        summary="Feature flag deploy guidance",
+        note_type="decision",
+        confidence=88,
+        evidence=["docs/release.md"],
+        tags=["deploy"],
+    )
+    n2 = add_note(brain, content="Rollback path must stay warm", summary="Rollback guidance")
+    assign_note_to_topic(brain, n1, "Deployments")
+    connect_notes(brain, n1, n2, reason="release safety")
+    brain.pages["deployments"] = {
+        "id": "deployments",
+        "title": "Deployments",
+        "content": "Deployment knowledge",
+        "sources": [n1],
+        "tags": ["deploy"],
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z",
+    }
+
+    desc = describe_note(brain, n1)
+
+    assert desc is not None
+    assert desc["note_type"] == "decision"
+    assert desc["confidence"] == 88
+    assert desc["topics"] == ["Deployments"]
+    assert desc["source_pages"] == ["Deployments"]
+    assert desc["connected_notes"][0]["id"] == n2
+
+
+def test_trace_topic_returns_topics_and_reachable_notes():
+    """trace_topic should traverse related topics and list reachable notes."""
+    brain = BrainState()
+    n1 = add_note(brain, content="React hooks reduce boilerplate", summary="Hooks")
+    n2 = add_note(brain, content="Context can replace prop drilling", summary="Context")
+    assign_note_to_topic(brain, n1, "React")
+    assign_note_to_topic(brain, n2, "State")
+    brain.topics["t0001"]["related_topics"] = ["t0002"]
+    brain.topics["t0002"]["related_topics"] = ["t0001"]
+
+    trace = trace_topic(brain, "React", depth=1, limit=10)
+
+    assert trace is not None
+    assert trace["topic"] == "React"
+    assert len(trace["topics"]) == 2
+    assert trace["total_notes"] == 2
+    assert {note["id"] for note in trace["notes"]} == {n1, n2}
+
+
+def test_search_notes_prefers_confident_connected_recent_note():
+    """Ranking should favor stronger, fresher, connected notes over weak archived ones."""
+    brain = BrainState()
+    weak = add_note(
+        brain,
+        content="Deploy strategy for rollouts",
+        summary="Old deploy note",
+        status="archive",
+        confidence=10,
+    )
+    strong = add_note(
+        brain,
+        content="Deploy strategy for rollouts",
+        summary="Current deploy decision",
+        note_type="decision",
+        confidence=95,
+        status="active",
+    )
+    helper = add_note(brain, content="Feature flags protect rollouts", summary="Feature flags")
+    connect_notes(brain, strong, helper, reason="release safety")
+    brain.notes[weak]["updated_at"] = "2020-01-01T00:00:00+00:00"
+
+    results = search_notes(brain, "deploy strategy", max_results=2)
+
+    assert results[0]["id"] == strong
+
+
+def test_search_notes_records_access_signals():
+    """Explicit retrieval should persist access counters in-memory."""
+    brain = BrainState()
+    note_id = add_note(brain, content="Deploy strategy prefers feature flags", summary="Deploy strategy")
+    brain.notes[note_id]["last_accessed_at"] = ""
+
+    results = search_notes(brain, "deploy strategy", max_results=5, record_access=True)
+
+    assert results[0]["id"] == note_id
+    assert brain.notes[note_id]["recall_count"] == 1
+    assert brain.notes[note_id]["last_accessed_at"]
+
+
+def test_search_notes_demotes_weak_and_contradicted_memories():
+    """Negative feedback and contradiction signals should demote weaker notes."""
+    brain = BrainState()
+    outdated = add_note(
+        brain,
+        content="Deploy strategy uses manual approval gates",
+        summary="Old deploy strategy",
+        confidence=90,
+    )
+    current = add_note(
+        brain,
+        content="Deploy strategy uses manual approval gates",
+        summary="Current deploy strategy",
+        note_type="decision",
+        confidence=72,
+    )
+
+    apply_relevance_feedback(brain, current, relevant=True, reason="Seen in current rollout docs")
+    apply_relevance_feedback(brain, outdated, relevant=False, reason="Old playbook")
+    record_contradiction(brain, outdated, current, reason="Automation replaced the manual gate")
+
+    results = search_notes(brain, "deploy strategy", max_results=2)
+
+    assert results[0]["id"] == current
+    assert brain.notes[outdated]["status"] in {"tentative", "superseded"}
+
+
+def test_store_backed_queries_match_saved_brain():
+    """Store-backed search/stats/detail/trace helpers should work off the SQLite brain store."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_file = os.path.join(tmpdir, "state.json")
+        brain = BrainState()
+        n1 = add_note(
+            brain,
+            content="Deploy strategy with feature flags",
+            summary="Deploy strategy",
+            note_type="decision",
+            confidence=91,
+            tags=["deploy"],
+        )
+        n2 = add_note(brain, content="Feature flags reduce rollout risk", summary="Flags")
+        assign_note_to_topic(brain, n1, "Deployments")
+        assign_note_to_topic(brain, n2, "Deployments")
+        connect_notes(brain, n1, n2, reason="release safety")
+
+        _run(save_brain(brain, state_file))
+        os.remove(_brain_path(state_file))
+
+        stats = build_brain_stats_from_store(state_file)
+        results = search_notes_from_store(state_file, "deploy strategy", max_results=5, record_access=True)
+        desc = describe_note_from_store(state_file, n1, record_access=True)
+        topics = get_topic_map_from_store(state_file)
+        trace = trace_topic_from_store(state_file, "Deployments", depth=1, limit=10, record_access=True)
+        loaded = _run(load_brain(state_file))
+
+        assert stats["notes"] == 2
+        assert results[0]["id"] == n1
+        assert desc is not None and desc["id"] == n1
+        assert any(topic["name"] == "Deployments" for topic in topics)
+        assert trace is not None and trace["total_notes"] == 2
+        assert loaded.notes[n1]["recall_count"] >= 3
+        assert loaded.notes[n1]["last_accessed_at"]
+        assert loaded.notes[n2]["recall_count"] >= 1
+
+
 def test_brain_path_derivation():
     """Test that brain path is correctly derived from state file."""
     # Use os.path.join for platform-independent comparison
     assert _brain_path("data/agent_state.json") == os.path.join("data", "brain.json")
     assert _brain_path("config/state.json") == os.path.join("config", "brain.json")
+    assert _brain_db_path("data/agent_state.json") == os.path.join("data", "brain.db")
+    assert _brain_db_path("config/state.json") == os.path.join("config", "brain.db")
 
 
 def test_load_brain_file_not_found():
@@ -282,6 +523,7 @@ def test_load_brain_success():
     with tempfile.TemporaryDirectory() as tmpdir:
         state_file = os.path.join(tmpdir, "state.json")
         brain_file = _brain_path(state_file)
+        brain_db = _brain_db_path(state_file)
 
         test_brain = BrainState(
             notes={"n0001": {"id": "n0001", "content": "Test", "summary": "", "source": "agent", "tags": [], "category": "resources", "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:00:00Z"}},
@@ -298,6 +540,7 @@ def test_load_brain_success():
         loaded_brain = _run(load_brain(state_file))
         assert loaded_brain.notes == test_brain.notes
         assert loaded_brain.connections == test_brain.connections
+        assert os.path.exists(brain_db)
 
 
 def test_load_brain_invalid_json():
@@ -320,6 +563,7 @@ def test_save_brain_writes_valid_file():
     with tempfile.TemporaryDirectory() as tmpdir:
         state_file = os.path.join(tmpdir, "state.json")
         brain_file = _brain_path(state_file)
+        brain_db = _brain_db_path(state_file)
 
         brain = BrainState(
             notes={"n0001": {"id": "n0001", "content": "Test", "summary": "", "source": "agent", "tags": [], "category": "resources", "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:00:00Z"}},
@@ -335,6 +579,24 @@ def test_save_brain_writes_valid_file():
             loaded = json.load(f)
         assert "n0001" in loaded["notes"]
         assert loaded["notes"]["n0001"]["content"] == "Test"
+        assert os.path.exists(brain_db)
+
+
+def test_load_brain_from_sqlite_when_snapshot_missing():
+    """SQLite is the primary store; load still works if brain.json is removed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_file = os.path.join(tmpdir, "state.json")
+        brain_file = _brain_path(state_file)
+
+        brain = BrainState()
+        add_note(brain, content="Persisted only in sqlite", summary="SQLite brain")
+        _run(save_brain(brain, state_file))
+
+        os.remove(brain_file)
+
+        loaded_brain = _run(load_brain(state_file))
+        assert len(loaded_brain.notes) == 1
+        assert loaded_brain.notes["n0001"]["content"] == "Persisted only in sqlite"
 
 
 def test_save_brain_max_review_limit():

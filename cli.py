@@ -13,10 +13,22 @@ Usage
     python cli.py brief                  # Daily digest / morning briefing
     python cli.py brief --save           # Save digest to data/digests/
     python cli.py brain stats            # Show brain statistics
+    python cli.py brain show n0001       # Inspect one note in detail
     python cli.py brain search "React"   # Full-text search over notes
+    python cli.py brain topics           # Show the most connected topics
+    python cli.py brain trace React      # Traverse notes reachable from a topic
+    python cli.py brain feedback n0001 --relevant   # Reinforce a memory
+    python cli.py brain contradict n0002 n0005      # Demote a contradicted memory
     python cli.py brain add "insight"    # Manually add a note
     python cli.py brain export           # Dump brain to markdown
     python cli.py brain lint             # Run health check
+    python cli.py task add "Fix the login bug" -p high   # Create a task
+    python cli.py task list                # List all tasks
+    python cli.py task list -s blocked     # List blocked tasks
+    python cli.py task status t1a2b3       # Show task details
+    python cli.py task answer t1a2b3 "Use OAuth2"  # Unblock a task
+    python cli.py task cancel t1a2b3               # Cancel a task
+    python cli.py task retry t1a2b3                # Retry a failed/blocked task
     python cli.py persona list           # Show available personas
     python cli.py persona set <name>      # Switch active persona
     python cli.py watch start             # Start file/git event watcher
@@ -141,32 +153,173 @@ def cmd_run(args: argparse.Namespace, config: AppConfig) -> None:
 
 def cmd_brain_stats(args: argparse.Namespace, config: AppConfig) -> None:
     """Show brain statistics."""
-    brain = _load_brain_sync(config)
+    from second_brain import build_brain_stats_from_store
 
-    categories: dict[str, int] = {}
-    for note in brain.notes.values():
-        cat = note.get("category", "resources")
-        categories[cat] = categories.get(cat, 0) + 1
+    stats = build_brain_stats_from_store(config.state_file)
 
-    print(f"Notes:       {len(brain.notes)}")
-    print(f"Connections: {len(brain.connections)}")
-    print(f"Reviews:     {len(brain.review_log)}")
-    print(f"Last review: {brain.last_review or 'never'}")
-    if categories:
-        print(f"Categories:  {', '.join(f'{k}={v}' for k, v in sorted(categories.items()))}")
+    print(f"Notes:             {stats['notes']}")
+    print(f"Wiki pages:        {stats['pages']}")
+    print(f"Topics:            {stats['topics']}")
+    print(f"Connections:       {stats['connections']}")
+    print(f"Reviews:           {stats['reviews']}")
+    print(f"Pending consolidate: {stats['unconsolidated']}")
+    print(f"Orphans:           {stats['orphans']}")
+    print(f"Connection density: {stats['connection_density']:.2f}")
+    print(f"Last review:       {stats['last_review']}")
+    print(f"Last consolidation: {stats['last_consolidation']}")
+    if stats["categories"]:
+        print(f"Categories:        {', '.join(f'{k}={v}' for k, v in sorted(stats['categories'].items()))}")
+    if stats["note_types"]:
+        print(f"Note types:        {', '.join(f'{k}={v}' for k, v in sorted(stats['note_types'].items()))}")
+    if stats["statuses"]:
+        print(f"Statuses:          {', '.join(f'{k}={v}' for k, v in sorted(stats['statuses'].items()))}")
+    if any(stats[key] for key in ("recalls", "positive_feedback", "negative_feedback", "contradictions")):
+        print(
+            "Memory signals:    "
+            f"recalls={stats['recalls']}, "
+            f"relevant={stats['positive_feedback']}, "
+            f"irrelevant={stats['negative_feedback']}, "
+            f"contradictions={stats['contradictions']}"
+        )
+    if stats["top_topics"]:
+        print("Top topics:")
+        for topic in stats["top_topics"]:
+            print(f"  - {topic['name']} ({topic['notes']} notes, {topic['related']} related)")
+
+
+def cmd_brain_show(args: argparse.Namespace, config: AppConfig) -> None:
+    """Inspect a single note with metadata and related context."""
+    from second_brain import describe_note_from_store
+
+    details = describe_note_from_store(config.state_file, args.note_id, record_access=True)
+    if details is None:
+        print(f"Note '{args.note_id}' not found.")
+        return
+
+    print(f"[{details['id']}] {details['summary']}")
+    print(f"Type: {details['note_type']} | Status: {details['status']} | Category: {details['category']}")
+    if details["confidence"] is not None:
+        print(f"Confidence: {details['confidence']}")
+    print(f"Created: {details['created_at'] or '?'}")
+    print(f"Updated: {details['updated_at'] or '?'}")
+    if details["last_accessed_at"]:
+        print(f"Last accessed: {details['last_accessed_at']}")
+    if details["last_confirmed_at"]:
+        print(f"Last confirmed: {details['last_confirmed_at']}")
+    print(f"Recall count: {details['recall_count']}")
+    if details["positive_feedback"] or details["negative_feedback"]:
+        print(
+            "Feedback: "
+            f"+{details['positive_feedback']} / -{details['negative_feedback']}"
+        )
+    if details["contradiction_count"]:
+        print(f"Contradictions: {details['contradiction_count']}")
+    if details["contradicted_by"]:
+        print(f"Contradicted by: {', '.join(details['contradicted_by'])}")
+
+    source = details["source"]
+    if isinstance(source, dict):
+        print("Source:")
+        for key, value in source.items():
+            print(f"  - {key}: {value}")
+    else:
+        print(f"Source: {source}")
+
+    if details["tags"]:
+        print(f"Tags: {', '.join(details['tags'])}")
+    if details["topics"]:
+        print(f"Topics: {', '.join(details['topics'])}")
+    if details["evidence"]:
+        print("Evidence:")
+        for item in details["evidence"]:
+            print(f"  - {item}")
+    if details["source_pages"]:
+        print("Source pages:")
+        for page in details["source_pages"]:
+            print(f"  - {page}")
+    if details["feedback_log"]:
+        print("Recent feedback:")
+        for entry in details["feedback_log"][-3:]:
+            label = "relevant" if entry.get("relevant") else "irrelevant"
+            suffix = f": {entry['reason']}" if entry.get("reason") else ""
+            print(f"  - {entry.get('timestamp', '?')} {label}{suffix}")
+    if details["contradiction_log"]:
+        print("Recent contradictions:")
+        for entry in details["contradiction_log"][-3:]:
+            label = entry.get("by_note_id") or "unknown"
+            suffix = f": {entry['reason']}" if entry.get("reason") else ""
+            print(f"  - {entry.get('timestamp', '?')} by {label}{suffix}")
+
+    print("Content:")
+    print(details["content"])
+
+    if details["connected_notes"]:
+        print("Connected notes:")
+        for note in details["connected_notes"]:
+            print(
+                f"  - [{note['id']}] ({note['note_type']}/{note['category']}) {note['summary']}"
+            )
+
+
+def cmd_brain_topics(args: argparse.Namespace, config: AppConfig) -> None:
+    """Show the top topics in the brain."""
+    from second_brain import get_topic_map_from_store
+
+    topics = sorted(
+        get_topic_map_from_store(config.state_file),
+        key=lambda topic: (topic["notes"], topic["related"], topic["name"].lower()),
+        reverse=True,
+    )
+    limit = max(1, args.limit)
+    if not topics:
+        print("No topics found.")
+        return
+
+    print(f"Top topics ({min(limit, len(topics))}/{len(topics)}):")
+    for topic in topics[:limit]:
+        print(f"  - {topic['name']} [{topic['id']}] {topic['notes']} note(s), {topic['related']} related topic(s)")
+
+
+def cmd_brain_trace(args: argparse.Namespace, config: AppConfig) -> None:
+    """Trace a topic through the brain graph."""
+    from second_brain import trace_topic_from_store
+
+    trace = trace_topic_from_store(
+        config.state_file,
+        args.topic,
+        depth=args.depth,
+        limit=args.limit,
+        record_access=True,
+    )
+    if trace is None:
+        print(f"Topic '{args.topic}' not found.")
+        return
+
+    print(f"Topic trace: {trace['topic']} (depth={trace['depth']})")
+    print(f"Topics visited: {len(trace['topics'])}")
+    for topic in trace["topics"]:
+        print(f"  - {topic['name']} [{topic['id']}] depth={topic['depth']} notes={topic['notes']} related={topic['related']}")
+
+    print(f"Reachable notes: {trace['total_notes']}")
+    for note in trace["notes"]:
+        tags = ", ".join(note.get("tags", []))
+        tag_str = f" [{tags}]" if tags else ""
+        print(f"  - [{note['id']}] ({note['note_type']}/{note['category']}) {note['summary']}{tag_str}")
 
 
 def cmd_brain_search(args: argparse.Namespace, config: AppConfig) -> None:
     """Full-text search over brain notes."""
-    brain = _load_brain_sync(config)
-    query = args.query.lower()
-    hits = []
-    for nid, note in brain.notes.items():
-        content = note.get("content", "").lower()
-        summary = note.get("summary", "").lower()
-        tags = " ".join(note.get("tags", [])).lower()
-        if query in content or query in summary or query in tags:
-            hits.append((nid, note))
+    from second_brain import search_notes_from_store
+
+    hits = [
+        (note.get("id", "?"), note)
+        for note in search_notes_from_store(
+            config.state_file,
+            args.query,
+            max_results=args.limit,
+            record_access=True,
+        )
+    ]
 
     if not hits:
         print(f"No notes matching '{args.query}'")
@@ -177,9 +330,63 @@ def cmd_brain_search(args: argparse.Namespace, config: AppConfig) -> None:
         summary = note.get("summary") or note.get("content", "")[:80]
         tags = ", ".join(note.get("tags", []))
         cat = note.get("category", "resources")
-        print(f"  [{nid}] ({cat}) {summary}")
+        note_type = note.get("note_type", "general")
+        status = note.get("status", "active")
+        print(f"  [{nid}] ({note_type}/{cat}, {status}) {summary}")
         if tags:
             print(f"    tags: {tags}")
+        if note.get("confidence") is not None:
+            print(f"    confidence: {note['confidence']}")
+
+
+def cmd_brain_feedback(args: argparse.Namespace, config: AppConfig) -> None:
+    """Record explicit relevance feedback for a note."""
+    from second_brain import apply_relevance_feedback, load_brain, save_brain
+
+    async def _feedback():
+        brain = await load_brain(config.state_file)
+        relevant = bool(args.relevant)
+        if not apply_relevance_feedback(
+            brain,
+            args.note_id,
+            relevant=relevant,
+            reason=args.reason,
+        ):
+            print(f"Note '{args.note_id}' not found.")
+            return
+        await save_brain(brain, config.state_file)
+        signal = "relevant" if relevant else "irrelevant"
+        print(f"Recorded {signal} feedback for {args.note_id}.")
+
+    asyncio.run(_feedback())
+
+
+def cmd_brain_contradict(args: argparse.Namespace, config: AppConfig) -> None:
+    """Mark one note as contradicted by another note."""
+    from second_brain import load_brain, record_contradiction, save_brain
+
+    async def _contradict():
+        brain = await load_brain(config.state_file)
+        if args.note_id not in brain.notes:
+            print(f"Note '{args.note_id}' not found.")
+            return
+        if args.by_note_id not in brain.notes:
+            print(f"Note '{args.by_note_id}' not found.")
+            return
+        if not record_contradiction(
+            brain,
+            args.note_id,
+            args.by_note_id,
+            reason=args.reason,
+            supersede=True if args.supersede else None,
+        ):
+            print("Could not record contradiction.")
+            return
+        await save_brain(brain, config.state_file)
+        status = brain.notes[args.note_id].get("status", "active")
+        print(f"Marked {args.note_id} as contradicted by {args.by_note_id} ({status}).")
+
+    asyncio.run(_contradict())
 
 
 def cmd_brain_add(args: argparse.Namespace, config: AppConfig) -> None:
@@ -193,6 +400,9 @@ def cmd_brain_add(args: argparse.Namespace, config: AppConfig) -> None:
             content=args.content,
             summary=args.content[:80],
             source={"type": "manual", "timestamp": datetime.now(timezone.utc).isoformat()},
+            note_type=args.note_type,
+            status=args.status,
+            confidence=args.confidence,
             tags=args.tags.split(",") if args.tags else [],
             category=args.category,
         )
@@ -226,8 +436,20 @@ def cmd_brain_export(args: argparse.Namespace, config: AppConfig) -> None:
             tags = ", ".join(note.get("tags", []))
             lines.append(f"### {nid}: {summary}\n")
             lines.append(note.get("content", ""))
+            lines.append(
+                f"\n*Type: {note.get('note_type', 'general')} | "
+                f"Status: {note.get('status', 'active')} | "
+                f"Category: {note.get('category', 'resources')}*"
+            )
+            if note.get("confidence") is not None:
+                lines.append(f"*Confidence: {note['confidence']}*")
             if tags:
                 lines.append(f"\n*Tags: {tags}*")
+            evidence = note.get("evidence", [])
+            if evidence:
+                lines.append("\n*Evidence:*")
+                for item in evidence:
+                    lines.append(f"- {item}")
             lines.append(f"*Created: {note.get('created_at', '?')}*\n")
 
     if brain.connections:
@@ -368,6 +590,113 @@ def cmd_brief(args: argparse.Namespace, config: AppConfig) -> None:
     if getattr(args, "save", False):
         path = save_digest(digest)
         print(f"\nSaved to {path}")
+
+
+def cmd_task_add(args: argparse.Namespace, config: AppConfig) -> None:
+    """Create a new task for the agent."""
+    from tasks import create_task, load_tasks, save_tasks
+
+    async def _add():
+        tasks = await load_tasks(config.state_file)
+        task = create_task(
+            title=args.title,
+            description=args.description or args.title,
+            priority=args.priority,
+            max_heartbeats=args.max_heartbeats,
+        )
+        tasks.append(task)
+        await save_tasks(tasks, config.state_file)
+        print(f"Created task {task.id}: {task.title} (priority={task.priority})")
+
+    asyncio.run(_add())
+
+
+def cmd_task_list(args: argparse.Namespace, config: AppConfig) -> None:
+    """List tasks."""
+    from tasks import format_task_list, load_tasks
+
+    async def _list():
+        tasks = await load_tasks(config.state_file)
+        status_filter = getattr(args, "status", "all") or "all"
+        print(format_task_list(tasks, status_filter=status_filter))
+
+    asyncio.run(_list())
+
+
+def cmd_task_status(args: argparse.Namespace, config: AppConfig) -> None:
+    """Show detailed status of a task."""
+    from tasks import find_task, format_task_detail, load_tasks
+
+    async def _status():
+        tasks = await load_tasks(config.state_file)
+        task = find_task(tasks, args.task_id)
+        if task is None:
+            print(f"Task '{args.task_id}' not found.")
+            sys.exit(1)
+        print(format_task_detail(task))
+
+    asyncio.run(_status())
+
+
+def cmd_task_answer(args: argparse.Namespace, config: AppConfig) -> None:
+    """Answer a blocked task's question to unblock it."""
+    from tasks import answer_task, find_task, load_tasks, save_tasks
+
+    async def _answer():
+        tasks = await load_tasks(config.state_file)
+        task = find_task(tasks, args.task_id)
+        if task is None:
+            print(f"Task '{args.task_id}' not found.")
+            sys.exit(1)
+        if task.status != "blocked":
+            print(f"Task {task.id} is not blocked (status={task.status}).")
+            sys.exit(1)
+        answer_task(task, args.answer)
+        await save_tasks(tasks, config.state_file)
+        print(f"Answered task {task.id} — it will resume on the next heartbeat.")
+
+    asyncio.run(_answer())
+
+
+def cmd_task_cancel(args: argparse.Namespace, config: AppConfig) -> None:
+    """Cancel a task."""
+    from tasks import cancel_task, find_task, load_tasks, save_tasks
+
+    async def _cancel():
+        tasks = await load_tasks(config.state_file)
+        task = find_task(tasks, args.task_id)
+        if task is None:
+            print(f"Task '{args.task_id}' not found.")
+            sys.exit(1)
+        if task.status in ("completed", "failed"):
+            print(f"Task {task.id} is already {task.status} — cannot cancel.")
+            sys.exit(1)
+        reason = getattr(args, "reason", "") or ""
+        cancel_task(task, reason)
+        await save_tasks(tasks, config.state_file)
+        print(f"Cancelled task {task.id}: {task.title}")
+
+    asyncio.run(_cancel())
+
+
+def cmd_task_retry(args: argparse.Namespace, config: AppConfig) -> None:
+    """Retry a failed or blocked task."""
+    from tasks import find_task, load_tasks, retry_task, save_tasks
+
+    async def _retry():
+        tasks = await load_tasks(config.state_file)
+        task = find_task(tasks, args.task_id)
+        if task is None:
+            print(f"Task '{args.task_id}' not found.")
+            sys.exit(1)
+        if task.status not in ("failed", "blocked"):
+            print(f"Task {task.id} is {task.status} — only failed or blocked tasks can be retried.")
+            sys.exit(1)
+        retry_task(task)
+        await save_tasks(tasks, config.state_file)
+        print(f"Retried task {task.id}: {task.title} — it will be picked up next heartbeat.")
+
+    asyncio.run(_retry())
 
 
 def cmd_config_show(args: argparse.Namespace, config: AppConfig) -> None:
@@ -674,7 +1003,7 @@ def cmd_code(args: argparse.Namespace, config: AppConfig) -> None:
 
 def cmd_chat(args: argparse.Namespace, config: AppConfig) -> None:
     """Start an interactive chat session with the agent."""
-    from second_brain import load_brain, save_brain, add_note, search_notes
+    from second_brain import load_brain, save_brain, add_note, search_notes, search_notes_from_store
     from state import load_state, save_state
     from agent_setup import create_agent
     from learning import build_context_block
@@ -741,8 +1070,13 @@ def cmd_chat(args: argparse.Namespace, config: AppConfig) -> None:
             Use this when the user asks what you know, or when you need to look
             up a previously stored fact, preference, or piece of knowledge."""
             nonlocal brain
-            brain = _run_async(load_brain(config.state_file))  # reload latest
-            results = search_notes(brain, query)
+            results = search_notes_from_store(
+                config.state_file,
+                query,
+                max_results=8,
+                record_access=True,
+            )
+            brain = _run_async(load_brain(config.state_file))  # refresh access counters
             if not results:
                 return f"No memories found matching '{query}'."
             lines = [f"Found {len(results)} memory note(s):"]
@@ -953,16 +1287,76 @@ def build_parser() -> argparse.ArgumentParser:
 
     search_p = brain_sub.add_parser("search", help="Full-text search over notes")
     search_p.add_argument("query", help="Search query")
+    search_p.add_argument("--limit", type=int, default=10, help="Maximum results to show")
+
+    show_p = brain_sub.add_parser("show", help="Show one note with metadata and connections")
+    show_p.add_argument("note_id", help="Note ID to inspect")
+
+    topics_p = brain_sub.add_parser("topics", help="Show the most connected topics")
+    topics_p.add_argument("--limit", type=int, default=10, help="Maximum topics to show")
+
+    trace_p = brain_sub.add_parser("trace", help="Trace notes reachable from a topic")
+    trace_p.add_argument("topic", help="Topic name to trace")
+    trace_p.add_argument("--depth", type=int, default=1, help="How many topic hops to traverse")
+    trace_p.add_argument("--limit", type=int, default=10, help="Maximum notes to show")
+
+    feedback_p = brain_sub.add_parser("feedback", help="Record explicit relevance feedback for a note")
+    feedback_p.add_argument("note_id", help="Note ID to reinforce or demote")
+    feedback_group = feedback_p.add_mutually_exclusive_group(required=True)
+    feedback_group.add_argument("--relevant", action="store_true", help="Mark note as reinforced")
+    feedback_group.add_argument("--irrelevant", action="store_true", help="Mark note as weak or stale")
+    feedback_p.add_argument("--reason", default="", help="Optional reason for the feedback")
+
+    contradict_p = brain_sub.add_parser("contradict", help="Mark a note as contradicted by another note")
+    contradict_p.add_argument("note_id", help="Note ID to demote")
+    contradict_p.add_argument("by_note_id", help="Note ID that contradicts or supersedes it")
+    contradict_p.add_argument("--reason", default="", help="Optional contradiction reason")
+    contradict_p.add_argument("--supersede", action="store_true", help="Force the contradicted note into superseded status")
 
     add_p = brain_sub.add_parser("add", help="Manually add a note")
     add_p.add_argument("content", help="Note content")
     add_p.add_argument("--tags", default="", help="Comma-separated tags")
     add_p.add_argument("--category", default="resources", help="PARA category")
+    add_p.add_argument("--type", dest="note_type", default="general", help="Note type")
+    add_p.add_argument("--status", default="active", help="Lifecycle status")
+    add_p.add_argument("--confidence", type=int, default=None, help="Confidence score (0-100)")
 
     export_p = brain_sub.add_parser("export", help="Export brain to markdown")
     export_p.add_argument("-o", "--output", help="Output file path (default: stdout)")
 
     brain_sub.add_parser("lint", help="Run brain health check")
+
+    # task
+    task_p = sub.add_parser("task", help="Task queue management")
+    task_sub = task_p.add_subparsers(dest="task_command")
+
+    task_add_p = task_sub.add_parser("add", help="Create a new task for the agent")
+    task_add_p.add_argument("title", help="Task title / short description")
+    task_add_p.add_argument("-d", "--description", default=None,
+                            help="Detailed description (default: same as title)")
+    task_add_p.add_argument("-p", "--priority", default="medium",
+                            choices=["low", "medium", "high", "urgent"],
+                            help="Task priority (default: medium)")
+    task_add_p.add_argument("--max-heartbeats", type=int, default=10,
+                            help="Maximum heartbeats before auto-timeout (default: 10)")
+
+    task_list_p = task_sub.add_parser("list", help="List tasks")
+    task_list_p.add_argument("-s", "--status", default="all",
+                             help="Filter by status (pending, in_progress, blocked, completed, failed, all)")
+
+    task_status_p = task_sub.add_parser("status", help="Show detailed task status")
+    task_status_p.add_argument("task_id", help="Task ID to inspect")
+
+    task_answer_p = task_sub.add_parser("answer", help="Answer a blocked task's question")
+    task_answer_p.add_argument("task_id", help="Task ID to answer")
+    task_answer_p.add_argument("answer", help="Your answer to the agent's question")
+
+    task_cancel_p = task_sub.add_parser("cancel", help="Cancel a pending or in-progress task")
+    task_cancel_p.add_argument("task_id", help="Task ID to cancel")
+    task_cancel_p.add_argument("--reason", default="", help="Optional cancellation reason")
+
+    task_retry_p = task_sub.add_parser("retry", help="Retry a failed or blocked task")
+    task_retry_p.add_argument("task_id", help="Task ID to retry")
 
     # persona
     persona_p = sub.add_parser("persona", help="Persona management")
@@ -1009,9 +1403,22 @@ def main(argv: list[str] | None = None) -> None:
         "chat": cmd_chat,
         "brief": cmd_brief,
         "code": cmd_code,
+        "task": {
+            "add": cmd_task_add,
+            "list": cmd_task_list,
+            "status": cmd_task_status,
+            "answer": cmd_task_answer,
+            "cancel": cmd_task_cancel,
+            "retry": cmd_task_retry,
+        },
         "brain": {
             "stats": cmd_brain_stats,
+            "show": cmd_brain_show,
             "search": cmd_brain_search,
+            "topics": cmd_brain_topics,
+            "trace": cmd_brain_trace,
+            "feedback": cmd_brain_feedback,
+            "contradict": cmd_brain_contradict,
             "add": cmd_brain_add,
             "export": cmd_brain_export,
             "lint": cmd_brain_lint,

@@ -1,0 +1,15 @@
+You are checking the status of an assigned task after this cycle's work.
+
+{task_context}
+
+Work done this cycle:
+{execute_result}
+
+Evaluate the result. Respond with EXACTLY ONE of these verdicts on the first line:
+
+DONE — The task is fully complete. List deliverables (file paths, note IDs, etc.)
+CONTINUE — Progress was made but more work is needed. Briefly say what's next.
+BLOCKED: <question> — You need developer input to proceed. Ask a specific question.
+FAILED: <reason> — The task cannot be completed. Explain why.
+
+Follow the verdict with a 1-2 sentence explanation.

@@ -7,6 +7,7 @@ Covers:
 - _run_freeform_heartbeat: end-to-end with mock agent
 - _run_steps_heartbeat: all-at-once and stepwise pointer
 - _run_coordinator_heartbeat: round-robin and all schedule modes
+- run_task_heartbeat: plan→execute→check→capture integration
 - _distil_to_brain: end-to-end with mock agent
 - _relate_cooccurring_tags: topic graph wiring
 """
@@ -32,6 +33,8 @@ with patch.dict("sys.modules", {
     import workflow as wf_mod
     from workflow import (
         _distil_to_brain,
+        _extract_json,
+        _extract_deliverables,
         _relate_cooccurring_tags,
         _run_all_steps,
         _run_coordinator_heartbeat,
@@ -42,6 +45,7 @@ with patch.dict("sys.modules", {
         _store_capture,
         _store_connection,
         run_heartbeat,
+        run_task_heartbeat,
     )
 
 from config import AppConfig
@@ -110,7 +114,54 @@ def _json_agent(*responses: str) -> MagicMock:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# A. _store_capture tests
+# A. _extract_json tests
+# ══════════════════════════════════════════════════════════════════════
+
+class TestExtractJson:
+    """Test the _extract_json helper used by _store_capture and _store_connection."""
+
+    def test_plain_json(self):
+        raw = '{"content": "hello", "tags": []}'
+        assert _extract_json(raw) == {"content": "hello", "tags": []}
+
+    def test_code_fenced_json(self):
+        raw = '```json\n{"content": "fenced"}\n```'
+        assert _extract_json(raw)["content"] == "fenced"
+
+    def test_json_with_preamble_text(self):
+        """LLM returns commentary before the JSON object."""
+        raw = (
+            "Let me first check the workspace.\n\n"
+            '{"topic": "Insight", "content": "Real data", "tags": ["a"], "category": "resources"}'
+        )
+        data = _extract_json(raw, required_key="content")
+        assert data is not None
+        assert data["content"] == "Real data"
+
+    def test_json_with_tool_artifacts(self):
+        """LLM returns tool-call artifacts before the actual JSON."""
+        raw = (
+            'Based on the output:\n'
+            '{"toolu_vrtx_abc": "Tool Output: stuff"}\n'
+            '{"topic": "Real", "content": "Correct", "tags": [], "category": "resources"}'
+        )
+        data = _extract_json(raw, required_key="content")
+        assert data is not None
+        assert data["content"] == "Correct"
+
+    def test_no_json_returns_none(self):
+        assert _extract_json("Just plain text") is None
+
+    def test_empty_string_returns_none(self):
+        assert _extract_json("") is None
+
+    def test_no_required_key_accepts_any_dict(self):
+        raw = '{"foo": 1}'
+        assert _extract_json(raw, required_key="") == {"foo": 1}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# B. _store_capture tests
 # ══════════════════════════════════════════════════════════════════════
 
 class TestStoreCapture:
@@ -135,6 +186,18 @@ class TestStoreCapture:
         nid = _store_capture(brain, raw)
         assert nid is not None
         assert brain.notes[nid]["content"] == "Wrapped"
+
+    def test_json_with_preamble(self, brain):
+        """LLM emits commentary/tool artifacts before the JSON — should still parse."""
+        raw = (
+            "Let me gather evidence.\n"
+            '{"toolu_response": "Tool Output"}\n'
+            '{"topic": "Embedded", "content": "Found it", "tags": ["test"], "category": "resources"}'
+        )
+        nid = _store_capture(brain, raw)
+        assert nid is not None
+        assert brain.notes[nid]["content"] == "Found it"
+        assert brain.notes[nid]["summary"] == "Embedded"
 
     def test_malformed_json_fallback(self, brain):
         """Malformed JSON falls back to storing raw content as a note."""
@@ -258,6 +321,18 @@ class TestStoreConnection:
         raw = '```json\n{"from": "n0001", "to": "n0002", "reason": "linked"}\n```'
         _store_connection(brain, raw)
         assert len(brain.connections) == 1
+
+    def test_json_with_preamble(self, brain):
+        """LLM emits text before the JSON — should still parse."""
+        add_note(brain, content="X")
+        add_note(brain, content="Y")
+        raw = (
+            'I will check the git log.\n'
+            '{"from": "n0001", "to": "n0002", "reason": "related work"}'
+        )
+        _store_connection(brain, raw)
+        assert len(brain.connections) == 1
+        assert brain.connections[0]["reason"] == "related work"
 
     def test_missing_from_field(self, brain):
         add_note(brain, content="X")
@@ -703,3 +778,204 @@ class TestRunHeartbeatDispatcher:
         with patch.object(wf_mod, "_run_second_brain_heartbeat", new_callable=AsyncMock) as m:
             asyncio.run(run_heartbeat(MagicMock(), state, brain, config, persona))
             m.assert_called_once()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# J. run_task_heartbeat — integration tests
+# ══════════════════════════════════════════════════════════════════════
+
+class TestRunTaskHeartbeat:
+    """Integration tests for the plan → execute → check → capture flow."""
+
+    def _make_task(self, **overrides):
+        from tasks import create_task
+        kwargs = {"title": "Fix the login bug", "description": "Users can't log in", "priority": "high"}
+        kwargs.update(overrides)
+        return create_task(**kwargs)
+
+    def test_done_verdict_completes_task(self, state, brain, config, persona):
+        """DONE verdict marks task as completed and captures insight."""
+        task = self._make_task()
+        capture_json = json.dumps({
+            "topic": "Login fix",
+            "content": "Fixed auth token refresh",
+            "tags": ["auth", "bugfix"],
+            "category": "projects",
+        })
+        agent = _json_agent(
+            "Plan: Check the token refresh logic",  # plan
+            "Fixed the token refresh in auth.py",    # execute
+            "DONE\n- src/auth.py\n- tests/test_auth.py",  # check verdict
+            capture_json,                            # capture
+        )
+
+        asyncio.run(run_task_heartbeat(agent, state, brain, config, persona, task))
+
+        assert task.status == "completed"
+        assert task.completed_at is not None
+        assert agent.run.call_count == 4
+        # Deliverables should include file paths from verdict
+        assert any("auth.py" in d for d in task.deliverables)
+        # Insight should be captured in brain
+        assert len(brain.notes) >= 1
+
+    def test_continue_verdict_advances_task(self, state, brain, config, persona):
+        """CONTINUE verdict increments heartbeats and records progress."""
+        task = self._make_task()
+        capture_json = json.dumps({
+            "topic": "Partial progress",
+            "content": "Identified the root cause",
+            "tags": ["debug"],
+            "category": "resources",
+        })
+        agent = _json_agent(
+            "Plan: Investigate the error logs",      # plan
+            "Found error in connection pooling",     # execute
+            "CONTINUE — need another cycle to fix",  # check verdict
+            capture_json,                            # capture
+        )
+
+        asyncio.run(run_task_heartbeat(agent, state, brain, config, persona, task))
+
+        assert task.status == "in_progress"
+        assert task.heartbeats_spent == 1
+        assert len(task.progress_notes) >= 1
+
+    def test_blocked_verdict_blocks_task(self, state, brain, config, persona):
+        """BLOCKED verdict sets task to blocked with a question."""
+        task = self._make_task()
+        capture_json = json.dumps({
+            "topic": "Blocked",
+            "content": "Need database credentials",
+            "tags": ["blocked"],
+            "category": "resources",
+        })
+        agent = _json_agent(
+            "Plan: Connect to the database",                # plan
+            "Cannot connect — missing credentials",         # execute
+            "BLOCKED: What are the database credentials?",  # check verdict
+            capture_json,                                   # capture
+        )
+
+        asyncio.run(run_task_heartbeat(agent, state, brain, config, persona, task))
+
+        assert task.status == "blocked"
+        assert len(task.questions) == 1
+        assert "credentials" in task.questions[0]["question"].lower()
+
+    def test_failed_verdict_fails_task(self, state, brain, config, persona):
+        """FAILED verdict marks the task as failed."""
+        task = self._make_task()
+        capture_json = json.dumps({
+            "topic": "Failure",
+            "content": "Incompatible API version",
+            "tags": ["failure"],
+            "category": "resources",
+        })
+        agent = _json_agent(
+            "Plan: Upgrade the API client",          # plan
+            "API v1 is deprecated, v2 incompatible", # execute
+            "FAILED: API v2 has breaking changes",   # check verdict
+            capture_json,                            # capture
+        )
+
+        asyncio.run(run_task_heartbeat(agent, state, brain, config, persona, task))
+
+        assert task.status == "failed"
+        assert task.completed_at is not None
+
+    def test_task_transitions_to_in_progress(self, state, brain, config, persona):
+        """Task should be moved to in_progress at start of heartbeat."""
+        task = self._make_task()
+        assert task.status == "pending"
+
+        capture_json = json.dumps({
+            "topic": "Test", "content": "Test", "tags": [], "category": "resources"
+        })
+        agent = _json_agent("plan", "execute", "CONTINUE", capture_json)
+
+        asyncio.run(run_task_heartbeat(agent, state, brain, config, persona, task))
+
+        # start_task sets in_progress; CONTINUE keeps it there
+        assert task.status == "in_progress"
+        assert task.started_at is not None
+
+    def test_capture_stores_note_in_brain(self, state, brain, config, persona):
+        """The capture step should produce a note linked to the task."""
+        task = self._make_task()
+        capture_json = json.dumps({
+            "topic": "Auth insight",
+            "content": "Token refresh needs 30s buffer",
+            "tags": ["auth"],
+            "category": "resources",
+        })
+        agent = _json_agent("plan", "execute", "DONE", capture_json)
+
+        asyncio.run(run_task_heartbeat(agent, state, brain, config, persona, task))
+
+        assert len(brain.notes) >= 1
+        # Task should have a note:xxx deliverable
+        note_deliverables = [d for d in task.deliverables if d.startswith("note:")]
+        assert len(note_deliverables) >= 1
+
+    def test_exception_during_heartbeat_advances_with_error(self, state, brain, config, persona):
+        """Exceptions in the heartbeat should be caught and logged as progress."""
+        task = self._make_task()
+        agent = MagicMock()
+        agent.run = AsyncMock(side_effect=Exception("LLM timeout"))
+
+        asyncio.run(run_task_heartbeat(agent, state, brain, config, persona, task))
+
+        # Task should have an error note
+        assert any("ERROR" in n for n in task.progress_notes)
+
+    def test_multiple_heartbeats_accumulate_progress(self, state, brain, config, persona):
+        """Running multiple heartbeats on the same task accumulates notes."""
+        task = self._make_task()
+
+        for i in range(3):
+            capture_json = json.dumps({
+                "topic": f"Step {i}", "content": f"Progress {i}",
+                "tags": [], "category": "resources",
+            })
+            agent = _json_agent(
+                f"Plan step {i}", f"Execute step {i}", "CONTINUE", capture_json
+            )
+            asyncio.run(run_task_heartbeat(agent, state, brain, config, persona, task))
+
+        assert task.heartbeats_spent == 3
+        assert len(task.progress_notes) >= 3
+        assert task.status == "in_progress"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# K. _extract_deliverables tests
+# ══════════════════════════════════════════════════════════════════════
+
+class TestExtractDeliverables:
+
+    def test_extracts_file_paths(self):
+        verdict = "DONE\n- src/auth.py\n- tests/test_auth.py\n- Updated the login flow"
+        result = _extract_deliverables(verdict)
+        assert "src/auth.py" in result
+        assert "tests/test_auth.py" in result
+
+    def test_extracts_note_ids(self):
+        verdict = "DONE\n- note:n0042\n- n0001"
+        result = _extract_deliverables(verdict)
+        assert "note:n0042" in result
+        assert "n0001" in result
+
+    def test_empty_verdict(self):
+        assert _extract_deliverables("DONE") == []
+
+    def test_limits_to_20(self):
+        lines = "\n".join(f"- file{i}.py" for i in range(30))
+        result = _extract_deliverables(f"DONE\n{lines}")
+        assert len(result) <= 20
+
+    def test_truncates_long_paths(self):
+        long_path = "a/" * 200 + "file.py"
+        verdict = f"DONE\n- {long_path}"
+        result = _extract_deliverables(verdict)
+        assert len(result[0]) <= 200

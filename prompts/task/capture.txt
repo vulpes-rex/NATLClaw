@@ -1,0 +1,10 @@
+You just worked on task "{task_title}":
+{execute_result}
+
+Distil ONE key insight from this work into the second brain.
+Focus on something reusable — a pattern, a convention, a decision,
+or a discovery that would help with future tasks.
+
+Return as JSON with these exact keys:
+{{"topic": "short title", "content": "1-2 sentence insight", "tags": ["tag1", "tag2"], "category": "resources"}}
+Return ONLY the JSON object, no extra text.

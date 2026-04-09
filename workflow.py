@@ -128,6 +128,161 @@ async def run_heartbeat(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Task heartbeat (runs INSTEAD of normal heartbeat when a task is active)
+# ──────────────────────────────────────────────────────────────────────
+
+async def run_task_heartbeat(
+    agent,
+    state: AgentState,
+    brain: BrainState,
+    config: AppConfig,
+    persona: Persona,
+    task,
+) -> None:
+    """One heartbeat cycle dedicated to a task.
+
+    Flow: plan → execute → check verdict → capture insight to brain.
+
+    The *task* object is mutated in place (status, heartbeats_spent, etc.)
+    and the caller is responsible for persisting it.
+    """
+    from tasks import (
+        advance_task, block_task, build_task_context,
+        complete_task, fail_task, start_task,
+    )
+
+    try:
+        seen_fps: set[str] = set()
+        start_task(task)
+
+        task_ctx = build_task_context(task)
+        brain_summary = build_brain_summary(brain, max_notes=5)
+
+        # Step 1: Plan — what should I do this cycle?
+        plan_prompt = load_prompt(
+            "task", "plan",
+            task_context=task_ctx,
+            brain_summary=brain_summary,
+            heartbeats_spent=task.heartbeats_spent + 1,
+            max_heartbeats=task.max_heartbeats,
+        )
+        if not plan_prompt:
+            plan_prompt = (
+                f"You are working on: {task.title}\n{task.description}\n\n"
+                f"Progress so far: {task.progress_notes[-3:]}\n"
+                f"Heartbeat {task.heartbeats_spent + 1}/{task.max_heartbeats}\n\n"
+                f"What is the single most important thing to do this cycle?"
+            )
+        plan = await _run_step(agent, "task_plan", plan_prompt, state, seen_fps=seen_fps)
+
+        # Step 2: Execute — do the work
+        execute_prompt = load_prompt(
+            "task", "execute",
+            plan=plan[:500],
+            task_context=task_ctx,
+        )
+        if not execute_prompt:
+            execute_prompt = (
+                f"Execute this plan:\n{plan[:500]}\n\n"
+                f"{task_ctx}\n\n"
+                f"Use your tools to do the actual work. "
+                f"If you need information from the developer, say BLOCKED: <question>."
+            )
+        execute_result = await _run_step(
+            agent, "task_execute", execute_prompt, state, seen_fps=seen_fps,
+        )
+
+        # Step 3: Check — verdict on status
+        check_prompt = load_prompt(
+            "task", "check",
+            task_context=task_ctx,
+            execute_result=execute_result[:600],
+        )
+        if not check_prompt:
+            check_prompt = (
+                f"Task: {task.title}\n"
+                f"Work done: {execute_result[:600]}\n\n"
+                f"Is this task DONE, should it CONTINUE, is it BLOCKED, or has it FAILED?"
+            )
+        verdict = await _run_step(
+            agent, "task_check", check_prompt, state, seen_fps=seen_fps,
+        )
+
+        # Step 4: Apply verdict
+        verdict_upper = verdict.strip().upper()
+        if verdict_upper.startswith("DONE"):
+            # Extract deliverables from the verdict text
+            deliverables = _extract_deliverables(verdict)
+            complete_task(task, deliverables)
+            logger.info("[task] Completed: %s (%d heartbeats)", task.title, task.heartbeats_spent + 1)
+        elif verdict_upper.startswith("BLOCKED:"):
+            question = verdict.split(":", 1)[1].strip() if ":" in verdict else verdict
+            block_task(task, question, state.execution_count)
+            logger.info("[task] Blocked: %s — %s", task.title, question[:100])
+        elif verdict_upper.startswith("FAILED:"):
+            reason = verdict.split(":", 1)[1].strip() if ":" in verdict else verdict
+            fail_task(task, reason)
+            logger.info("[task] Failed: %s — %s", task.title, reason[:100])
+        else:
+            # CONTINUE or unrecognized → advance
+            advance_task(task, execute_result[:300])
+            logger.info(
+                "[task] Continuing: %s (%d/%d heartbeats)",
+                task.title, task.heartbeats_spent, task.max_heartbeats,
+            )
+
+        # Step 5: Capture — store what was learned in the brain
+        capture_prompt = load_prompt(
+            "task", "capture",
+            task_title=task.title,
+            execute_result=execute_result[:400],
+        )
+        if not capture_prompt:
+            capture_prompt = (
+                f"You just worked on task \"{task.title}\":\n{execute_result[:400]}\n\n"
+                f"Distil ONE key insight into the second brain.\n"
+                f'Return JSON: {{"topic": "...", "content": "...", '
+                f'"tags": [...], "category": "resources"}}\n'
+                f"Return ONLY the JSON object."
+            )
+        capture_result = await _run_step(
+            agent, "task_capture", capture_prompt, state, seen_fps=seen_fps,
+        )
+        note_id = _store_capture(
+            brain, capture_result,
+            persona_name=persona.name,
+            heartbeat_number=state.execution_count,
+            step=f"task_{task.id}",
+        )
+        if note_id:
+            task.deliverables.append(f"note:{note_id}")
+            logger.info("[task] captured insight as %s", note_id)
+
+    except Exception as e:
+        logger.error("Error in task heartbeat for '%s': %s", task.title, e)
+        logger.debug("Task heartbeat error:", exc_info=True)
+        advance_task(task, f"ERROR: {e}")
+
+
+def _extract_deliverables(verdict: str) -> list[str]:
+    """Pull file paths and note IDs from a DONE verdict."""
+    deliverables = []
+    for line in verdict.splitlines():
+        stripped = line.strip().lstrip("-•*")
+        stripped = stripped.strip()
+        # Look for file-like paths or note IDs
+        if stripped and (
+            "/" in stripped
+            or "\\" in stripped
+            or stripped.startswith("n0")
+            or stripped.startswith("note:")
+            or stripped.endswith((".py", ".ts", ".js", ".tsx", ".md", ".json"))
+        ):
+            deliverables.append(stripped[:200])
+    return deliverables[:20]
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Mode 1: second_brain
 # ──────────────────────────────────────────────────────────────────────
 
@@ -786,6 +941,40 @@ async def _run_coordinator_heartbeat(
 # Brain helpers (shared)
 # ──────────────────────────────────────────────────────────────────────
 
+def _extract_json(raw: str, required_key: str = "content") -> dict | None:
+    """Find and parse a JSON object from *raw*, tolerating preamble text.
+
+    Strategy:
+    1. Strip code fences (```json ... ```)
+    2. Try json.loads on the whole text.
+    3. If that fails, scan for every '{' and try to parse from that offset;
+       accept the first object that contains *required_key*.
+    """
+    text = raw.strip()
+    # Strip code fences
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        text = text.rsplit("```", 1)[0].strip()
+    # Fast path: whole text is valid JSON
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Slow path: find embedded JSON objects
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            data = json.loads(text[i:])
+            if isinstance(data, dict) and (not required_key or required_key in data):
+                return data
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return None
+
+
 def _store_capture(
     brain: BrainState,
     raw: str,
@@ -800,11 +989,10 @@ def _store_capture(
     instead of creating a new one.
     """
     try:
-        text = raw.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-            text = text.rsplit("```", 1)[0]
-        data = json.loads(text)
+        data = _extract_json(raw, required_key="content")
+        if data is None:
+            logger.warning("_store_capture: no JSON object with 'content' key found")
+            return add_note(brain, content=raw[:300], source="heartbeat")
         content = data.get("content", raw[:300])
 
         tags = data.get("tags", [])
@@ -840,6 +1028,10 @@ def _store_capture(
             tags=tags,
             category=data.get("category", "resources"),
             source=source_meta,
+            note_type=data.get("note_type", "general"),
+            status=data.get("status", "active"),
+            confidence=data.get("confidence"),
+            evidence=data.get("evidence"),
         )
 
         # Wire note into the topic graph
@@ -875,11 +1067,10 @@ def _relate_cooccurring_tags(brain: BrainState, tags: list[str]) -> None:
 def _store_connection(brain: BrainState, raw: str) -> None:
     """Parse agent JSON and create a connection between notes."""
     try:
-        text = raw.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-            text = text.rsplit("```", 1)[0]
-        data = json.loads(text)
+        data = _extract_json(raw, required_key="from")
+        if data is None:
+            logger.warning("_store_connection: no JSON object with 'from' key found")
+            return
         from_id = data.get("from", "")
         to_id = data.get("to", "")
         reason = data.get("reason", "")
