@@ -1,0 +1,7 @@
+Summarize this heartbeat cycle for the second brain:
+- Status: {status_result}
+- New capture: {capture_result}
+- Brain size: {note_count} notes, {connection_count} connections
+{goals_block}
+
+Write a 2-3 sentence synthesis. Note any knowledge gaps or next areas to explore.{goals_suffix}

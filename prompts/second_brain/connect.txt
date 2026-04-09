@@ -1,0 +1,5 @@
+Here are recent notes in the second brain:
+{notes_text}
+
+Identify ONE meaningful connection between any two of these notes. Return as JSON: {{"from": "<id>", "to": "<id>", "reason": "..."}}
+Return ONLY the JSON object, no extra text.

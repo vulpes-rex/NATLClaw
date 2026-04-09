@@ -1,0 +1,25 @@
+You are auditing a knowledge wiki for quality.
+
+WIKI PAGES:
+{pages_json}
+
+Check for:
+1. Pages with no updates since their creation (stale)
+2. Contradictions between pages
+3. Sections missing source citations [Source: nXXXX]
+4. Pages with highly overlapping content (merge candidates)
+5. Factual claims that seem unsupported or hallucinated
+
+Return JSON:
+{{
+  "issues": [
+    {{
+      "type": "stale | contradiction | missing_citation | duplicate | suspect_claim",
+      "page_id": "...",
+      "description": "...",
+      "suggested_action": "update | merge | archive | flag"
+    }}
+  ]
+}}
+
+Return ONLY the JSON object, no extra text.

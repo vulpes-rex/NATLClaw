@@ -1,0 +1,12 @@
+Status: {status_result}
+
+Your second brain currently has {note_count} notes.
+{brain_summary}
+
+{heartbeat_task}
+
+IMPORTANT: Check the brain summary above. Do NOT repeat existing topics.
+Prefer practical, actionable insights over abstract/theoretical content.
+Return your answer as JSON with these exact keys:
+{{"topic": "...", "content": "2-3 sentence insight", "tags": ["tag1", "tag2"], "category": "resources"}}
+Return ONLY the JSON object, no extra text.

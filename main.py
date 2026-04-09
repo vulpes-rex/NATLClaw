@@ -2,7 +2,7 @@ import asyncio
 import logging
 import sys
 
-from config import load_config
+from config import load_config, validate_config
 from scheduler import run_scheduler
 
 
@@ -14,6 +14,12 @@ def main() -> None:
     )
 
     config = load_config()
+
+    errors = validate_config(config)
+    if errors:
+        for err in errors:
+            print(f"Config error: {err}", file=sys.stderr)
+        sys.exit(1)
 
     try:
         asyncio.run(run_scheduler(config))

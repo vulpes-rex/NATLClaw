@@ -1,0 +1,6 @@
+Summarize heartbeat #{execution_count} as {persona_description}:
+- Task outcome: {task_result}
+- Brain size: {note_count} notes
+{goals_block}
+
+Write a 2-3 sentence synthesis and note what to do next cycle.{goals_suffix}

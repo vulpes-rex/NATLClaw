@@ -1,0 +1,7 @@
+You just completed this task:
+{task_result}
+
+Distil ONE key insight or finding worth remembering in the second brain.
+Return as JSON with these exact keys:
+{{"topic": "short title", "content": "1-2 sentence insight", "tags": ["tag1", "tag2"], "category": "resources"}}
+Return ONLY the JSON object, no extra text.

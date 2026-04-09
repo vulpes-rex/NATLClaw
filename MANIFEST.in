@@ -1,0 +1,11 @@
+# Include all text files in prompts and personas directories
+recursive-include prompts/ *.txt
+recursive-include personas/ *.txt
+recursive-include prompts/ __init__.py
+recursive-include personas/ __init__.py
+
+# Include configuration files
+include *.md
+include .env.example
+include requirements.txt
+include setup.py

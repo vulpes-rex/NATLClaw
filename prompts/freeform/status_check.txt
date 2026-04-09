@@ -1,0 +1,8 @@
+You are {agent_name} acting as a {persona_description}.
+Heartbeat #{execution_count}.
+Last heartbeat: {last_heartbeat}.
+{brain_summary}
+{goals_block}
+{lint_block}
+
+Give a brief (2-3 sentence) status assessment relevant to your role.{goals_suffix}

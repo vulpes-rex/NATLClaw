@@ -55,6 +55,23 @@ class Persona:
     workflow: str = "second_brain"
     steps: list[dict] | None = None
     stepwise: bool = False
+    roster: list[str] = field(default_factory=list)
+    schedule: str = "round_robin"  # round_robin | all
+
+    # Tiered memory: consolidation & lint intervals
+    consolidation_interval: int = 5    # every N heartbeats (0 = threshold only)
+    consolidation_threshold: int = 10  # max unconsolidated notes before forced
+    lint_wiki_interval: int = 20       # every N heartbeats (0 = disabled)
+
+    # Agentic task mode (used by cmd_code / cmd_task)
+    prompt_dir: str = ""               # prompt template subdirectory (e.g. "coding_agent")
+    done_marker: str = "[TASK_COMPLETE]"
+    blocked_marker: str = "[TASK_BLOCKED]"
+    max_turns: int = 20                # default agentic-turn limit
+
+    # Governance schemas (loaded from BRAIN.md / HEARTBEAT.md)
+    brain_schema: str = ""             # knowledge organization rules
+    heartbeat_schema: str = ""         # cycle execution strategy
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -79,6 +96,124 @@ def _load_instructions(rel_or_abs_path: str, base_dir: str = _PROJECT_ROOT) -> s
         return ""
     with open(full, "r", encoding="utf-8") as f:
         return f.read().strip()
+
+
+_DEFAULT_BRAIN_SCHEMA = """\
+# Knowledge Schema: Default
+
+## Domain
+General AI agents, knowledge systems, and knowledge management.
+Capture insights about architecture patterns, tool ecosystems,
+best practices, and emerging research.
+
+## Categories
+- **projects**: specific build tasks with deliverables
+- **areas**: ongoing concerns (e.g., "agent reliability")
+- **resources**: reference knowledge (e.g., "comparison of memory frameworks")
+- **archive**: superseded or completed items
+
+## Tags
+Use lowercase, hyphenated tags. Avoid synonyms of existing tags.
+New tags are allowed but should be justified in the review step.
+
+## Citation Rules
+Every note must include provenance metadata (auto-populated).
+Wiki page sections must reference contributing note IDs as:
+  [Source: n0012, n0015]
+
+## Quality Standards
+- Notes: minimum 1 sentence, maximum 3 sentences
+- Every note needs at least 1 tag
+- Claims must be specific — avoid vague generalisations
+
+## Connection Rules
+Look for: supports, contradicts, extends, similar.
+Only create connections you can explain in one sentence.
+
+## Wiki Page Guidelines
+- One page per distinct topic (not per heartbeat)
+- Structure: Overview > Key Points > Details > Open Questions
+- Update existing pages before creating new ones
+- Cite all contributing notes in each section
+"""
+
+
+_DEFAULT_HEARTBEAT_SCHEMA = """\
+# Heartbeat Strategy: Default
+
+## Phase
+**Discovery** — the brain is young. Focus on breadth.
+Update to **Deepening** at 50+ notes and 3+ wiki pages.
+Update to **Maintenance** at 200+ notes.
+
+## Cycle Focus Rules
+| Brain state | Focus this cycle |
+|-------------|-----------------|
+| < 10 notes | Capture a foundational concept |
+| 10-50 notes, few connections | Prioritize connecting existing notes |
+| 50+ notes, < 3 wiki pages | Trigger consolidation |
+| 50+ notes, 3+ wiki pages | Alternate: deepen existing page / explore new angle |
+| Lint flagged issues | Resolve highest-severity lint issue first |
+
+## Priority Stack
+1. Fix flagged lint issues
+2. Consolidate pending notes
+3. Deepen a weak wiki page
+4. Capture something new
+5. Explore connections
+
+## Adaptive Behavior
+- High error rate (3+ errors in last 10 heartbeats): slow down, review existing knowledge
+- Repetitive captures (last 3 notes overlap): force a different topic
+- Empty review ("nothing new"): skip capture, focus on connections or consolidation
+
+## Escalation Rules
+Flag for human attention:
+- Contradiction between high-confidence wiki pages
+- Same topic captured 3+ times without resolution
+- Tool failure 3 consecutive heartbeats
+- Zero new notes for 5+ heartbeats
+
+## Cycle Continuity
+Begin by reading the previous review summary. Avoid repeating
+what was just captured. Follow up on suggested next areas.
+
+## Resource Constraints
+- Status check: 2-3 sentences
+- Capture: 2-3 sentence content per note
+- Review: 2-3 sentences, focus on actionable next steps
+"""
+
+
+def _load_schema_file(
+    persona_dir: str, filename: str, default: str,
+    config_path: str = "",
+) -> str:
+    """Load a schema markdown file from the persona directory.
+
+    Resolution order:
+    1. Explicit path from mcp.json config (``config_path``)
+    2. ``<persona_dir>/<filename>`` (convention-based)
+    3. Built-in default string
+    """
+    # 1. Explicit config path
+    if config_path:
+        content = _load_instructions(config_path)
+        if content:
+            return content
+
+    # 2. Convention: file in persona directory
+    if persona_dir:
+        candidate = os.path.join(persona_dir, filename)
+        if os.path.isfile(candidate):
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    return f.read().strip()
+            except OSError as e:
+                logger.warning("Failed to read %s: %s", candidate, e)
+
+    # 3. Default
+    return default
 
 
 def _extract_functions(
@@ -207,9 +342,9 @@ def _discover_external_personas(
 
 _BUILTIN_DEFAULT = Persona(
     name="default",
-    description="Autonomous second-brain knowledge agent",
+    description="Second-brain knowledge agent",
     instructions=(
-        "You are an autonomous second-brain agent. Your responsibilities:\n"
+        "You are a knowledge-management assistant. Your responsibilities:\n"
         "1. Capture and organize new knowledge as atomic notes\n"
         "2. Discover connections between ideas\n"
         "3. Periodically review and synthesize your knowledge base\n"
@@ -217,8 +352,14 @@ _BUILTIN_DEFAULT = Persona(
         "When asked to return JSON, return ONLY valid JSON with no extra text."
     ),
     heartbeat_task=(
-        "Research one new insight about AI agents, autonomous systems, or "
-        "knowledge management that is NOT already captured in the brain."
+        "Review the existing notes in the brain summary above. Then do ONE of:\n"
+        "(a) Identify a GAP or missing connection between existing notes and "
+        "generate a practical insight that bridges them.\n"
+        "(b) Synthesize or refine an existing note with more depth or nuance.\n"
+        "(c) Generate a PRACTICAL, actionable insight relevant to the user's "
+        "current domain and work.\n"
+        "DO NOT repeat topics already covered. Check the brain summary carefully.\n"
+        "Prefer concrete, specific insights over abstract/theoretical ones."
     ),
 )
 
@@ -283,9 +424,20 @@ def _build_inline_persona(
     """Build a Persona from an inline mcp.json entry.
     Instruction paths are resolved relative to base_dir (the mcp.json directory).
     """
-    instructions = _load_instructions(entry.get("instructions", ""), base_dir)
+    instructions_path = entry.get("instructions", "")
+    instructions = _load_instructions(instructions_path, base_dir)
     if not instructions:
         instructions = entry.get("description", "")
+
+    # Derive persona directory from the instructions path for schema discovery
+    persona_dir = ""
+    if instructions_path:
+        full = (
+            instructions_path
+            if os.path.isabs(instructions_path)
+            else os.path.normpath(os.path.join(base_dir, instructions_path))
+        )
+        persona_dir = os.path.dirname(full)
 
     tools: list[Callable] = []
     tools_cfg = entry.get("tools")
@@ -297,6 +449,17 @@ def _build_inline_persona(
 
     mcp_servers = _resolve_servers(entry, server_pool, name)
 
+    # Load governance schemas
+    brain_schema = _load_schema_file(
+        persona_dir, "BRAIN.md", _DEFAULT_BRAIN_SCHEMA,
+        config_path=entry.get("brainSchema", ""),
+    )
+    hb_strategy = entry.get("heartbeatStrategy", {})
+    heartbeat_schema = _load_schema_file(
+        persona_dir, "HEARTBEAT.md", _DEFAULT_HEARTBEAT_SCHEMA,
+        config_path=hb_strategy.get("file", "") if isinstance(hb_strategy, dict) else "",
+    )
+
     return Persona(
         name=name,
         description=entry.get("description", ""),
@@ -307,6 +470,17 @@ def _build_inline_persona(
         workflow=entry.get("workflow", "second_brain"),
         steps=entry.get("steps") or None,
         stepwise=bool(entry.get("stepwise", False)),
+        roster=entry.get("roster", []),
+        schedule=entry.get("schedule", "round_robin"),
+        consolidation_interval=int(entry.get("consolidation", {}).get("interval", 5)),
+        consolidation_threshold=int(entry.get("consolidation", {}).get("threshold", 10)),
+        lint_wiki_interval=int(entry.get("lint", {}).get("interval", 20)),
+        prompt_dir=entry.get("promptDir", ""),
+        done_marker=entry.get("doneMarker", "[TASK_COMPLETE]"),
+        blocked_marker=entry.get("blockedMarker", "[TASK_BLOCKED]"),
+        max_turns=int(entry.get("maxTurns", 20)),
+        brain_schema=brain_schema,
+        heartbeat_schema=heartbeat_schema,
     )
 
 
@@ -346,6 +520,17 @@ def _build_external_persona(
 
     mcp_servers = _resolve_servers(manifest, server_pool, name)
 
+    # Load governance schemas
+    brain_schema = _load_schema_file(
+        persona_dir, "BRAIN.md", _DEFAULT_BRAIN_SCHEMA,
+        config_path=manifest.get("brainSchema", ""),
+    )
+    hb_strategy = manifest.get("heartbeatStrategy", {})
+    heartbeat_schema = _load_schema_file(
+        persona_dir, "HEARTBEAT.md", _DEFAULT_HEARTBEAT_SCHEMA,
+        config_path=hb_strategy.get("file", "") if isinstance(hb_strategy, dict) else "",
+    )
+
     return Persona(
         name=name,
         description=manifest.get("description", ""),
@@ -356,6 +541,17 @@ def _build_external_persona(
         workflow=manifest.get("workflow", "second_brain"),
         steps=manifest.get("steps") or None,
         stepwise=bool(manifest.get("stepwise", False)),
+        roster=manifest.get("roster", []),
+        schedule=manifest.get("schedule", "round_robin"),
+        consolidation_interval=int(manifest.get("consolidation", {}).get("interval", 5)),
+        consolidation_threshold=int(manifest.get("consolidation", {}).get("threshold", 10)),
+        lint_wiki_interval=int(manifest.get("lint", {}).get("interval", 20)),
+        prompt_dir=manifest.get("promptDir", ""),
+        done_marker=manifest.get("doneMarker", "[TASK_COMPLETE]"),
+        blocked_marker=manifest.get("blockedMarker", "[TASK_BLOCKED]"),
+        max_turns=int(manifest.get("maxTurns", 20)),
+        brain_schema=brain_schema,
+        heartbeat_schema=heartbeat_schema,
     )
 
 

@@ -1,0 +1,5 @@
+## Follow-up
+{message}
+
+Continue working on the current task. Use tools as needed.
+When finished, end with {done_marker}.

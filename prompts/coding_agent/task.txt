@@ -1,0 +1,5 @@
+## Task
+{task}
+
+Work step by step. Use your tools to inspect the workspace, make changes, and
+verify the result. When finished, state what you did and end with {done_marker}.

@@ -1,0 +1,7 @@
+Distil ONE key insight from this output into the second brain.
+
+Output:
+{result}
+
+Return JSON: {{"topic": "...", "content": "...", "tags": [...], "category": "resources"}}
+Return ONLY the JSON object.

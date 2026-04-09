@@ -6,20 +6,85 @@ import os
 from datetime import datetime, timezone
 from typing import Annotated
 
+
 _TASKS_FILE = "data/tasks.json"
 
 
+def _validate_path(
+    path: str,
+    allow_directories: bool = False,
+    must_exist: bool = True,
+    operation: str = "access"
+) -> tuple[bool, str]:
+    """
+    Validate a file/directory path against workspace security restrictions.
+    
+    Returns:
+        (is_valid, error_message)
+    """
+    # Get workspace root (current working directory)
+    workspace = os.path.abspath(os.getcwd())
+    
+    # Resolve to absolute path
+    try:
+        abs_path = os.path.abspath(path)
+    except Exception:
+        return False, f"Invalid path format: {path}"
+    
+    # Check if path is within workspace (primary validation)
+    if not abs_path.startswith(workspace):
+        return False, f"{operation}: '{path}' is outside the workspace directory"
+    
+    # Additional check: ensure path doesn't contain redundant parent directory references
+    # This catches cases like "dir/../secret" where the normalized path might be valid
+    # but the original input is suspicious
+    if path.replace("\\", "/").count("../") > 0:
+        # Check if the path tries to go above workspace root
+        common = os.path.commonpath([workspace, abs_path])
+        if common != workspace:
+            return False, f"{operation}: '{path}' contains path traversal attempt"
+    
+    # Check if path exists
+    if must_exist and not os.path.exists(abs_path):
+        return False, f"{operation}: Path '{path}' does not exist"
+    
+    # For directories, ensure it's actually a directory if required
+    if allow_directories and must_exist and not os.path.isdir(abs_path):
+        return False, f"{operation}: '{path}' is not a directory"
+    
+    return True, ""
+
+
 def _load_tasks() -> list[dict]:
-    if os.path.exists(_TASKS_FILE):
+    # Validate path even if file doesn't exist (we'll return empty list)
+    is_valid, error = _validate_path(_TASKS_FILE, operation="load_tasks", must_exist=False)
+    if not is_valid:
+        return []
+    
+    if not os.path.exists(_TASKS_FILE):
+        return []
+    
+    try:
         with open(_TASKS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return []
+    except json.JSONDecodeError:
+        return []
+    except Exception:
+        return []
 
 
 def _save_tasks(tasks: list[dict]) -> None:
-    os.makedirs(os.path.dirname(_TASKS_FILE) or ".", exist_ok=True)
-    with open(_TASKS_FILE, "w", encoding="utf-8") as f:
-        json.dump(tasks, f, indent=2)
+    # Validate path - file may not exist yet, that's okay
+    is_valid, error = _validate_path(_TASKS_FILE, operation="save_tasks", must_exist=False)
+    if not is_valid:
+        return
+    
+    try:
+        os.makedirs(os.path.dirname(_TASKS_FILE) or ".", exist_ok=True)
+        with open(_TASKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(tasks, f, indent=2)
+    except Exception:
+        pass
 
 
 def list_tasks(

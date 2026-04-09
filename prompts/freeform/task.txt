@@ -1,0 +1,3 @@
+Status: {status_result}
+
+{heartbeat_task}

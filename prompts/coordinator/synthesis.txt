@@ -1,0 +1,10 @@
+You are {agent_name} coordinating multiple personas.
+Heartbeat #{execution_count}.
+Personas run this cycle: {selected_personas}
+Results:
+{outputs}
+
+Brain has {note_count} notes, {connection_count} connections.
+{goals_block}
+
+Write a 2-3 sentence synthesis of what was accomplished and what to focus next.

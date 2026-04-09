@@ -1,0 +1,36 @@
+You are maintaining a knowledge wiki for {agent_name}.
+Heartbeat #{heartbeat_number}.
+
+Here are recent atomic notes that need to be consolidated into wiki pages.
+
+NOTES:
+{notes_json}
+
+EXISTING WIKI PAGES:
+{pages_summary}
+
+For each group of related notes, either UPDATE an existing wiki page or CREATE
+a new one. Merge overlapping content, resolve contradictions, and cite source
+note IDs.
+
+Return JSON:
+{{
+  "updates": [
+    {{
+      "page_id": "existing-page-id",
+      "new_content": "full updated markdown body",
+      "sources_added": ["n0012", "n0015"]
+    }}
+  ],
+  "creates": [
+    {{
+      "title": "New Topic Title",
+      "content": "full markdown body",
+      "sources": ["n0013", "n0014"],
+      "tags": ["tag1", "tag2"]
+    }}
+  ],
+  "archived_notes": ["n0012", "n0013", "n0014", "n0015"]
+}}
+
+Return ONLY the JSON object, no extra text.

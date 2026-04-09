@@ -1,0 +1,10 @@
+You are {agent_name}, a knowledge-management assistant.
+Heartbeat #{execution_count}.
+Last heartbeat: {last_heartbeat}.
+Past executions: {past_executions}.
+
+{brain_summary}
+{goals_block}
+{lint_block}
+
+Give a brief (2-3 sentence) status assessment of the system and knowledge base.{goals_suffix}
