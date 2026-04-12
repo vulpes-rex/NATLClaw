@@ -14,6 +14,11 @@
       "env": {
         "CODENAV_GRAMMARS_DIR": "C:/Users/kvwul/source/repos/CodeIntel/src/codenav-mcp/grammars"
       }
+    },
+    "graphify": {
+      "type":    "stdio",
+      "command": "python",
+      "args":    ["-m", "graphify.serve", "graphify-out/graph.json"]
     }
   },
 
@@ -138,7 +143,7 @@
       "instructions":  "personas/workspace_observer/instructions.md",
       "workflow":      "steps",
       "stepwise":      false,
-      "mcpServers":    ["codenav"],
+      "mcpServers":    ["codenav", "graphify"],
       "tools": {
         "module": "personas.workspace_observer.tools"
       },
@@ -167,7 +172,7 @@
       "instructions":  "personas/codebase_learner/instructions.md",
       "workflow":      "steps",
       "stepwise":      false,
-      "mcpServers":    ["codenav"],
+      "mcpServers":    ["codenav", "graphify"],
       "tools": {
         "module": "personas.codebase_learner.tools"
       },

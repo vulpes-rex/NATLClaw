@@ -84,10 +84,12 @@ Status update:
 - Chat and tool-based memory recall already benefit from the improved ranking because they still route through `search_notes()`
 - Reads now persist `last_accessed_at` and `recall_count`, so retrieval can learn from actual usage
 - Explicit relevance feedback is now stored and fed back into ranking and visibility surfaces
+- Access-frequency preference learning is now active: `_access_frequency_bonus()` computes an access-rate signal (recalls per week with diminishing returns) and a smooth exponential-decay recency curve (half-life ~5 days), replacing the old flat step-function bonuses. Notes that are recalled often and recently rank measurably higher than stale or never-accessed notes
+- `build_brain_stats()` now reports `frequently_accessed` and `never_accessed` counts for operator visibility
 
 ### Phase 3: Storage Migration
 
-Planned after retrieval:
+**Done.**
 
 - Move notes, topics, pages, and edges into SQLite
 - Keep a compatibility layer for loading old JSON brains
@@ -98,7 +100,13 @@ Status update:
 - SQLite-backed storage is now the primary persistence layer via `brain.db`
 - `brain.json` is still written as a compatibility snapshot and human-readable export
 - `load_brain()` auto-migrates legacy JSON-only brains into SQLite on first load
-- Retrieval still needs to start taking advantage of the new store instead of rebuilding everything in memory
+- Schema v2 migration adds queryable columns (`confidence`, `recall_count`, `last_accessed_at`, `content`) directly on `brain_notes` — no need to parse `raw_json` for common queries
+- FTS5 virtual table (`brain_notes_fts`) enables native full-text search on note content/summary
+- Schema versioning via `brain_meta.schema_version` — future migrations auto-apply on startup
+- Retrieval is now store-backed: `build_brain_summary_from_store()`, `get_recent_notes_from_store()`, `get_unconsolidated_notes_from_store()`, `find_duplicate_from_store()`, `decay_stale_notes_from_store()` all query SQLite directly instead of loading the full brain into memory
+- Scheduler uses store-backed summary and decay — avoids the O(n) in-memory rebuild on every heartbeat
+- `save_brain()` now uses incremental UPSERT (`INSERT OR REPLACE`) for notes, topics, and pages instead of DELETE all + re-INSERT — only changed rows touch disk
+- Fallback: if incremental save fails, it falls back to the original full rewrite transparently
 
 ### Phase 4: Knowledge Quality
 

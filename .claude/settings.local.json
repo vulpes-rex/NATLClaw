@@ -4,7 +4,9 @@
       "Bash(python -c \"import json; json.load\\(open\\('mcp.json'\\)\\); print\\('mcp.json is valid JSON'\\)\")",
       "Bash(python -m pytest tests/ -x -q -c pytest.ini)",
       "Bash(python -m pytest tests/unit/test_coding_agent.py::TestOneShotCodeAgent::test_custom_persona -x -q -c pytest.ini)",
-      "Bash(python -m pytest tests/ -x -q -c pytest.ini --deselect tests/unit/test_coding_agent.py::TestOneShotCodeAgent::test_custom_persona)"
+      "Bash(python -m pytest tests/ -x -q -c pytest.ini --deselect tests/unit/test_coding_agent.py::TestOneShotCodeAgent::test_custom_persona)",
+      "Bash(python -c \"import faiss; print\\('faiss OK'\\)\")",
+      "Bash(python -c \"import sentence_transformers; print\\('sentence_transformers OK'\\)\")"
     ]
   }
 }

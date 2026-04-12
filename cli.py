@@ -12,6 +12,8 @@ Usage
     python cli.py chat                   # Interactive chat session
     python cli.py brief                  # Daily digest / morning briefing
     python cli.py brief --save           # Save digest to data/digests/
+    python cli.py report                   # Run workspace audit report
+    python cli.py report --save            # Save report to data/reports/
     python cli.py brain stats            # Show brain statistics
     python cli.py brain show n0001       # Inspect one note in detail
     python cli.py brain search "React"   # Full-text search over notes
@@ -28,6 +30,8 @@ Usage
     python cli.py inbox dismiss m1a2b3     # Dismiss a message
     python cli.py inbox dismiss -a         # Dismiss all read messages
     python cli.py inbox clear              # Clear all messages
+    python cli.py serve                         # Start API server + dashboard
+    python cli.py serve --port 9000             # Custom port
     python cli.py task add "Fix the login bug" -p high   # Create a task
     python cli.py task list                # List all tasks
     python cli.py task list -s blocked     # List blocked tasks
@@ -43,6 +47,8 @@ Usage
     python cli.py watch install-hook      # Install git post-commit hook
     python cli.py config show            # Print resolved config
     python cli.py config validate        # Check for missing/invalid settings
+    python cli.py api                    # Start HTTP API server
+    python cli.py api --port 9000        # Custom port
 """
 from __future__ import annotations
 
@@ -97,6 +103,21 @@ def _load_brain_sync(config: AppConfig):
 # ──────────────────────────────────────────────────────────────────────
 # Subcommand handlers
 # ──────────────────────────────────────────────────────────────────────
+
+def cmd_serve(args: argparse.Namespace, config: AppConfig) -> None:
+    """Start the API server with embedded dashboard."""
+    from api_server import create_app
+    import uvicorn
+
+    app = create_app(config)
+    host = getattr(args, "host", "0.0.0.0")
+    port = getattr(args, "port", 8000)
+    print(f"Starting NATLClaw API server on http://{host}:{port}")
+    print(f"  Dashboard: http://localhost:{port}/")
+    print(f"  OpenAI API: http://localhost:{port}/v1/chat/completions")
+    print(f"  Tasks API: http://localhost:{port}/api/tasks")
+    uvicorn.run(app, host=host, port=port)
+
 
 def cmd_run(args: argparse.Namespace, config: AppConfig) -> None:
     """Start the heartbeat scheduler, or run a single heartbeat."""
@@ -576,6 +597,90 @@ def cmd_watch_install_hook(args: argparse.Namespace, config: AppConfig) -> None:
     print(result)
 
 
+def cmd_report(args: argparse.Namespace, config: AppConfig) -> None:
+    """Run a comprehensive workspace audit using the workspace_observer persona."""
+    from agent_setup import create_agent
+    from second_brain import build_brain_summary, load_brain
+    from state import load_state
+    from prompts import load_prompt
+    from agent_framework import AgentSession
+
+    persona = load_persona("workspace_observer")
+    state = asyncio.run(load_state(config.state_file))
+    brain = asyncio.run(load_brain(config.state_file))
+    brain_summary = build_brain_summary(brain, max_notes=5)
+
+    # Load the audit prompt template
+    prompt = load_prompt(
+        "report", "workspace_audit",
+        agent_name=config.agent_name,
+        brain_summary=brain_summary,
+    )
+    if not prompt:
+        print("Error: prompts/report/workspace_audit.txt not found.", file=sys.stderr)
+        sys.exit(1)
+
+    base_instructions = persona.instructions
+    enriched = f"{base_instructions}\n\nYou are performing a one-shot workspace audit. Use ALL your tools thoroughly."
+
+    agent = create_agent(
+        config, enriched,
+        tools=persona.tools,
+        mcp_servers=persona.mcp_servers,
+    )
+
+    max_turns = getattr(args, "max_turns", None) or 15
+
+    async def _run_audit():
+        session = AgentSession()
+        report_parts: list[str] = []
+        current_prompt = prompt
+
+        for turn in range(1, max_turns + 1):
+            print(f"[audit turn {turn}/{max_turns}] Analyzing...", file=sys.stderr, flush=True)
+            try:
+                response = await agent.run(current_prompt, session=session)
+                text = response.text if hasattr(response, "text") else str(response)
+            except Exception as e:
+                print(f"  Error: {e}", file=sys.stderr)
+                break
+
+            report_parts.append(text)
+
+            # If the report contains our expected headings, it's likely complete
+            if "## Recommended Priorities" in text or "## Summary" in text:
+                break
+
+            current_prompt = (
+                "Continue the audit. You have more tools to use. "
+                "When done, output the full markdown report."
+            )
+
+        return "\n\n".join(report_parts)
+
+    if _needs_copilot_session(agent):
+        async def _copilot_audit():
+            async with agent:
+                return await _run_audit()
+        report = asyncio.run(_copilot_audit())
+    else:
+        report = asyncio.run(_run_audit())
+
+    # Output the report
+    print(report)
+
+    # Save if requested
+    if getattr(args, "save", False):
+        from pathlib import Path as _Path
+        from datetime import datetime as _dt, timezone as _tz
+        reports_dir = _Path("data") / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{_dt.now(_tz.utc).strftime('%Y-%m-%d_%H%M')}_audit.md"
+        out_path = reports_dir / filename
+        out_path.write_text(report, encoding="utf-8")
+        print(f"\nSaved to {out_path}", file=sys.stderr)
+
+
 def cmd_brief(args: argparse.Namespace, config: AppConfig) -> None:
     """Print a daily digest / morning briefing."""
     from daily_digest import build_digest, save_digest
@@ -601,6 +706,7 @@ def cmd_brief(args: argparse.Namespace, config: AppConfig) -> None:
 def cmd_task_add(args: argparse.Namespace, config: AppConfig) -> None:
     """Create a new task for the agent."""
     from tasks import create_task, load_tasks, save_tasks
+    from event_watcher import enqueue_event
 
     async def _add():
         tasks = await load_tasks(config.state_file)
@@ -612,6 +718,7 @@ def cmd_task_add(args: argparse.Namespace, config: AppConfig) -> None:
         )
         tasks.append(task)
         await save_tasks(tasks, config.state_file)
+        enqueue_event("task_created", {"task_id": task.id, "title": task.title})
         print(f"Created task {task.id}: {task.title} (priority={task.priority})")
 
     asyncio.run(_add())
@@ -647,6 +754,7 @@ def cmd_task_status(args: argparse.Namespace, config: AppConfig) -> None:
 def cmd_task_answer(args: argparse.Namespace, config: AppConfig) -> None:
     """Answer a blocked task's question to unblock it."""
     from tasks import answer_task, find_task, load_tasks, save_tasks
+    from event_watcher import enqueue_event
 
     async def _answer():
         tasks = await load_tasks(config.state_file)
@@ -659,6 +767,7 @@ def cmd_task_answer(args: argparse.Namespace, config: AppConfig) -> None:
             sys.exit(1)
         answer_task(task, args.answer)
         await save_tasks(tasks, config.state_file)
+        enqueue_event("task_answered", {"task_id": task.id})
         print(f"Answered task {task.id} — it will resume on the next heartbeat.")
 
     asyncio.run(_answer())
@@ -741,6 +850,7 @@ def cmd_inbox_clear(args: argparse.Namespace, config: AppConfig) -> None:
 def cmd_task_cancel(args: argparse.Namespace, config: AppConfig) -> None:
     """Cancel a task."""
     from tasks import cancel_task, find_task, load_tasks, save_tasks
+    from event_watcher import enqueue_event
 
     async def _cancel():
         tasks = await load_tasks(config.state_file)
@@ -754,6 +864,7 @@ def cmd_task_cancel(args: argparse.Namespace, config: AppConfig) -> None:
         reason = getattr(args, "reason", "") or ""
         cancel_task(task, reason)
         await save_tasks(tasks, config.state_file)
+        enqueue_event("task_cancelled", {"task_id": task.id})
         print(f"Cancelled task {task.id}: {task.title}")
 
     asyncio.run(_cancel())
@@ -762,6 +873,7 @@ def cmd_task_cancel(args: argparse.Namespace, config: AppConfig) -> None:
 def cmd_task_retry(args: argparse.Namespace, config: AppConfig) -> None:
     """Retry a failed or blocked task."""
     from tasks import find_task, load_tasks, retry_task, save_tasks
+    from event_watcher import enqueue_event
 
     async def _retry():
         tasks = await load_tasks(config.state_file)
@@ -774,6 +886,7 @@ def cmd_task_retry(args: argparse.Namespace, config: AppConfig) -> None:
             sys.exit(1)
         retry_task(task)
         await save_tasks(tasks, config.state_file)
+        enqueue_event("task_retried", {"task_id": task.id})
         print(f"Retried task {task.id}: {task.title} — it will be picked up next heartbeat.")
 
     asyncio.run(_retry())
@@ -789,6 +902,25 @@ def cmd_config_show(args: argparse.Namespace, config: AppConfig) -> None:
         else:
             display = val
         print(f"  {key}: {display}")
+
+
+def cmd_api(args: argparse.Namespace, config: AppConfig) -> None:
+    """Start the FastAPI HTTP server."""
+    import uvicorn
+    from api_server import create_app
+
+    app = create_app(config)
+    host = getattr(args, "host", "127.0.0.1")
+    port = getattr(args, "port", 8321)
+    reload = getattr(args, "reload", False)
+    print(f"Starting NATLClaw API on http://{host}:{port}")
+    uvicorn.run(
+        "api_server:app" if reload else app,
+        host=host,
+        port=port,
+        reload=reload,
+        log_level="info",
+    )
 
 
 def cmd_config_validate(args: argparse.Namespace, config: AppConfig) -> None:
@@ -1338,6 +1470,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_p = sub.add_parser("run", help="Start the heartbeat scheduler")
     run_p.add_argument("--once", action="store_true", help="Run a single heartbeat and exit")
 
+    # serve — API server + dashboard
+    serve_p = sub.add_parser("serve", help="Start the API server with dashboard")
+    serve_p.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
+    serve_p.add_argument("--port", type=int, default=8000, help="Port (default: 8000)")
+
     # chat (NEW)
     chat_p = sub.add_parser("chat", help="Start an interactive chat session with the agent")
 
@@ -1345,6 +1482,13 @@ def build_parser() -> argparse.ArgumentParser:
     brief_p = sub.add_parser("brief", help="Print a daily digest / morning briefing")
     brief_p.add_argument("--save", action="store_true",
                          help="Also save digest to data/digests/YYYY-MM-DD.md")
+
+    # report — workspace audit
+    report_p = sub.add_parser("report", help="Run a comprehensive workspace audit")
+    report_p.add_argument("--save", action="store_true",
+                          help="Save report to data/reports/")
+    report_p.add_argument("--max-turns", type=int, default=15,
+                          help="Maximum agent turns for the audit (default: 15)")
 
     # code — agentic task mode
     code_p = sub.add_parser("code", help="Execute tasks with tools using the active persona")
@@ -1479,7 +1623,13 @@ def build_parser() -> argparse.ArgumentParser:
     config_sub = config_p.add_subparsers(dest="config_command")
     config_sub.add_parser("show", help="Print resolved config")
     config_sub.add_parser("validate", help="Check for config errors")
-    
+
+    # api
+    api_p = sub.add_parser("api", help="Start the HTTP API server")
+    api_p.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    api_p.add_argument("--port", type=int, default=8321, help="Port (default: 8321)")
+    api_p.add_argument("--reload", action="store_true", help="Auto-reload on code changes")
+
     return parser
 
 
@@ -1499,8 +1649,10 @@ def main(argv: list[str] | None = None) -> None:
 
     dispatch = {
         "run": cmd_run,
+        "serve": cmd_serve,
         "chat": cmd_chat,
         "brief": cmd_brief,
+        "report": cmd_report,
         "code": cmd_code,
         "inbox": {
             "list": cmd_inbox_list,
@@ -1542,6 +1694,7 @@ def main(argv: list[str] | None = None) -> None:
             "show": cmd_config_show,
             "validate": cmd_config_validate,
         },
+        "api": cmd_api,
     }
 
     cmd = args.command

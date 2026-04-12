@@ -138,9 +138,38 @@ class Task:
 
 ---
 
+### Move 5.5: HTTP API Layer (enables n8n integration)
+
+**Why now:** To allow external orchestration (n8n, VS Code extension, webhooks) while keeping the core Python logic intact.
+
+**Scope:**
+1. `api.py` with FastAPI server
+2. Endpoints:
+   - `POST /heartbeat` — trigger one scheduler heartbeat
+   - `POST /task` — create a new task
+   - `GET /tasks` — list tasks (filter by status)
+   - `GET /task/:id` — get task detail
+   - `POST /task/:id/answer` — answer a blocked task
+   - `POST /task/:id/cancel` — cancel a task
+   - `POST /task/:id/retry` — retry a failed task
+   - `GET /inbox` — list messages (filter by status)
+   - `GET /inbox/:id` — get message detail + mark read
+   - `POST /inbox/:id/dismiss` — dismiss a message
+   - `GET /brain/search` — search notes
+   - `GET /brain/stats` — brain statistics
+   - `GET /status` — overall agent health, unread count, active task
+3. `natl serve` CLI command to start the API server
+4. Add `api.py` to `pyproject.toml py-modules`
+
+**Files:** New `api.py`, modify `cli.py`, modify `pyproject.toml`
+
+**Estimated effort:** 2-3 days
+
+---
+
 ### Move 6: Event-Driven Scheduler (makes the coworker responsive)
 
-**Why after tasks/outbox:** The timer-based scheduler works fine for background learning, but once you can assign tasks, you want the coworker to pick them up immediately — not wait up to 2 minutes.
+**Why after API + Outbox:** The timer-based scheduler works fine for background learning, but once you can assign tasks, you want the coworker to pick them up immediately — not wait up to 2 minutes.
 
 **Scope:**
 1. Replace `asyncio.sleep(interval)` with `asyncio.wait_for(queue.get(), timeout=interval)`
@@ -201,27 +230,27 @@ except asyncio.TimeoutError:
 
 ---
 
-## Longer-Term Horizon
+### Longer-Term Horizon
 
 These depend on the foundation above being solid:
 
-### Semantic Search (brain-evolution Phase 2b)
+#### Semantic Search (brain-evolution Phase 2b)
 - Embedding index (sentence-transformers + FAISS) for topic-aware retrieval
 - Replace recency-based prompt injection with relevance-based
 - Depends on: SQLite brain store being the primary read path
 
-### Preference Learning
+#### Preference Learning
 - Track which brain notes the developer acts on (vs. ignores)
 - CodeIntel-style calibration applied to knowledge capture: notes that match developer behavior get boosted, notes that don't get suppressed
 - Depends on: task system (provides accept/reject signal)
 
-### Rich Interaction Surfaces
+#### Rich Interaction Surfaces
 - VS Code extension / `@coworker` chat participant
 - OpenClaw channel integration (Slack, Discord)
 - OS notifications (beyond basic toast)
 - Depends on: outbox/messaging system
 
-### Customer Portal (Phase 7 from coworker-vision.md)
+#### Customer Portal (Phase 7 from coworker-vision.md)
 - Multi-tenant brain isolation
 - Insurance personas (account_manager, claims_specialist, underwriting_assistant)
 - Policy/claims data ingestion
@@ -236,7 +265,8 @@ These depend on the foundation above being solid:
 |---|---|---|---|---|
 | **Done** | #4 — Task queue + delegation | Task dataclass, scheduler, CLI | Nothing | 3-4 days |
 | **Done** | #5 — Outbox + notifications | Messaging, inbox CLI, scheduler wiring | Move 4 | 2-3 days |
-| **Next** | #6 — Event-driven scheduler | asyncio.wait_for, priority queue | Moves 4-5 | 2-3 days |
+| **Next** | #5.5 — HTTP API layer | FastAPI server, endpoints, CLI | Moves 4-5 | 2-3 days |
+| **After** | #6 — Event-driven scheduler | asyncio.wait_for, priority queue | Moves 4-5 | 2-3 days |
 | **After** | #7 — Project context model | Auto-detect, active-work tracking | Moves 1-3 (done) | 2-3 days |
 | **After** | #8 — Coordinator-MCP | Task board orchestration, file locks | Move 4 | 3-5 days |
 | **Later** | Semantic search | Embedding index, relevance retrieval | Brain SQLite migration | 2-3 days |
@@ -259,3 +289,5 @@ The system feels like a coworker when:
 7. It stops generating notes about abstract AI and starts generating notes about your code
 
 **Items 1-3 are the next sprint. Items 4-5 are partially done. Items 6-7 are the medium-term target.**
+
+(End of file - total 261 lines)

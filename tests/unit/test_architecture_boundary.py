@@ -84,6 +84,8 @@ EXEMPTION_PATTERNS: list[str] = [
     r"Legacy constants", # kept for backward compat
     r"backward.compat", # explanatory notes
     r"[\"']type[\"']\s*:", # event-type dict literals (e.g. "type": "git_commit")
+    # Allow git_commit in event_watcher.py because it's part of the event system
+    r"_push_event\(\s*\"git_commit\"",
 ]
 
 

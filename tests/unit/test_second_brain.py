@@ -30,13 +30,18 @@ with patch.dict('sys.modules', {
         assign_note_to_topic,
         build_brain_stats,
         build_brain_stats_from_store,
+        build_brain_summary_from_store,
         connect_notes,
+        decay_stale_notes_from_store,
         describe_note,
         describe_note_from_store,
+        find_duplicate_from_store,
         get_notes_by_category,
         get_recent_notes,
+        get_recent_notes_from_store,
         get_topic_map,
         get_topic_map_from_store,
+        get_unconsolidated_notes_from_store,
         build_brain_summary,
         load_brain,
         record_contradiction,
@@ -47,8 +52,15 @@ with patch.dict('sys.modules', {
         search_notes_from_store,
         trace_topic,
         trace_topic_from_store,
+        _access_frequency_bonus,
+        _ensure_brain_db,
+        _get_schema_version,
+        _has_fts,
+        _usage_adjustment,
+        _write_brain_sqlite,
         _brain_db_path,
         _brain_path,
+        _SCHEMA_VERSION,
     )
 from state import AgentState
 
@@ -785,3 +797,397 @@ def test_decay_stale_notes_preserves_connected():
     assert archived == 0
     assert brain.notes["n0001"]["category"] == "resources"
     assert brain.notes["n0002"]["category"] == "resources"
+
+
+# ── Access-frequency ranking (Brain Phase 2) ─────────────────────────
+
+
+class TestAccessFrequencyBonus:
+    """Verify that access-frequency ranking rewards frequently used notes."""
+
+    def test_never_accessed_returns_zero(self):
+        note = {"recall_count": 0, "created_at": "2026-01-01T00:00:00Z"}
+        assert _access_frequency_bonus(note) == 0.0
+
+    def test_high_frequency_beats_low_frequency(self):
+        """A note recalled 10 times in 10 days should score higher than
+        one recalled 10 times over 6 months."""
+        now = datetime.now(timezone.utc).isoformat()
+        from datetime import timedelta as td
+        ten_days_ago = (datetime.now(timezone.utc) - td(days=10)).isoformat()
+        six_months_ago = (datetime.now(timezone.utc) - td(days=180)).isoformat()
+
+        frequent = {
+            "recall_count": 10,
+            "created_at": ten_days_ago,
+            "last_accessed_at": now,
+        }
+        infrequent = {
+            "recall_count": 10,
+            "created_at": six_months_ago,
+            "last_accessed_at": now,
+        }
+        assert _access_frequency_bonus(frequent) > _access_frequency_bonus(infrequent)
+
+    def test_recent_access_beats_stale_access(self):
+        """Same recall count and creation date, but one was accessed today
+        and the other a month ago."""
+        from datetime import timedelta as td
+        now = datetime.now(timezone.utc)
+        created = (now - td(days=60)).isoformat()
+
+        recent = {
+            "recall_count": 5,
+            "created_at": created,
+            "last_accessed_at": now.isoformat(),
+        }
+        stale = {
+            "recall_count": 5,
+            "created_at": created,
+            "last_accessed_at": (now - td(days=30)).isoformat(),
+        }
+        assert _access_frequency_bonus(recent) > _access_frequency_bonus(stale)
+
+    def test_bonus_is_bounded(self):
+        """Even extreme values should not blow up the score."""
+        note = {
+            "recall_count": 9999,
+            "created_at": "2026-04-10T00:00:00Z",
+            "last_accessed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        bonus = _access_frequency_bonus(note)
+        assert bonus <= 1.0  # 0.55 rate cap + 0.30 recency cap = 0.85
+
+    def test_missing_created_at_uses_fallback(self):
+        """Without created_at, the function should still return a score
+        based on raw recall count."""
+        note = {
+            "recall_count": 4,
+            "last_accessed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        bonus = _access_frequency_bonus(note)
+        assert bonus > 0.0
+
+
+class TestUsageAdjustment:
+    """_usage_adjustment combines frequency, feedback, and contradiction signals."""
+
+    def test_positive_feedback_adds_to_score(self):
+        note = {
+            "recall_count": 0,
+            "positive_feedback": 2,
+            "negative_feedback": 0,
+            "contradiction_count": 0,
+        }
+        assert _usage_adjustment(note) > 0.0
+
+    def test_negative_feedback_reduces_score(self):
+        note = {
+            "recall_count": 0,
+            "positive_feedback": 0,
+            "negative_feedback": 3,
+            "contradiction_count": 0,
+        }
+        assert _usage_adjustment(note) < 0.0
+
+    def test_contradictions_reduce_score(self):
+        note = {
+            "recall_count": 0,
+            "positive_feedback": 0,
+            "negative_feedback": 0,
+            "contradiction_count": 2,
+        }
+        assert _usage_adjustment(note) < 0.0
+
+    def test_frequency_plus_feedback_compound(self):
+        """A frequently accessed, positively reinforced note should score
+        higher than one with just positive feedback."""
+        now = datetime.now(timezone.utc).isoformat()
+        from datetime import timedelta as td
+        created = (datetime.now(timezone.utc) - td(days=7)).isoformat()
+
+        with_access = {
+            "recall_count": 5,
+            "created_at": created,
+            "last_accessed_at": now,
+            "positive_feedback": 2,
+            "negative_feedback": 0,
+            "contradiction_count": 0,
+        }
+        without_access = {
+            "recall_count": 0,
+            "positive_feedback": 2,
+            "negative_feedback": 0,
+            "contradiction_count": 0,
+        }
+        assert _usage_adjustment(with_access) > _usage_adjustment(without_access)
+
+
+class TestFrequencyInSearch:
+    """End-to-end: frequently accessed notes rank higher in search results."""
+
+    def test_frequently_accessed_note_ranks_higher(self):
+        brain = BrainState()
+        from datetime import timedelta as td
+        now = datetime.now(timezone.utc)
+        created = (now - td(days=14)).isoformat()
+
+        # Both notes have identical content and creation time
+        n1 = add_note(brain, content="deployment pipeline config", summary="deployment pipeline")
+        n2 = add_note(brain, content="deployment pipeline config", summary="deployment pipeline")
+
+        brain.notes[n1]["created_at"] = created
+        brain.notes[n2]["created_at"] = created
+
+        # n1 has been accessed frequently, n2 never
+        brain.notes[n1]["recall_count"] = 8
+        brain.notes[n1]["last_accessed_at"] = now.isoformat()
+        brain.notes[n2]["recall_count"] = 0
+        brain.notes[n2]["last_accessed_at"] = ""
+
+        results = search_notes(brain, "deployment pipeline", max_results=5)
+        assert len(results) >= 2
+        result_ids = [r["id"] for r in results]
+        assert result_ids.index(n1) < result_ids.index(n2)
+
+    def test_brain_stats_include_frequency_metrics(self):
+        brain = BrainState()
+        from datetime import timedelta as td
+        now = datetime.now(timezone.utc)
+
+        n1 = add_note(brain, content="active note", summary="active")
+        n2 = add_note(brain, content="idle note", summary="idle")
+
+        # n1: frequently accessed (high rate + recent)
+        brain.notes[n1]["recall_count"] = 10
+        brain.notes[n1]["created_at"] = (now - td(days=5)).isoformat()
+        brain.notes[n1]["last_accessed_at"] = now.isoformat()
+
+        # n2: never accessed
+        brain.notes[n2]["recall_count"] = 0
+
+        stats = build_brain_stats(brain)
+        assert "frequently_accessed" in stats
+        assert "never_accessed" in stats
+        assert stats["frequently_accessed"] >= 1
+        assert stats["never_accessed"] >= 1
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 3: Store-backed retrieval tests
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _make_brain_db(tmp_path, notes=None, topics=None, pages=None, connections=None):
+    """Helper: create a brain.db with test data and return the state_file path."""
+    state_file = str(tmp_path / "state.json")
+    brain = BrainState()
+    if notes:
+        for content, tags in notes:
+            add_note(brain, content, tags=tags)
+    if topics:
+        for name in topics:
+            from second_brain import find_or_create_topic
+            find_or_create_topic(brain, name)
+    if pages:
+        from second_brain import add_page
+        for title, content, source_ids in pages:
+            add_page(brain, title, content, source_ids)
+    if connections:
+        for from_id, to_id, reason in connections:
+            connect_notes(brain, from_id, to_id, reason)
+    brain_dict = asdict(brain)
+    db_path = _brain_db_path(state_file)
+    _write_brain_sqlite(brain_dict, db_path)
+    return state_file
+
+
+class TestSchemaMigration:
+    def test_ensure_db_creates_new_columns(self, tmp_path):
+        """New databases should have the v2 columns."""
+        db_path = str(tmp_path / "brain.db")
+        conn = _ensure_brain_db(db_path)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(brain_notes)").fetchall()}
+        assert "confidence" in cols
+        assert "recall_count" in cols
+        assert "last_accessed_at" in cols
+        assert "content" in cols
+        conn.close()
+
+    def test_schema_version_set(self, tmp_path):
+        db_path = str(tmp_path / "brain.db")
+        conn = _ensure_brain_db(db_path)
+        assert _get_schema_version(conn) == _SCHEMA_VERSION
+        conn.close()
+
+    def test_fts_table_created(self, tmp_path):
+        db_path = str(tmp_path / "brain.db")
+        conn = _ensure_brain_db(db_path)
+        assert _has_fts(conn)
+        conn.close()
+
+
+class TestGetRecentNotesFromStore:
+    def test_returns_recent_notes(self, tmp_path):
+        state_file = _make_brain_db(tmp_path, notes=[
+            ("First note", ["tag1"]),
+            ("Second note", ["tag2"]),
+            ("Third note", ["tag3"]),
+        ])
+        notes = get_recent_notes_from_store(state_file, count=2)
+        assert len(notes) == 2
+        # Most recent first
+        assert "Third" in notes[0].get("content", "")
+
+    def test_returns_empty_when_no_db(self, tmp_path):
+        state_file = str(tmp_path / "nonexistent" / "state.json")
+        notes = get_recent_notes_from_store(state_file, count=5)
+        assert notes == []
+
+
+class TestGetUnconsolidatedNotesFromStore:
+    def test_excludes_consolidated_and_archived(self, tmp_path):
+        state_file = _make_brain_db(
+            tmp_path,
+            notes=[
+                ("Note A", []),
+                ("Note B", []),
+                ("Note C", []),
+            ],
+            pages=[("Test Page", "Page content", ["n0001"])],
+        )
+        uncons = get_unconsolidated_notes_from_store(state_file)
+        ids = [n["id"] for n in uncons]
+        # n0001 is consolidated (in page sources), so excluded
+        assert "n0001" not in ids
+        assert "n0002" in ids
+        assert "n0003" in ids
+
+
+class TestDecayStaleNotesFromStore:
+    def test_archives_old_orphan_notes(self, tmp_path):
+        from datetime import timedelta
+        state_file = str(tmp_path / "state.json")
+        brain = BrainState()
+        old_date = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+        add_note(brain, "Old orphan note")
+        brain.notes["n0001"]["created_at"] = old_date
+        brain_dict = asdict(brain)
+        _write_brain_sqlite(brain_dict, _brain_db_path(state_file))
+
+        archived = decay_stale_notes_from_store(state_file, max_age_days=30)
+        assert archived == 1
+
+    def test_does_not_archive_connected_notes(self, tmp_path):
+        from datetime import timedelta
+        state_file = str(tmp_path / "state.json")
+        brain = BrainState()
+        old_date = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+        n1 = add_note(brain, "Connected old note")
+        n2 = add_note(brain, "Another note")
+        brain.notes[n1]["created_at"] = old_date
+        brain.notes[n2]["created_at"] = old_date
+        connect_notes(brain, n1, n2, "related")
+        brain_dict = asdict(brain)
+        _write_brain_sqlite(brain_dict, _brain_db_path(state_file))
+
+        archived = decay_stale_notes_from_store(state_file, max_age_days=30)
+        assert archived == 0  # both are connected
+
+
+class TestFindDuplicateFromStore:
+    def test_finds_duplicate(self, tmp_path):
+        state_file = _make_brain_db(tmp_path, notes=[
+            ("The quick brown fox jumps over the lazy dog", ["test"]),
+        ])
+        result = find_duplicate_from_store(
+            state_file, "The quick brown fox jumps over the lazy dog"
+        )
+        assert result == "n0001"
+
+    def test_returns_none_when_no_duplicate(self, tmp_path):
+        state_file = _make_brain_db(tmp_path, notes=[
+            ("The quick brown fox", ["test"]),
+        ])
+        result = find_duplicate_from_store(
+            state_file, "Completely different content about databases"
+        )
+        assert result is None
+
+
+class TestBuildBrainSummaryFromStore:
+    def test_builds_summary_with_notes(self, tmp_path):
+        state_file = _make_brain_db(tmp_path, notes=[
+            ("React hooks are useful for state management", ["react"]),
+            ("TypeScript improves code quality", ["typescript"]),
+        ])
+        summary = build_brain_summary_from_store(state_file, max_notes=5)
+        assert "SECOND BRAIN" in summary
+        assert "Total notes: 2" in summary
+        assert "n0001" in summary or "n0002" in summary
+
+    def test_builds_summary_with_pages(self, tmp_path):
+        state_file = _make_brain_db(
+            tmp_path,
+            notes=[("Note A", []), ("Note B", [])],
+            pages=[("React Guide", "A guide to React hooks", ["n0001"])],
+        )
+        summary = build_brain_summary_from_store(state_file, max_notes=5)
+        assert "WIKI PAGES" in summary
+        assert "React Guide" in summary
+
+    def test_returns_fallback_when_no_db(self, tmp_path):
+        state_file = str(tmp_path / "nonexistent" / "state.json")
+        summary = build_brain_summary_from_store(state_file, max_notes=5)
+        assert "SECOND BRAIN" in summary
+
+
+class TestIncrementalSave:
+    def test_save_brain_preserves_data(self, tmp_path):
+        state_file = str(tmp_path / "state.json")
+        brain = BrainState()
+        add_note(brain, "Note one", tags=["tag1"])
+        add_note(brain, "Note two", tags=["tag2"])
+        connect_notes(brain, "n0001", "n0002", "related")
+
+        asyncio.run(save_brain(brain, state_file))
+
+        # Verify data round-trips through SQLite
+        loaded = asyncio.run(load_brain(state_file))
+        assert len(loaded.notes) == 2
+        assert len(loaded.connections) == 1
+        assert loaded.notes["n0001"]["content"] == "Note one"
+
+    def test_incremental_save_handles_deletions(self, tmp_path):
+        state_file = str(tmp_path / "state.json")
+        brain = BrainState()
+        add_note(brain, "Note to keep")
+        add_note(brain, "Note to delete")
+        asyncio.run(save_brain(brain, state_file))
+
+        # Delete one note and save again
+        del brain.notes["n0002"]
+        asyncio.run(save_brain(brain, state_file))
+
+        loaded = asyncio.run(load_brain(state_file))
+        assert len(loaded.notes) == 1
+        assert "n0001" in loaded.notes
+        assert "n0002" not in loaded.notes
+
+    def test_new_columns_populated_after_save(self, tmp_path):
+        state_file = str(tmp_path / "state.json")
+        brain = BrainState()
+        add_note(brain, "Test content with confidence", confidence=85)
+        brain.notes["n0001"]["recall_count"] = 5
+        asyncio.run(save_brain(brain, state_file))
+
+        import sqlite3
+        db_path = _brain_db_path(state_file)
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT confidence, recall_count, content FROM brain_notes WHERE id = 'n0001'"
+        ).fetchone()
+        conn.close()
+        assert row[0] == 85  # confidence
+        assert row[1] == 5   # recall_count
+        assert "Test content" in row[2]  # content

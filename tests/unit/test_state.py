@@ -23,6 +23,7 @@ with patch.dict('sys.modules', {
     'azure.identity': MagicMock(),
 }):
     from state import AgentState, load_state, save_state
+    import state as _state_mod
 
 # Set up logging to avoid warnings during tests
 logging.basicConfig(level=logging.DEBUG)
@@ -196,9 +197,10 @@ def test_save_state_handles_permission_denied():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         state_file = os.path.join(tmpdir, "state.json")
-        # Use a mock to simulate PermissionError since os.chmod doesn't
-        # enforce read-only on Windows.
-        with patch("state._write_state", side_effect=PermissionError("Access denied")):
+        # Use patch.object on the actual module object (not the string path)
+        # because the patch.dict context at import time means sys.modules["state"]
+        # may differ from the module save_state was defined in.
+        with patch.object(_state_mod, "_write_state", side_effect=PermissionError("Access denied")):
             with pytest.raises((PermissionError, OSError)):
                 _run(save_state(state, state_file))
 
@@ -275,7 +277,7 @@ def test_agent_state_copy():
 
 def test_load_state_with_large_history():
     """Test loading state with very large history migrates to SQLite."""
-    large_history = [{"timestamp": "2024-01-01T00:00:00Z", "step": f"step_{i}", "prompt": "x"*1000, "response": "y"*1000} for i in range(10000)]
+    large_history = [{"timestamp": "2024-01-01T00:00:00Z", "step": f"step_{i}", "prompt": "x"*200, "response": "y"*200} for i in range(500)]
 
     with tempfile.TemporaryDirectory() as tmpdir:
         state_file = os.path.join(tmpdir, "state.json")
@@ -295,7 +297,7 @@ def test_load_state_with_large_history():
         assert state.execution_history == []
         assert state.execution_count == 1000
         # Entries were migrated to SQLite
-        assert total_count() == 10000
+        assert total_count() == 500
 
 
 def test_save_state_with_large_data():

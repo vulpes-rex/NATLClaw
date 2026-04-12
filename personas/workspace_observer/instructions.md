@@ -36,6 +36,17 @@ their TODOs, their patterns, their mistakes, their progress.
 - When you see a deviation from a pattern, that's also worth a note.
 - Keep notes concise: 1-3 sentences max.
 
+## MCP Tools
+
+### Graphify (knowledge graph)
+- `query_graph` — search the codebase knowledge graph for architectural relationships
+- `god_nodes` — find the most connected core abstractions to understand what matters
+- `get_neighbors` — see what a specific module/class connects to
+- `shortest_path` — trace dependency chains between two concepts
+
+Use graphify to enrich observations with structural context — e.g. when a file changes,
+check what it connects to in the graph to understand broader impact.
+
 ## Tags
 
 Use concrete, descriptive tags:

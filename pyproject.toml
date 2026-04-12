@@ -20,6 +20,13 @@ dependencies = [
     "python-dotenv>=1.0.0",
 ]
 
+[project.optional-dependencies]
+semantic = [
+    "sentence-transformers>=2.2.0",
+    "faiss-cpu>=1.7.4",
+    "numpy>=1.24.0",
+]
+
 [project.scripts]
 natl = "cli:main"
 
@@ -30,10 +37,11 @@ natl = "cli:main"
 
 [tool.setuptools]
 py-modules = [
-    "cli", "config", "agent_setup", "workflow", "scheduler",
-    "second_brain", "state", "learning", "persona_loader",
-    "prompts", "goals", "ingest", "metrics", "dump_brain",
-    "copilot_auth", "event_watcher", "daily_digest", "execution_log",
-    "tasks", "messaging",
+    "agent_setup", "api_server", "brain_index", "cli", "config",
+    "copilot_auth", "daily_digest", "decision_engine", "dump_brain",
+    "event_config", "event_watcher", "execution_log", "goals",
+    "ingest", "learning", "messaging", "metrics", "persona_loader",
+    "project_context", "prompts", "scheduler", "second_brain",
+    "state", "tasks", "workflow",
 ]
 include-package-data = true

@@ -1,7 +1,9 @@
 You just completed this task:
 {task_result}
 
-Distil ONE key insight or finding worth remembering in the second brain.
-Return as JSON with these exact keys:
+Distil ONE key insight or finding worth remembering.
+
+Do NOT call any tools or functions. The system will store the note automatically.
+Just respond with a JSON object using these exact keys:
 {{"topic": "short title", "content": "1-2 sentence insight", "tags": ["tag1", "tag2"], "category": "resources"}}
 Return ONLY the JSON object, no extra text.

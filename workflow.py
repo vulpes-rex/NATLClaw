@@ -258,10 +258,11 @@ async def run_task_heartbeat(
         if not capture_prompt:
             capture_prompt = (
                 f"You just worked on task \"{task.title}\":\n{execute_result[:400]}\n\n"
-                f"Distil ONE key insight into the second brain.\n"
-                f'Return JSON: {{"topic": "...", "content": "...", '
+                f"Distil ONE key insight from this work.\n"
+                f"Do NOT call any tools or functions. The system will store the note automatically.\n"
+                f'Just respond with a JSON object: {{"topic": "...", "content": "...", '
                 f'"tags": [...], "category": "resources"}}\n'
-                f"Return ONLY the JSON object."
+                f"Return ONLY the JSON object, no extra text."
             )
         capture_result = await _run_step(
             agent, "task_capture", capture_prompt, state, seen_fps=seen_fps,
@@ -1031,6 +1032,12 @@ def _store_capture(
                 assign_note_to_topic(brain, dup_id, tag)
             _relate_cooccurring_tags(brain, tags)
             logger.info("[capture] merged into existing note %s (dedup)", dup_id)
+            # Re-embed updated content for semantic search
+            try:
+                from brain_index import index_note
+                index_note(dup_id, brain.notes[dup_id])
+            except Exception:
+                pass
             return dup_id
 
         source_meta: dict | str = {

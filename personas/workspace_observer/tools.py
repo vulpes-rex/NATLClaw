@@ -192,3 +192,237 @@ def list_recently_modified(
         rel = fp.relative_to(ws)
         lines.append(f"{ts}  {rel}")
     return "\n".join(lines) or "(empty workspace)"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Deep analysis tools (used during workspace audits / reports)
+# ──────────────────────────────────────────────────────────────────────
+
+def read_file(
+    path: Annotated[str, "Relative path to the file within the workspace"],
+    max_lines: Annotated[int, "Maximum number of lines to read"] = 200,
+) -> str:
+    """Read a file's contents (read-only). Use for inspecting source code,
+    config files, documentation, or test files during an audit."""
+    ws = Path(WORKSPACE)
+    target = ws / path
+    # Safety: ensure path doesn't escape workspace
+    try:
+        target.resolve().relative_to(ws.resolve())
+    except ValueError:
+        return f"Error: path escapes workspace: {path}"
+    if not target.is_file():
+        return f"File not found: {path}"
+    try:
+        lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+        truncated = lines[:max_lines]
+        result = "\n".join(f"{i+1:4d}  {line}" for i, line in enumerate(truncated))
+        if len(lines) > max_lines:
+            result += f"\n... ({len(lines) - max_lines} more lines)"
+        return result
+    except OSError as e:
+        return f"Error reading {path}: {e}"
+
+
+def list_directory(
+    path: Annotated[str, "Relative directory path (use '.' for root)"] = ".",
+    pattern: Annotated[str, "Glob pattern to filter files, e.g. '*.py'"] = "*",
+) -> str:
+    """List files in a directory, optionally filtered by glob pattern.
+    Useful for discovering project structure during an audit."""
+    ws = Path(WORKSPACE)
+    target = ws / path
+    try:
+        target.resolve().relative_to(ws.resolve())
+    except ValueError:
+        return f"Error: path escapes workspace: {path}"
+    if not target.is_dir():
+        return f"Directory not found: {path}"
+
+    entries: list[str] = []
+    for item in sorted(target.glob(pattern)):
+        if item.name.startswith(".") and item.name not in (".env.example",):
+            continue
+        if item.name in {"node_modules", "__pycache__", ".git", "venv", ".venv"}:
+            continue
+        rel = item.relative_to(ws)
+        marker = "DIR " if item.is_dir() else "    "
+        entries.append(f"{marker}{rel}")
+    return "\n".join(entries[:100]) or "(empty)"
+
+
+def check_imports(
+    path: Annotated[str, "Relative path to a Python file"],
+) -> str:
+    """Check whether all imports in a Python file resolve correctly.
+    Returns a list of broken/missing imports."""
+    ws = Path(WORKSPACE)
+    target = ws / path
+    if not target.is_file():
+        return f"File not found: {path}"
+
+    import ast
+    try:
+        source = target.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source, filename=path)
+    except SyntaxError as e:
+        return f"Syntax error in {path}: {e}"
+
+    issues: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                _check_module(alias.name, path, node.lineno, issues)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                _check_module(node.module, path, node.lineno, issues)
+
+    if not issues:
+        return f"All imports in {path} resolve correctly."
+    return "\n".join(issues)
+
+
+def _check_module(module: str, filepath: str, lineno: int, issues: list[str]) -> None:
+    """Try to import a module; if it fails, log the issue."""
+    import importlib
+    top = module.split(".")[0]
+    # Skip stdlib and known third-party
+    try:
+        importlib.import_module(top)
+    except ImportError:
+        issues.append(f"  {filepath}:{lineno}  MISSING: {module}")
+    except Exception:
+        pass  # some modules have side effects on import
+
+
+def search_codebase(
+    query: Annotated[str, "Text or regex pattern to search for"],
+    extensions: Annotated[str, "Comma-separated file extensions, e.g. 'py,ts'"] = "py",
+    max_results: Annotated[int, "Maximum matches to return"] = 30,
+) -> str:
+    """Search for a text pattern across workspace files. Useful for finding
+    dead code, inconsistencies, hardcoded values, or usage of a function."""
+    ws = Path(WORKSPACE)
+    exts = {f".{e.strip()}" for e in extensions.split(",")}
+    pattern = re.compile(query, re.IGNORECASE)
+    hits: list[str] = []
+
+    for root, dirs, files in os.walk(ws):
+        dirs[:] = [
+            d for d in dirs
+            if d not in {"node_modules", ".git", "__pycache__", "venv", ".venv", "dist", "build", "data"}
+        ]
+        for fname in files:
+            if Path(fname).suffix not in exts:
+                continue
+            fpath = Path(root) / fname
+            try:
+                for lineno, line in enumerate(
+                    fpath.read_text(encoding="utf-8", errors="ignore").splitlines(),
+                    start=1,
+                ):
+                    if pattern.search(line):
+                        rel = fpath.relative_to(ws)
+                        hits.append(f"{rel}:{lineno}  {line.strip()[:120]}")
+                        if len(hits) >= max_results:
+                            return "\n".join(hits)
+            except OSError:
+                continue
+
+    return "\n".join(hits) if hits else f"No matches for '{query}'"
+
+
+def run_tests(
+    args: Annotated[str, "Extra pytest arguments, e.g. '--tb=short -q'"] = "-q --tb=line --no-header",
+) -> str:
+    """Run the project's test suite and return the summary. Read-only
+    observation of test health — does not modify any files."""
+    try:
+        result = subprocess.run(
+            ["python", "-m", "pytest"] + args.split(),
+            capture_output=True,
+            cwd=WORKSPACE,
+            timeout=120,
+        )
+        out = result.stdout.decode("utf-8", errors="replace")
+        err = result.stderr.decode("utf-8", errors="replace")
+        combined = out + ("\n" + err if err else "")
+        return combined[-4000:] or "(no output)"
+    except FileNotFoundError:
+        return "pytest not installed"
+    except subprocess.TimeoutExpired:
+        return "Tests timed out after 120s"
+    except Exception as e:
+        return f"Test run failed: {e}"
+
+
+def analyze_module_structure() -> str:
+    """Analyze the project's Python module structure: which .py files exist,
+    their sizes, and import relationships. Good for architecture overview."""
+    ws = Path(WORKSPACE)
+    modules: list[dict] = []
+
+    for py_file in sorted(ws.glob("*.py")):
+        try:
+            content = py_file.read_text(encoding="utf-8", errors="ignore")
+            lines = content.splitlines()
+            imports = [
+                l.strip() for l in lines
+                if l.strip().startswith(("import ", "from "))
+                and not l.strip().startswith("#")
+            ]
+            # Extract local imports (not stdlib/third-party)
+            local_imports = []
+            for imp in imports:
+                parts = imp.replace("from ", "").replace("import ", "").split()[0].split(".")
+                top = parts[0]
+                if (ws / f"{top}.py").exists() or (ws / top).is_dir():
+                    local_imports.append(top)
+
+            modules.append({
+                "file": py_file.name,
+                "lines": len(lines),
+                "imports": len(imports),
+                "local_deps": sorted(set(local_imports)),
+            })
+        except OSError:
+            continue
+
+    if not modules:
+        return "No Python modules found in workspace root."
+
+    lines = [f"{'Module':<25s} {'Lines':>6s}  {'Imports':>7s}  Local Dependencies"]
+    lines.append("-" * 80)
+    for m in modules:
+        deps = ", ".join(m["local_deps"]) if m["local_deps"] else "(none)"
+        lines.append(f"{m['file']:<25s} {m['lines']:>6d}  {m['imports']:>7d}  {deps}")
+    return "\n".join(lines)
+
+
+def check_docs_vs_implementation() -> str:
+    """Compare docs/ folder contents against actual implementation.
+    Scans documentation for feature mentions and checks if corresponding
+    code exists. Useful for finding planned-but-not-started features."""
+    ws = Path(WORKSPACE)
+    docs_dir = ws / "docs"
+    if not docs_dir.is_dir():
+        return "No docs/ directory found."
+
+    report: list[str] = []
+    for doc_file in sorted(docs_dir.glob("*.md")):
+        try:
+            content = doc_file.read_text(encoding="utf-8", errors="ignore")
+            # Extract headings and status markers
+            headings = re.findall(r"^#+\s+(.+)$", content, re.MULTILINE)
+            not_started = re.findall(r"(?:not started|TODO|planned|future)", content, re.IGNORECASE)
+            done_markers = re.findall(r"(?:✅|done|completed|implemented)", content, re.IGNORECASE)
+            partial_markers = re.findall(r"(?:⚠️|partial|in.progress|started)", content, re.IGNORECASE)
+
+            status = f"Done:{len(done_markers)} Partial:{len(partial_markers)} Planned:{len(not_started)}"
+            report.append(f"\n{doc_file.name} ({len(headings)} sections, {status})")
+            for h in headings[:8]:
+                report.append(f"  - {h[:80]}")
+        except OSError:
+            continue
+
+    return "\n".join(report) if report else "No documentation files found."

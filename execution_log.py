@@ -180,24 +180,30 @@ def migrate_from_state(entries: list[dict], *, db_path: str | None = None) -> in
     conn = _ensure_db(resolved)
     inserted = 0
     try:
+        # Build set of existing (timestamp, step) pairs for dedup
+        existing = set(
+            conn.execute(
+                "SELECT timestamp, step FROM execution_log"
+            ).fetchall()
+        )
+        rows = []
         for entry in entries:
             ts = entry.get("timestamp", "")
             step = entry.get("step", "")
-            prompt = entry.get("prompt", "")
-            response = entry.get("response", "")
-            # Skip if already exists
-            exists = conn.execute(
-                "SELECT 1 FROM execution_log WHERE timestamp = ? AND step = ? LIMIT 1",
-                (ts, step),
-            ).fetchone()
-            if not exists:
-                conn.execute(
-                    "INSERT INTO execution_log (timestamp, step, prompt, response) "
-                    "VALUES (?, ?, ?, ?)",
-                    (ts, step, prompt, response),
-                )
-                inserted += 1
-        conn.commit()
+            if (ts, step) not in existing:
+                rows.append((
+                    ts, step,
+                    entry.get("prompt", ""),
+                    entry.get("response", ""),
+                ))
+        if rows:
+            conn.executemany(
+                "INSERT INTO execution_log (timestamp, step, prompt, response) "
+                "VALUES (?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+        inserted = len(rows)
     finally:
         conn.close()
     return inserted

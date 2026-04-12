@@ -33,6 +33,7 @@ class AppConfig:
 
     # Scheduler
     heartbeat_interval_sec: int = 120
+    watch_path: str = "."
 
     # State
     state_file: str = "data/agent_state.json"
@@ -42,6 +43,9 @@ class AppConfig:
     agent_name: str = "NATLClaw"
     persona: str = "default"
     agent_instructions: str = ""  # populated from persona if empty
+
+    # API authentication (optional — if set, all API endpoints require Bearer token)
+    api_key: str = ""
 
 
 VALID_PROVIDERS = ("copilot", "foundry", "openai", "openrouter", "azure_openai", "ollama")
@@ -100,4 +104,5 @@ def load_config(env_path: str = ".env") -> AppConfig:
         agent_name=os.getenv("AGENT_NAME", "NATLClaw"),
         persona=os.getenv("PERSONA", "default"),
         agent_instructions=os.getenv("AGENT_INSTRUCTIONS", ""),
+        api_key=os.getenv("NATL_API_KEY", ""),
     )

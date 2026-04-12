@@ -89,6 +89,7 @@ test_state.json
 package-lock.json
 *.vi
 *.location
+graphify-out/
 
 # Windows
 Thumbs.db

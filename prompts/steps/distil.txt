@@ -1,7 +1,8 @@
-Distil ONE key insight from this output into the second brain.
+Distil ONE key insight from this output.
 
 Output:
 {result}
 
-Return JSON: {{"topic": "...", "content": "...", "tags": [...], "category": "resources"}}
-Return ONLY the JSON object.
+Do NOT call any tools or functions. The system will store the note automatically.
+Just respond with a JSON object: {{"topic": "...", "content": "...", "tags": [...], "category": "resources"}}
+Return ONLY the JSON object, no extra text.

@@ -21,7 +21,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Global event queue (set by scheduler)
-_event_queue: asyncio.Queue[tuple[str, dict | None] | None] | None = None
+_event_queue: asyncio.PriorityQueue[tuple[int, str, dict]] | None = None
 
 # Directories to ignore while watching
 _IGNORE_DIRS = frozenset({
@@ -39,13 +39,33 @@ _IGNORE_SUFFIXES = frozenset({
 # Event queue writer
 # ──────────────────────────────────────────────────────────────────────
 
+def _should_ignore(filepath: str) -> bool:
+    """Return True if a file path should be ignored by the watcher."""
+    p = Path(filepath)
+    # Check directory components
+    for part in p.parts:
+        if part in _IGNORE_DIRS:
+            return True
+    # Check file suffix
+    if p.suffix in _IGNORE_SUFFIXES:
+        return True
+    return False
+
+
+# Priority levels for events
+from event_config import EVENT_PRIORITY
+
 def _push_event(event_type: str, payload: dict | None = None) -> None:
     """Push an event to the global event queue (thread-safe)."""
     if _event_queue is None:
         logger.warning("Event queue not initialized: %s", event_type)
         return
+    # Determine priority; default to low (3) if not specified
+    priority = EVENT_PRIORITY.get(event_type, 3)
+    # Ensure payload is a dict (convert None to empty dict)
+    payload_dict = payload if payload is not None else {}
     try:
-        _event_queue.put_nowait((event_type, payload))
+        _event_queue.put_nowait((priority, event_type, payload_dict))
     except asyncio.QueueFull:
         logger.warning("Event queue full, dropping event: %s", event_type)
 
@@ -54,7 +74,9 @@ def _push_event_nowait(event_type: str, payload: dict | None = None) -> None:
     """Push an event without blocking (may raise QueueFull)."""
     if _event_queue is None:
         raise ValueError("Event queue not initialized")
-    _event_queue.put_nowait((event_type, payload))
+    priority = EVENT_PRIORITY.get(event_type, 3)
+    payload_dict = payload if payload is not None else {}
+    _event_queue.put_nowait((priority, event_type, payload_dict))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -64,7 +86,7 @@ def _push_event_nowait(event_type: str, payload: dict | None = None) -> None:
 class EventWatcher:
     """Watch a directory tree and push file-change events to an event queue."""
 
-    def __init__(self, watch_path: str = ".", event_queue: asyncio.Queue[tuple[str, dict | None] | None] | None = None):
+    def __init__(self, watch_path: str = ".", event_queue: asyncio.PriorityQueue[tuple[int, str, dict]] | None = None):
         self.watch_path = os.path.abspath(watch_path)
         self._observer: Any = None
         self._polling = False
@@ -77,10 +99,28 @@ class EventWatcher:
         if _event_queue is None:
             logger.warning("Event queue not initialized: %s", event_type)
             return
+        # Determine priority; default to low (3) if not specified
+        priority = EVENT_PRIORITY.get(event_type, 3)
+        # Ensure payload is a dict (convert None to empty dict)
+        payload_dict = payload if payload is not None else {}
         try:
-            _event_queue.put_nowait((event_type, payload))
+            _event_queue.put_nowait((priority, event_type, payload_dict))
         except asyncio.QueueFull:
             logger.warning("Event queue full, dropping event: %s", event_type)
+
+    def start(self) -> None:
+        """Start watching — uses watchdog if available, else polling."""
+        self._stop = False
+        self._start_watchdog()
+
+    def stop(self) -> None:
+        """Stop the watcher."""
+        self._stop = True
+        if self._observer is not None:
+            self._observer.stop()
+            self._observer.join(timeout=5)
+            self._observer = None
+        self._polling = False
 
     # ── watchdog backend ──
 
@@ -169,6 +209,64 @@ class EventWatcher:
 
         self._snapshot = new_snap
         return count
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Cross-process event signaling (CLI → scheduler)
+# ──────────────────────────────────────────────────────────────────────
+
+_PENDING_EVENTS_FILE = Path("data") / "pending_events.ndjson"
+
+
+def enqueue_event(event_type: str, payload: dict | None = None) -> None:
+    """Write an event to the pending-events file for the scheduler to pick up.
+
+    This is the cross-process entry point — CLI commands call this to
+    signal the running scheduler without needing shared memory.
+    """
+    _PENDING_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    priority = EVENT_PRIORITY.get(event_type, 3)
+    record = {
+        "priority": priority,
+        "event_type": event_type,
+        "payload": payload or {},
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    with open(_PENDING_EVENTS_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def drain_pending_events(
+    event_queue: asyncio.PriorityQueue[tuple[int, str, dict]],
+) -> int:
+    """Read and clear pending events from the file, pushing them to the queue.
+
+    Returns the number of events drained.
+    """
+    if not _PENDING_EVENTS_FILE.exists():
+        return 0
+    count = 0
+    try:
+        lines = _PENDING_EVENTS_FILE.read_text(encoding="utf-8").splitlines()
+        # Clear the file immediately to avoid double-processing
+        _PENDING_EVENTS_FILE.write_text("", encoding="utf-8")
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                event_queue.put_nowait((
+                    record["priority"],
+                    record["event_type"],
+                    record.get("payload", {}),
+                ))
+                count += 1
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning("Skipping malformed pending event: %s", e)
+    except OSError as e:
+        logger.warning("Failed to drain pending events: %s", e)
+    return count
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -408,7 +506,7 @@ def _daemon_main(watch_path: str) -> None:
 
     signal.signal(signal.SIGTERM, _shutdown)
     if sys.platform != "win32":
-        signal.signal(SIGHUP, _shutdown)
+        signal.signal(signal.SIGHUP, _shutdown)
 
     try:
         while True:

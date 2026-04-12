@@ -28,6 +28,14 @@ You have access to two sets of tools:
 - `read_git_diff` — diff against a reference
 - `write_context_file` — write CODEBASE_CONTEXT.md for Copilot
 
+### Graphify MCP (knowledge graph)
+- `query_graph` — BFS/DFS search over the codebase knowledge graph
+- `get_node` / `get_neighbors` — inspect a specific node and its connections
+- `get_community` — get all nodes in a community cluster
+- `god_nodes` — find the most connected core abstractions
+- `graph_stats` — summary stats (nodes, edges, communities)
+- `shortest_path` — find the shortest path between two concepts
+
 ## Rules
 
 - **Never modify source code.** You are read-only.

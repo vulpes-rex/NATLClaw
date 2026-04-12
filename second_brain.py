@@ -210,14 +210,18 @@ CREATE TABLE IF NOT EXISTS brain_meta (
 
 _CREATE_NOTES_TABLE = """\
 CREATE TABLE IF NOT EXISTS brain_notes (
-    id         TEXT PRIMARY KEY,
-    summary    TEXT NOT NULL DEFAULT '',
-    category   TEXT NOT NULL DEFAULT 'resources',
-    note_type  TEXT NOT NULL DEFAULT 'general',
-    status     TEXT NOT NULL DEFAULT 'active',
-    created_at TEXT NOT NULL DEFAULT '',
-    updated_at TEXT NOT NULL DEFAULT '',
-    raw_json   TEXT NOT NULL
+    id              TEXT PRIMARY KEY,
+    summary         TEXT NOT NULL DEFAULT '',
+    category        TEXT NOT NULL DEFAULT 'resources',
+    note_type       TEXT NOT NULL DEFAULT 'general',
+    status          TEXT NOT NULL DEFAULT 'active',
+    created_at      TEXT NOT NULL DEFAULT '',
+    updated_at      TEXT NOT NULL DEFAULT '',
+    confidence      INTEGER,
+    recall_count    INTEGER NOT NULL DEFAULT 0,
+    last_accessed_at TEXT NOT NULL DEFAULT '',
+    content         TEXT NOT NULL DEFAULT '',
+    raw_json        TEXT NOT NULL
 );
 """
 
@@ -274,6 +278,92 @@ _CREATE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_brain_connections_from_to ON brain_connections (from_id, to_id);",
 )
 
+# Indexes on v2 columns — created after migration
+_CREATE_V2_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_brain_notes_status ON brain_notes (status);",
+    "CREATE INDEX IF NOT EXISTS idx_brain_notes_created ON brain_notes (created_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_brain_notes_confidence ON brain_notes (confidence DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_brain_notes_recall ON brain_notes (recall_count DESC);",
+)
+
+# Current schema version — bump when schema changes
+_SCHEMA_VERSION = 2
+
+
+def _get_schema_version(conn: sqlite3.Connection) -> int:
+    """Read the schema version from brain_meta, defaulting to 1."""
+    try:
+        row = conn.execute(
+            "SELECT value_json FROM brain_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        if row:
+            return int(json.loads(row[0]))
+    except (sqlite3.OperationalError, ValueError, TypeError):
+        pass
+    return 1
+
+
+def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
+    """Write the schema version to brain_meta."""
+    conn.execute(
+        "INSERT OR REPLACE INTO brain_meta (key, value_json) VALUES ('schema_version', ?)",
+        (json.dumps(version),),
+    )
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """Add queryable columns and FTS5 table (v1 → v2).
+
+    Safe to run on a fresh DB (columns already exist via CREATE TABLE).
+    """
+    # Add queryable columns to brain_notes if missing (legacy DBs only)
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(brain_notes)").fetchall()}
+    new_cols = [
+        ("confidence", "INTEGER"),
+        ("recall_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_accessed_at", "TEXT NOT NULL DEFAULT ''"),
+        ("content", "TEXT NOT NULL DEFAULT ''"),
+    ]
+    for col, col_type in new_cols:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE brain_notes ADD COLUMN {col} {col_type}")
+
+    # Backfill new columns from raw_json
+    for note_id, raw_json in conn.execute("SELECT id, raw_json FROM brain_notes").fetchall():
+        try:
+            note = json.loads(raw_json)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        conn.execute(
+            "UPDATE brain_notes SET confidence = ?, recall_count = ?, "
+            "last_accessed_at = ?, content = ? WHERE id = ?",
+            (
+                _normalize_confidence(note.get("confidence")),
+                _normalize_counter(note.get("recall_count")),
+                str(note.get("last_accessed_at") or ""),
+                str(note.get("content") or ""),
+                note_id,
+            ),
+        )
+
+    # Create FTS5 virtual table for full-text search on notes
+    try:
+        conn.execute("DROP TABLE IF EXISTS brain_notes_fts")
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS brain_notes_fts "
+            "USING fts5(id UNINDEXED, content, summary, content=brain_notes, content_rowid=rowid)"
+        )
+        # Populate FTS from existing data
+        conn.execute(
+            "INSERT INTO brain_notes_fts(brain_notes_fts) VALUES('rebuild')"
+        )
+    except sqlite3.OperationalError:
+        # FTS5 not available in this SQLite build — skip gracefully
+        logger.info("FTS5 not available; full-text search will use fallback")
+
+    _set_schema_version(conn, 2)
+    conn.commit()
+
 
 def _ensure_brain_db(db_path: str) -> sqlite3.Connection:
     """Open or create the SQLite brain store and ensure schema exists."""
@@ -290,6 +380,20 @@ def _ensure_brain_db(db_path: str) -> sqlite3.Connection:
     for stmt in _CREATE_INDEXES:
         conn.execute(stmt)
     conn.commit()
+
+    # Run migrations
+    version = _get_schema_version(conn)
+    if version < 2:
+        _migrate_v1_to_v2(conn)
+
+    # Create v2 indexes (safe after migration has added the columns)
+    for stmt in _CREATE_V2_INDEXES:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column might not exist in degraded state
+    conn.commit()
+
     return conn
 
 
@@ -427,6 +531,20 @@ async def load_brain(state_file: str) -> BrainState:
                     await loop.run_in_executor(None, _write_brain_sqlite, data, db_path)
                 except sqlite3.OperationalError as db_write_err:
                     raise OSError(str(db_write_err)) from db_write_err
+
+            # SQLite exists but is empty — backfill from JSON if it has data
+            if not data.get("notes") and os.path.exists(path):
+                json_data = await loop.run_in_executor(None, _read_brain, path)
+                if json_data.get("notes"):
+                    logger.info(
+                        "SQLite brain empty but %s has %d note(s) — backfilling",
+                        path, len(json_data["notes"]),
+                    )
+                    data = json_data
+                    try:
+                        await loop.run_in_executor(None, _write_brain_sqlite, data, db_path)
+                    except sqlite3.OperationalError as e:
+                        raise OSError(str(e)) from e
         else:
             data = await loop.run_in_executor(None, _read_brain, path)
             try:
@@ -479,6 +597,7 @@ def _write_brain_sqlite(brain_dict: dict, db_path: str) -> None:
             conn.executemany(
                 "INSERT INTO brain_meta (key, value_json) VALUES (?, ?)",
                 [
+                    ("schema_version", json.dumps(_SCHEMA_VERSION)),
                     ("capture_count", json.dumps(brain_dict.get("capture_count", 0))),
                     ("topic_count", json.dumps(brain_dict.get("topic_count", 0))),
                     ("page_count", json.dumps(brain_dict.get("page_count", 0))),
@@ -490,8 +609,9 @@ def _write_brain_sqlite(brain_dict: dict, db_path: str) -> None:
 
             conn.executemany(
                 "INSERT INTO brain_notes "
-                "(id, summary, category, note_type, status, created_at, updated_at, raw_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "(id, summary, category, note_type, status, created_at, updated_at, "
+                "confidence, recall_count, last_accessed_at, content, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         note_id,
@@ -501,6 +621,10 @@ def _write_brain_sqlite(brain_dict: dict, db_path: str) -> None:
                         note.get("status", "active"),
                         note.get("created_at", ""),
                         note.get("updated_at", ""),
+                        _normalize_confidence(note.get("confidence")),
+                        _normalize_counter(note.get("recall_count")),
+                        str(note.get("last_accessed_at") or ""),
+                        str(note.get("content") or ""),
                         json.dumps(note),
                     )
                     for note_id, note in brain_dict.get("notes", {}).items()
@@ -576,7 +700,8 @@ def _update_note_row(conn: sqlite3.Connection, note_id: str, note: dict) -> None
     """Persist one note row in SQLite after an in-place mutation."""
     conn.execute(
         "UPDATE brain_notes "
-        "SET summary = ?, category = ?, note_type = ?, status = ?, created_at = ?, updated_at = ?, raw_json = ? "
+        "SET summary = ?, category = ?, note_type = ?, status = ?, created_at = ?, updated_at = ?, "
+        "confidence = ?, recall_count = ?, last_accessed_at = ?, content = ?, raw_json = ? "
         "WHERE id = ?",
         (
             note.get("summary", ""),
@@ -585,6 +710,10 @@ def _update_note_row(conn: sqlite3.Connection, note_id: str, note: dict) -> None
             note.get("status", "active"),
             note.get("created_at", ""),
             note.get("updated_at", ""),
+            _normalize_confidence(note.get("confidence")),
+            _normalize_counter(note.get("recall_count")),
+            str(note.get("last_accessed_at") or ""),
+            str(note.get("content") or ""),
             json.dumps(note),
             note_id,
         ),
@@ -691,7 +820,12 @@ def _mutate_notes_in_store(
 
 
 async def save_brain(brain: BrainState, state_file: str, max_reviews: int = 50) -> None:
-    """Save brain state atomically."""
+    """Save brain state atomically.
+
+    Uses incremental UPSERT for the SQLite store when available,
+    falling back to full rewrite on error.  Always writes the JSON
+    snapshot for backward compatibility.
+    """
     path = _brain_path(state_file)
     db_path = _brain_db_path(state_file)
     if len(brain.review_log) > max_reviews:
@@ -700,10 +834,179 @@ async def save_brain(brain: BrainState, state_file: str, max_reviews: int = 50) 
     loop = asyncio.get_event_loop()
     brain_dict = asdict(brain)
     try:
-        await loop.run_in_executor(None, _write_brain_sqlite, brain_dict, db_path)
-    except sqlite3.OperationalError as e:
-        raise OSError(str(e)) from e
+        await loop.run_in_executor(None, _write_brain_incremental, brain_dict, db_path)
+    except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+        logger.warning("Incremental save failed, falling back to full rewrite: %s", e)
+        try:
+            await loop.run_in_executor(None, _write_brain_sqlite, brain_dict, db_path)
+        except sqlite3.OperationalError as e2:
+            raise OSError(str(e2)) from e2
     await loop.run_in_executor(None, _write_brain, brain_dict, path)
+
+
+def _write_brain_incremental(brain_dict: dict, db_path: str) -> None:
+    """Persist the brain dict to SQLite using UPSERT for notes/topics/pages.
+
+    Instead of DELETE all + re-INSERT, this:
+    1. UPSERTs notes, topics, pages (only changed rows touch disk)
+    2. Replaces connections and logs (these are append-only and small)
+    3. UPSERTs meta counters
+    """
+    try:
+        conn = _ensure_brain_db(db_path)
+    except sqlite3.DatabaseError:
+        try:
+            if os.path.exists(db_path):
+                os.remove(db_path)
+        except OSError:
+            pass
+        conn = _ensure_brain_db(db_path)
+
+    try:
+        with conn:
+            # Meta — UPSERT
+            meta_rows = [
+                ("schema_version", json.dumps(_SCHEMA_VERSION)),
+                ("capture_count", json.dumps(brain_dict.get("capture_count", 0))),
+                ("topic_count", json.dumps(brain_dict.get("topic_count", 0))),
+                ("page_count", json.dumps(brain_dict.get("page_count", 0))),
+                ("last_review", json.dumps(brain_dict.get("last_review"))),
+                ("last_consolidation", json.dumps(brain_dict.get("last_consolidation"))),
+                ("last_lint", json.dumps(brain_dict.get("last_lint"))),
+            ]
+            conn.executemany(
+                "INSERT OR REPLACE INTO brain_meta (key, value_json) VALUES (?, ?)",
+                meta_rows,
+            )
+
+            # Notes — UPSERT
+            note_ids_in_brain = set(brain_dict.get("notes", {}).keys())
+            conn.executemany(
+                "INSERT OR REPLACE INTO brain_notes "
+                "(id, summary, category, note_type, status, created_at, updated_at, "
+                "confidence, recall_count, last_accessed_at, content, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        note_id,
+                        note.get("summary", ""),
+                        note.get("category", "resources"),
+                        note.get("note_type", "general"),
+                        note.get("status", "active"),
+                        note.get("created_at", ""),
+                        note.get("updated_at", ""),
+                        _normalize_confidence(note.get("confidence")),
+                        _normalize_counter(note.get("recall_count")),
+                        str(note.get("last_accessed_at") or ""),
+                        str(note.get("content") or ""),
+                        json.dumps(note),
+                    )
+                    for note_id, note in brain_dict.get("notes", {}).items()
+                ],
+            )
+            # Remove notes that were deleted from the in-memory brain
+            existing_ids = {
+                row[0] for row in conn.execute("SELECT id FROM brain_notes").fetchall()
+            }
+            removed = existing_ids - note_ids_in_brain
+            if removed:
+                ph = ",".join("?" for _ in removed)
+                conn.execute(f"DELETE FROM brain_notes WHERE id IN ({ph})", tuple(removed))
+
+            # Topics — UPSERT
+            topic_ids_in_brain = set(brain_dict.get("topics", {}).keys())
+            conn.executemany(
+                "INSERT OR REPLACE INTO brain_topics (id, name, created_at, raw_json) VALUES (?, ?, ?, ?)",
+                [
+                    (
+                        topic_id,
+                        topic.get("name", ""),
+                        topic.get("created_at", ""),
+                        json.dumps(topic),
+                    )
+                    for topic_id, topic in brain_dict.get("topics", {}).items()
+                ],
+            )
+            existing_topic_ids = {
+                row[0] for row in conn.execute("SELECT id FROM brain_topics").fetchall()
+            }
+            removed_topics = existing_topic_ids - topic_ids_in_brain
+            if removed_topics:
+                ph = ",".join("?" for _ in removed_topics)
+                conn.execute(f"DELETE FROM brain_topics WHERE id IN ({ph})", tuple(removed_topics))
+
+            # Pages — UPSERT
+            page_ids_in_brain = set(brain_dict.get("pages", {}).keys())
+            conn.executemany(
+                "INSERT OR REPLACE INTO brain_pages (id, title, updated_at, raw_json) VALUES (?, ?, ?, ?)",
+                [
+                    (
+                        page_id,
+                        page.get("title", ""),
+                        page.get("updated_at", ""),
+                        json.dumps(page),
+                    )
+                    for page_id, page in brain_dict.get("pages", {}).items()
+                ],
+            )
+            existing_page_ids = {
+                row[0] for row in conn.execute("SELECT id FROM brain_pages").fetchall()
+            }
+            removed_pages = existing_page_ids - page_ids_in_brain
+            if removed_pages:
+                ph = ",".join("?" for _ in removed_pages)
+                conn.execute(f"DELETE FROM brain_pages WHERE id IN ({ph})", tuple(removed_pages))
+
+            # Connections — replace (append-only, small)
+            conn.execute("DELETE FROM brain_connections")
+            conn.executemany(
+                "INSERT INTO brain_connections (from_id, to_id, created_at, raw_json) VALUES (?, ?, ?, ?)",
+                [
+                    (
+                        conn_row.get("from", ""),
+                        conn_row.get("to", ""),
+                        conn_row.get("created_at", ""),
+                        json.dumps(conn_row),
+                    )
+                    for conn_row in brain_dict.get("connections", [])
+                ],
+            )
+
+            # Review/lint logs — replace (bounded, small)
+            conn.execute("DELETE FROM brain_review_log")
+            conn.executemany(
+                "INSERT INTO brain_review_log (timestamp, summary, raw_json) VALUES (?, ?, ?)",
+                [
+                    (
+                        entry.get("timestamp", ""),
+                        entry.get("summary", ""),
+                        json.dumps(entry),
+                    )
+                    for entry in brain_dict.get("review_log", [])
+                ],
+            )
+            conn.execute("DELETE FROM brain_lint_log")
+            conn.executemany(
+                "INSERT INTO brain_lint_log (timestamp, raw_json) VALUES (?, ?)",
+                [
+                    (
+                        entry.get("timestamp", ""),
+                        json.dumps(entry),
+                    )
+                    for entry in brain_dict.get("lint_log", [])
+                ],
+            )
+
+            # Rebuild FTS index if it exists
+            if _has_fts(conn):
+                try:
+                    conn.execute(
+                        "INSERT INTO brain_notes_fts(brain_notes_fts) VALUES('rebuild')"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+    finally:
+        conn.close()
 
 
 def add_note(
@@ -739,6 +1042,12 @@ def add_note(
             updated_at=now,
             last_accessed_at=now,
         ))
+        # Index for semantic search (no-op if deps not installed)
+        try:
+            from brain_index import index_note
+            index_note(note_id, brain.notes[note_id])
+        except Exception:
+            pass
         return note_id
     except Exception as e:
         logger.error("Failed to add note: %s", str(e))
@@ -998,25 +1307,53 @@ def _recency_bonus(note: dict) -> float:
     return 0.0
 
 
+def _access_frequency_bonus(note: dict) -> float:
+    """Score based on how frequently a note is accessed relative to its age.
+
+    A note recalled 8 times in 10 days is far more valuable than one
+    recalled 8 times over 6 months.  This replaces the flat recall_count
+    multiplier with an access-rate signal and a last-access recency curve.
+    """
+    recall_count = _normalize_counter(note.get("recall_count"))
+    if recall_count == 0:
+        return 0.0
+
+    now = datetime.now(timezone.utc)
+
+    # --- access rate (recalls per week, capped) ---
+    created = _parse_iso(note.get("created_at", ""))
+    if created is not None:
+        age_days = max((now - created.astimezone(timezone.utc)).total_seconds() / 86400, 1.0)
+        recalls_per_week = (recall_count / age_days) * 7.0
+        # Diminishing returns: sqrt curve capped at ~0.55
+        rate_score = min(recalls_per_week ** 0.5 * 0.25, 0.55)
+    else:
+        # Fallback: use raw count with diminishing returns
+        rate_score = min(recall_count ** 0.5 * 0.12, 0.40)
+
+    # --- last-access recency (smooth decay, not step-function) ---
+    accessed_at = _parse_iso(note.get("last_accessed_at", ""))
+    if accessed_at is not None:
+        days_since = max((now - accessed_at.astimezone(timezone.utc)).total_seconds() / 86400, 0.0)
+        # Exponential decay: half-life ~5 days, max 0.30
+        recency_score = 0.30 * (0.5 ** (days_since / 5.0))
+    else:
+        recency_score = 0.0
+
+    return rate_score + recency_score
+
+
 def _usage_adjustment(note: dict) -> float:
     """Convert real retrieval and feedback signals into ranking adjustments."""
-    recall_count = _normalize_counter(note.get("recall_count"))
     positive_feedback = _normalize_counter(note.get("positive_feedback"))
     negative_feedback = _normalize_counter(note.get("negative_feedback"))
     contradiction_count = _normalize_counter(note.get("contradiction_count"))
 
-    score = min(recall_count, 8) * 0.08
+    score = _access_frequency_bonus(note)
     score += min(positive_feedback, 4) * 0.30
     score -= min(negative_feedback, 4) * 0.45
     score -= min(contradiction_count, 4) * 0.55
 
-    accessed_at = _parse_iso(note.get("last_accessed_at", ""))
-    if accessed_at is not None:
-        age = datetime.now(timezone.utc) - accessed_at.astimezone(timezone.utc)
-        if age <= timedelta(days=1):
-            score += 0.20
-        elif age <= timedelta(days=7):
-            score += 0.10
     return score
 
 
@@ -1145,6 +1482,44 @@ def _rank_notes(notes: list[dict], connections: list[dict], query: str, *, max_r
 
     scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
     return [(score, note) for score, _, _, note in scored[:max_results]]
+
+
+def _rank_notes_hybrid(
+    notes: list[dict],
+    connections: list[dict],
+    query: str,
+    *,
+    semantic_scores: dict[str, float],
+    semantic_weight: float = 2.0,
+    max_results: int = 10,
+) -> list[dict]:
+    """Rank notes using combined lexical + semantic signals.
+
+    Unlike ``_rank_notes``, a note does **not** need a positive lexical
+    score to be included — a positive semantic score alone is sufficient.
+    """
+    query_lower = query.lower().strip()
+    query_words = _query_words(query_lower)
+    connection_counts = _connection_count_map(connections)
+    scored: list[tuple[float, str, str, dict]] = []
+
+    for note in notes:
+        note_id = note.get("id", "")
+        lexical = _score_note(
+            note,
+            query_lower,
+            query_words,
+            connection_count=connection_counts.get(note_id, 0),
+        )
+        sem = semantic_scores.get(note_id, 0.0) * semantic_weight
+        total = max(lexical, 0.0) + sem
+        if total <= 0:
+            continue
+        recency = note.get("last_confirmed_at") or note.get("updated_at") or note.get("created_at", "")
+        scored.append((total, recency, note_id, note))
+
+    scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return [note for _, _, _, note in scored[:max_results]]
 
 
 def search_notes(
@@ -1319,6 +1694,8 @@ def build_brain_stats(brain: BrainState, *, topic_limit: int = 8) -> dict[str, A
     positive_feedback_total = 0
     negative_feedback_total = 0
     contradiction_total = 0
+    frequently_accessed = 0
+    never_accessed = 0
 
     for nid, note in brain.notes.items():
         _normalize_note_dict(note, nid)
@@ -1331,10 +1708,16 @@ def build_brain_stats(brain: BrainState, *, topic_limit: int = 8) -> dict[str, A
         status = note.get("status", "active") or "active"
         statuses[status] = statuses.get(status, 0) + 1
 
-        recall_total += _normalize_counter(note.get("recall_count"))
+        rc = _normalize_counter(note.get("recall_count"))
+        recall_total += rc
         positive_feedback_total += _normalize_counter(note.get("positive_feedback"))
         negative_feedback_total += _normalize_counter(note.get("negative_feedback"))
         contradiction_total += _normalize_counter(note.get("contradiction_count"))
+
+        if rc == 0:
+            never_accessed += 1
+        elif _access_frequency_bonus(note) >= 0.25:
+            frequently_accessed += 1
 
         if note.get("category") != "archive" and nid not in connected_ids:
             orphan_count += 1
@@ -1361,6 +1744,8 @@ def build_brain_stats(brain: BrainState, *, topic_limit: int = 8) -> dict[str, A
         "note_types": note_types,
         "statuses": statuses,
         "recalls": recall_total,
+        "frequently_accessed": frequently_accessed,
+        "never_accessed": never_accessed,
         "positive_feedback": positive_feedback_total,
         "negative_feedback": negative_feedback_total,
         "contradictions": contradiction_total,
@@ -1598,6 +1983,8 @@ def build_brain_stats_from_store(state_file: str, *, topic_limit: int = 8) -> di
             positive_feedback_total = 0
             negative_feedback_total = 0
             contradiction_total = 0
+            frequently_accessed = 0
+            never_accessed = 0
             for from_id, to_id in conn.execute("SELECT from_id, to_id FROM brain_connections").fetchall():
                 if from_id:
                     connected_ids.add(from_id)
@@ -1624,10 +2011,15 @@ def build_brain_stats_from_store(state_file: str, *, topic_limit: int = 8) -> di
                 if not isinstance(note, dict):
                     continue
                 _normalize_note_dict(note, note_id)
-                recall_total += _normalize_counter(note.get("recall_count"))
+                rc = _normalize_counter(note.get("recall_count"))
+                recall_total += rc
                 positive_feedback_total += _normalize_counter(note.get("positive_feedback"))
                 negative_feedback_total += _normalize_counter(note.get("negative_feedback"))
                 contradiction_total += _normalize_counter(note.get("contradiction_count"))
+                if rc == 0:
+                    never_accessed += 1
+                elif _access_frequency_bonus(note) >= 0.25:
+                    frequently_accessed += 1
 
             top_topics = []
             for topic_id, name, raw_json in conn.execute(
@@ -1669,6 +2061,8 @@ def build_brain_stats_from_store(state_file: str, *, topic_limit: int = 8) -> di
         "note_types": note_types,
         "statuses": statuses,
         "recalls": recall_total,
+        "frequently_accessed": frequently_accessed,
+        "never_accessed": never_accessed,
         "positive_feedback": positive_feedback_total,
         "negative_feedback": negative_feedback_total,
         "contradictions": contradiction_total,
@@ -1682,8 +2076,14 @@ def search_notes_from_store(
     *,
     max_results: int = 10,
     record_access: bool = False,
+    semantic: bool = True,
 ) -> list[dict]:
-    """Search notes directly from SQLite when available."""
+    """Search notes directly from SQLite when available.
+
+    When *semantic* is True and vector dependencies are installed,
+    uses embedding similarity to pre-filter candidates before
+    applying the standard lexical/recency/connection re-ranking.
+    """
     db_path = _brain_db_path(state_file)
     if not os.path.exists(db_path):
         brain = _load_brain_for_queries(state_file)
@@ -1693,23 +2093,54 @@ def search_notes_from_store(
             _write_brain_sqlite(brain_dict, db_path)
         return results
 
+    # --- Semantic pre-filtering ---
+    semantic_hits: dict[str, float] = {}
+    if semantic:
+        try:
+            from brain_index import semantic_search as _sem_search
+            raw_hits = _sem_search(query, k=max_results * 3)
+            semantic_hits = dict(raw_hits)
+        except Exception:
+            pass  # graceful fallback to lexical-only
+
     try:
         conn = _ensure_brain_db(db_path)
         try:
-            notes = []
-            for note_id, raw_json in conn.execute(
-                "SELECT id, raw_json FROM brain_notes ORDER BY id"
-            ).fetchall():
-                note = json.loads(raw_json)
-                if isinstance(note, dict):
-                    _normalize_note_dict(note, note_id)
-                    notes.append(note)
-            connections = [
-                {"from": from_id, "to": to_id}
-                for from_id, to_id in conn.execute(
-                    "SELECT from_id, to_id FROM brain_connections"
-                ).fetchall()
-            ]
+            if semantic_hits:
+                # Fast path: load only candidate notes
+                candidate_ids = list(semantic_hits.keys())
+                placeholders = ",".join("?" for _ in candidate_ids)
+                notes = []
+                for note_id, raw_json in conn.execute(
+                    f"SELECT id, raw_json FROM brain_notes WHERE id IN ({placeholders})",
+                    candidate_ids,
+                ).fetchall():
+                    note = json.loads(raw_json)
+                    if isinstance(note, dict):
+                        _normalize_note_dict(note, note_id)
+                        notes.append(note)
+                connections = [
+                    {"from": from_id, "to": to_id}
+                    for from_id, to_id in conn.execute(
+                        "SELECT from_id, to_id FROM brain_connections"
+                    ).fetchall()
+                ]
+            else:
+                # Full-scan path: load all notes
+                notes = []
+                for note_id, raw_json in conn.execute(
+                    "SELECT id, raw_json FROM brain_notes ORDER BY id"
+                ).fetchall():
+                    note = json.loads(raw_json)
+                    if isinstance(note, dict):
+                        _normalize_note_dict(note, note_id)
+                        notes.append(note)
+                connections = [
+                    {"from": from_id, "to": to_id}
+                    for from_id, to_id in conn.execute(
+                        "SELECT from_id, to_id FROM brain_connections"
+                    ).fetchall()
+                ]
         finally:
             conn.close()
     except (sqlite3.DatabaseError, ValueError, UnicodeDecodeError):
@@ -1722,7 +2153,15 @@ def search_notes_from_store(
             _write_brain(brain_dict, _brain_path(state_file))
         return results
 
-    results = [note for _, note in _rank_notes(notes, connections, query, max_results=max_results)]
+    if semantic_hits:
+        results = _rank_notes_hybrid(
+            notes, connections, query,
+            semantic_scores=semantic_hits,
+            max_results=max_results,
+        )
+    else:
+        results = [note for _, note in _rank_notes(notes, connections, query, max_results=max_results)]
+
     if record_access and results:
         stamp = datetime.now(timezone.utc).isoformat()
         for note in results:
@@ -2054,6 +2493,353 @@ def trace_topic_from_store(
             for note in notes[:limit]
         ],
     }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 3: Store-backed retrieval (avoids full in-memory rebuild)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _has_fts(conn: sqlite3.Connection) -> bool:
+    """Check whether the FTS5 virtual table exists."""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='brain_notes_fts'"
+    ).fetchone()
+    return row is not None
+
+
+def get_recent_notes_from_store(
+    state_file: str, count: int = 10,
+) -> list[dict]:
+    """Return the most recently created notes directly from SQLite."""
+    db_path = _brain_db_path(state_file)
+    if not os.path.exists(db_path):
+        return get_recent_notes(_load_brain_for_queries(state_file), count)
+
+    try:
+        conn = _ensure_brain_db(db_path)
+        try:
+            notes = []
+            for note_id, raw_json in conn.execute(
+                "SELECT id, raw_json FROM brain_notes "
+                "ORDER BY created_at DESC LIMIT ?",
+                (count,),
+            ).fetchall():
+                note = json.loads(raw_json)
+                if isinstance(note, dict):
+                    _normalize_note_dict(note, note_id)
+                    notes.append(note)
+            return notes
+        finally:
+            conn.close()
+    except (sqlite3.DatabaseError, ValueError, UnicodeDecodeError):
+        logger.warning("get_recent_notes_from_store fallback", exc_info=True)
+        return get_recent_notes(_load_brain_for_queries(state_file), count)
+
+
+def get_unconsolidated_notes_from_store(state_file: str) -> list[dict]:
+    """Return notes not yet consumed by any wiki page, queried from SQLite."""
+    db_path = _brain_db_path(state_file)
+    if not os.path.exists(db_path):
+        return get_unconsolidated_notes(_load_brain_for_queries(state_file))
+
+    try:
+        conn = _ensure_brain_db(db_path)
+        try:
+            # Collect consolidated IDs from page sources
+            consolidated_ids: set[str] = set()
+            for (raw_json,) in conn.execute(
+                "SELECT raw_json FROM brain_pages"
+            ).fetchall():
+                page = json.loads(raw_json)
+                if isinstance(page, dict):
+                    consolidated_ids.update(page.get("sources", []))
+
+            notes = []
+            for note_id, raw_json in conn.execute(
+                "SELECT id, raw_json FROM brain_notes "
+                "WHERE category != 'archive' ORDER BY created_at DESC"
+            ).fetchall():
+                if note_id in consolidated_ids:
+                    continue
+                note = json.loads(raw_json)
+                if isinstance(note, dict):
+                    _normalize_note_dict(note, note_id)
+                    notes.append(note)
+            return notes
+        finally:
+            conn.close()
+    except (sqlite3.DatabaseError, ValueError, UnicodeDecodeError):
+        logger.warning("get_unconsolidated_notes_from_store fallback", exc_info=True)
+        return get_unconsolidated_notes(_load_brain_for_queries(state_file))
+
+
+def decay_stale_notes_from_store(
+    state_file: str, max_age_days: int = 30,
+) -> int:
+    """Archive orphan notes older than max_age_days via SQL UPDATE."""
+    db_path = _brain_db_path(state_file)
+    if not os.path.exists(db_path):
+        return 0
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+    try:
+        conn = _ensure_brain_db(db_path)
+        try:
+            # Find all note IDs that have at least one connection
+            connected_ids: set[str] = set()
+            for from_id, to_id in conn.execute(
+                "SELECT from_id, to_id FROM brain_connections"
+            ).fetchall():
+                if from_id:
+                    connected_ids.add(from_id)
+                if to_id:
+                    connected_ids.add(to_id)
+
+            # Find stale orphan notes
+            stale = []
+            for (note_id,) in conn.execute(
+                "SELECT id FROM brain_notes "
+                "WHERE category != 'archive' AND created_at < ? AND created_at != ''",
+                (cutoff,),
+            ).fetchall():
+                if note_id not in connected_ids:
+                    stale.append(note_id)
+
+            if not stale:
+                return 0
+
+            # Batch-update to archive
+            with conn:
+                for note_id in stale:
+                    raw = conn.execute(
+                        "SELECT raw_json FROM brain_notes WHERE id = ?", (note_id,)
+                    ).fetchone()
+                    if raw:
+                        note = json.loads(raw[0])
+                        note["category"] = "archive"
+                        conn.execute(
+                            "UPDATE brain_notes SET category = 'archive', raw_json = ? WHERE id = ?",
+                            (json.dumps(note), note_id),
+                        )
+            return len(stale)
+        finally:
+            conn.close()
+    except (sqlite3.DatabaseError, ValueError, UnicodeDecodeError):
+        logger.warning("decay_stale_notes_from_store failed", exc_info=True)
+        return 0
+
+
+def find_duplicate_from_store(
+    state_file: str, content: str, threshold: float = 0.50,
+) -> str | None:
+    """Check for duplicate notes using FTS5 when available, else token overlap."""
+    db_path = _brain_db_path(state_file)
+    if not os.path.exists(db_path):
+        return find_duplicate(_load_brain_for_queries(state_file), content, threshold)
+
+    try:
+        conn = _ensure_brain_db(db_path)
+        try:
+            candidates: list[tuple[str, str]] = []
+
+            if _has_fts(conn):
+                # Use FTS5 to find candidates — much faster than full scan
+                words = _query_words(content)
+                if words:
+                    fts_query = " OR ".join(words[:10])
+                    try:
+                        candidates = conn.execute(
+                            "SELECT bn.id, bn.content FROM brain_notes bn "
+                            "JOIN brain_notes_fts fts ON bn.rowid = fts.rowid "
+                            "WHERE brain_notes_fts MATCH ? LIMIT 50",
+                            (fts_query,),
+                        ).fetchall()
+                    except sqlite3.OperationalError:
+                        candidates = []
+
+            if not candidates:
+                # Fallback: scan all notes (same as in-memory path)
+                candidates = conn.execute(
+                    "SELECT id, content FROM brain_notes WHERE category != 'archive' "
+                    "ORDER BY created_at DESC LIMIT 500"
+                ).fetchall()
+
+            for note_id, note_content in candidates:
+                if _token_overlap(content, note_content or "") >= threshold:
+                    return note_id
+            return None
+        finally:
+            conn.close()
+    except (sqlite3.DatabaseError, ValueError, UnicodeDecodeError):
+        logger.warning("find_duplicate_from_store fallback", exc_info=True)
+        return find_duplicate(_load_brain_for_queries(state_file), content, threshold)
+
+
+def build_brain_summary_from_store(
+    state_file: str,
+    max_notes: int = 10,
+    *,
+    query_topic: str = "",
+    max_pages: int = 10,
+) -> str:
+    """Build brain summary for prompt injection directly from SQLite.
+
+    This is the Phase 3 replacement for ``build_brain_summary(brain)``:
+    it queries only the rows needed instead of loading the full brain.
+    """
+    db_path = _brain_db_path(state_file)
+    if not os.path.exists(db_path):
+        brain = _load_brain_for_queries(state_file)
+        return build_brain_summary(brain, max_notes, query_topic=query_topic, max_pages=max_pages)
+
+    try:
+        conn = _ensure_brain_db(db_path)
+        try:
+            meta = {
+                key: json.loads(value_json)
+                for key, value_json in conn.execute(
+                    "SELECT key, value_json FROM brain_meta"
+                ).fetchall()
+            }
+            notes_total = conn.execute("SELECT COUNT(*) FROM brain_notes").fetchone()[0]
+            pages_total = conn.execute("SELECT COUNT(*) FROM brain_pages").fetchone()[0]
+            connections_total = conn.execute("SELECT COUNT(*) FROM brain_connections").fetchone()[0]
+            topics_total = conn.execute("SELECT COUNT(*) FROM brain_topics").fetchone()[0]
+
+            # Unconsolidated count
+            consolidated_ids: set[str] = set()
+            for (raw_json,) in conn.execute("SELECT raw_json FROM brain_pages").fetchall():
+                page = json.loads(raw_json)
+                if isinstance(page, dict):
+                    consolidated_ids.update(page.get("sources", []))
+            unconsolidated_count = conn.execute(
+                "SELECT COUNT(*) FROM brain_notes WHERE category != 'archive'"
+            ).fetchone()[0]
+            unconsolidated_count -= sum(
+                1 for (nid,) in conn.execute(
+                    "SELECT id FROM brain_notes WHERE category != 'archive'"
+                ).fetchall() if nid in consolidated_ids
+            )
+
+            lines = ["== SECOND BRAIN =="]
+            lines.append(f"Wiki pages: {pages_total}")
+            lines.append(f"Total notes: {notes_total} ({unconsolidated_count} pending consolidation)")
+            lines.append(f"Total connections: {connections_total}")
+            lines.append(f"Total topics: {topics_total}")
+            lines.append(f"Last review: {meta.get('last_review') or 'never'}")
+            lines.append(f"Last consolidation: {meta.get('last_consolidation') or 'never'}")
+
+            # Category breakdown — direct SQL aggregation
+            categories = dict(conn.execute(
+                "SELECT category, COUNT(*) FROM brain_notes GROUP BY category"
+            ).fetchall())
+            if categories:
+                lines.append(f"Categories: {', '.join(f'{k}={v}' for k, v in categories.items())}")
+
+            # Wiki page summaries (long-term memory)
+            if pages_total > 0:
+                wiki_lines = ["== WIKI PAGES =="]
+                for page_id, raw_json in conn.execute(
+                    "SELECT id, raw_json FROM brain_pages ORDER BY updated_at DESC LIMIT ?",
+                    (max_pages,),
+                ).fetchall():
+                    page = json.loads(raw_json)
+                    if not isinstance(page, dict):
+                        continue
+                    first_line = page.get("content", "").split("\n", 1)[0][:80]
+                    source_count = len(page.get("sources", []))
+                    wiki_lines.append(f"  📄 {page.get('title', page_id)} ({source_count} sources): {first_line}")
+                lines.append("\n" + "\n".join(wiki_lines))
+
+            # Topic map (top topics by note count)
+            top_topics = []
+            for topic_id, raw_json in conn.execute(
+                "SELECT id, raw_json FROM brain_topics ORDER BY id"
+            ).fetchall():
+                topic = json.loads(raw_json)
+                if isinstance(topic, dict):
+                    top_topics.append({
+                        "name": topic.get("name", ""),
+                        "notes": len(topic.get("note_ids", [])),
+                    })
+            if top_topics:
+                top_topics.sort(key=lambda t: t["notes"], reverse=True)
+                topic_strs = [f"{t['name']}({t['notes']})" for t in top_topics[:8]]
+                lines.append("\nTopics: " + ", ".join(topic_strs))
+
+            # Select notes for the prompt
+            if query_topic:
+                # Topic-based recall via SQL
+                lower = query_topic.lower().strip()
+                topic_row = conn.execute(
+                    "SELECT raw_json FROM brain_topics WHERE name = ? COLLATE NOCASE",
+                    (lower,),
+                ).fetchone()
+                selected_ids: list[str] = []
+                if topic_row:
+                    topic = json.loads(topic_row[0])
+                    selected_ids = topic.get("note_ids", [])[:max_notes]
+                selected = []
+                if selected_ids:
+                    ph = ",".join("?" for _ in selected_ids)
+                    for nid, rj in conn.execute(
+                        f"SELECT id, raw_json FROM brain_notes WHERE id IN ({ph})",
+                        tuple(selected_ids),
+                    ).fetchall():
+                        note = json.loads(rj)
+                        if isinstance(note, dict):
+                            _normalize_note_dict(note, nid)
+                            selected.append(note)
+                label = f"Knowledge related to '{query_topic}'"
+            elif pages_total > 0:
+                # When pages exist, only show recent unconsolidated notes
+                capped = min(max_notes, 5)
+                selected = []
+                for nid, rj in conn.execute(
+                    "SELECT id, raw_json FROM brain_notes "
+                    "WHERE category != 'archive' "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (capped * 3,),  # over-fetch to filter out consolidated
+                ).fetchall():
+                    if nid in consolidated_ids:
+                        continue
+                    note = json.loads(rj)
+                    if isinstance(note, dict):
+                        _normalize_note_dict(note, nid)
+                        selected.append(note)
+                    if len(selected) >= capped:
+                        break
+                label = "Recent unconsolidated notes"
+            else:
+                # No pages — show recent notes
+                selected = []
+                for nid, rj in conn.execute(
+                    "SELECT id, raw_json FROM brain_notes "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (max_notes,),
+                ).fetchall():
+                    note = json.loads(rj)
+                    if isinstance(note, dict):
+                        _normalize_note_dict(note, nid)
+                        selected.append(note)
+                label = "Recent knowledge"
+
+            if selected:
+                lines.append(f"\n{label}:")
+                for note in selected:
+                    summary = note.get("summary") or note.get("content", "")[:80]
+                    tags = ", ".join(note.get("tags", []))
+                    tag_str = f" [{tags}]" if tags else ""
+                    lines.append(f"  - ({note['id']}) {summary}{tag_str}")
+
+            return "\n".join(lines)
+        finally:
+            conn.close()
+    except (sqlite3.DatabaseError, ValueError, UnicodeDecodeError):
+        logger.warning("build_brain_summary_from_store fallback", exc_info=True)
+        brain = _load_brain_for_queries(state_file)
+        return build_brain_summary(brain, max_notes, query_topic=query_topic, max_pages=max_pages)
 
 
 # ──────────────────────────────────────────────────────────────────────

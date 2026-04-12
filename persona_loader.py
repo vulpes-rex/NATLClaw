@@ -69,14 +69,89 @@ class Persona:
     blocked_marker: str = "[TASK_BLOCKED]"
     max_turns: int = 20                # default agentic-turn limit
 
-    # Governance schemas (loaded from BRAIN.md / HEARTBEAT.md)
+    # Governance schemas (loaded from BRAIN.md / HEARTBEAT.md / DECISIONS.md)
     brain_schema: str = ""             # knowledge organization rules
     heartbeat_schema: str = ""         # cycle execution strategy
+    decisions_schema: str = ""         # decision-making philosophy
+
+    # Decision engine policy (loaded from "decisions" manifest key)
+    decision_policy: Any = None        # DecisionPolicy or None
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ──────────────────────────────────────────────────────────────────────
+
+
+def _resolve_decision_policy(raw: dict | None) -> Any:
+    """Merge persona decision config with defaults.
+
+    Returns a :class:`DecisionPolicy` instance.  When *raw* is None or
+    empty, returns ``DEFAULT_DECISION_POLICY``.  Lazily imports to avoid
+    circular deps.
+    """
+    from decision_engine import DecisionPolicy, DEFAULT_DECISION_POLICY, ActionType, EventRoute
+
+    if not raw:
+        return DEFAULT_DECISION_POLICY
+
+    defaults = DEFAULT_DECISION_POLICY
+
+    # Merge task priority scores
+    task_scores = {**defaults.task_priority_scores, **raw.get("task_priority_scores", {})}
+
+    # Resolve enabled_initiatives from string names to ActionType
+    raw_initiatives = raw.get("enabled_initiatives")
+    if raw_initiatives is not None:
+        name_map = {a.value: a for a in ActionType if a.value.startswith("initiative_")}
+        enabled = frozenset(
+            name_map[name] for name in raw_initiatives if name in name_map
+        )
+    else:
+        enabled = defaults.enabled_initiatives
+
+    # Resolve event routing overrides
+    raw_routing = raw.get("event_routing", {})
+    event_routing: dict[str, EventRoute] = {}
+    for event_type, cfg in raw_routing.items():
+        action_str = cfg.get("action", "run_heartbeat")
+        try:
+            action = ActionType(action_str)
+        except ValueError:
+            action = ActionType.RUN_HEARTBEAT
+        event_routing[event_type] = EventRoute(
+            action=action,
+            preempt=bool(cfg.get("preempt", False)),
+            boost=float(cfg.get("boost", 0.0)),
+        )
+
+    # Resolve action biases from string keys
+    raw_biases = raw.get("action_biases", {})
+    action_biases: dict[ActionType, float] = {}
+    for key, val in raw_biases.items():
+        try:
+            action_biases[ActionType(key)] = float(val)
+        except (ValueError, TypeError):
+            pass
+
+    return DecisionPolicy(
+        task_priority_scores=task_scores,
+        consolidation_threshold=int(raw.get("consolidation_threshold", defaults.consolidation_threshold)),
+        consolidation_heartbeat_interval=int(raw.get("consolidation_heartbeat_interval", defaults.consolidation_heartbeat_interval)),
+        connection_density_target=float(raw.get("connection_density_target", defaults.connection_density_target)),
+        lint_heartbeat_interval=int(raw.get("lint_heartbeat_interval", defaults.lint_heartbeat_interval)),
+        lint_issue_boost=float(raw.get("lint_issue_boost", defaults.lint_issue_boost)),
+        confidence_threshold=float(raw.get("confidence_threshold", defaults.confidence_threshold)),
+        ambiguity_margin=float(raw.get("ambiguity_margin", defaults.ambiguity_margin)),
+        enabled_initiatives=enabled,
+        initiative_cooldown=int(raw.get("initiative_cooldown", defaults.initiative_cooldown)),
+        initiative_ceiling=float(raw.get("initiative_ceiling", defaults.initiative_ceiling)),
+        event_routing=event_routing,
+        action_biases=action_biases,
+        positive_outcome_boost=float(raw.get("positive_outcome_boost", defaults.positive_outcome_boost)),
+        negative_outcome_penalty=float(raw.get("negative_outcome_penalty", defaults.negative_outcome_penalty)),
+    )
+
 
 def _read_json(path: str = _MCP_JSON) -> dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -481,6 +556,8 @@ def _build_inline_persona(
         max_turns=int(entry.get("maxTurns", 20)),
         brain_schema=brain_schema,
         heartbeat_schema=heartbeat_schema,
+        decisions_schema=_load_schema_file(persona_dir, "DECISIONS.md", ""),
+        decision_policy=_resolve_decision_policy(entry.get("decisions")),
     )
 
 
@@ -552,6 +629,8 @@ def _build_external_persona(
         max_turns=int(manifest.get("maxTurns", 20)),
         brain_schema=brain_schema,
         heartbeat_schema=heartbeat_schema,
+        decisions_schema=_load_schema_file(persona_dir, "DECISIONS.md", ""),
+        decision_policy=_resolve_decision_policy(manifest.get("decisions")),
     )
 
 
