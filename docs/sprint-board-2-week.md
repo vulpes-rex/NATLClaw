@@ -24,6 +24,11 @@
   - **Goal:** Give operators deterministic control during incidents.
   - **Accept:** Add pause/resume, drain, and maintenance mode semantics (CLI + API), with clear status reflection.
   - **Measure:** Incident playbook actions complete in under 1 minute with expected transitions.
+  - **Progress:**
+    - [x] Added persistent scheduler control state with pause/resume/drain/maintenance flags (`scheduler_control.py`).
+    - [x] Added API control endpoints for pause/resume/drain/maintenance and reflected state in scheduler status (`api_server.py`).
+    - [x] Added CLI control commands (`natl scheduler status|pause|resume|drain|maintenance-enable|maintenance-disable`) with operator status reflection (`cli.py`, `operator_status.py`).
+    - [x] Added unit/integration tests for control semantics and API behavior (`tests/unit/test_scheduler.py`, `tests/integration/test_api_server.py`).
 
 - [ ] **S16: Regression gate for core flows (CI-grade)**
   - **Goal:** Prevent regressions in scheduler/task/status/idempotency core.
@@ -54,7 +59,7 @@
 
 - [ ] **S13: Persistence integrity + crash consistency**
 - [ ] **S14: Scheduler backpressure + bounded work per heartbeat**
-- [ ] *(empty)*
+- [ ] **S15: Operator control plane hardening**
 
 ## Done
 

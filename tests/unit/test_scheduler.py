@@ -32,6 +32,7 @@ from config import AppConfig
 from project_context import Project
 from state import AgentState, load_state, save_state
 from second_brain import BrainState, load_brain, save_brain
+from scheduler_control import SchedulerControlState
 
 # Set up logging to avoid warnings during tests
 logging.basicConfig(level=logging.DEBUG)
@@ -646,3 +647,59 @@ def test_scheduler_records_backpressure_stats():
     assert stats["queue_depth_before_decision"] >= 5
     assert stats["events_consumed_for_decision"] == 2
     assert stats["decision_spillover_events"] >= 1
+
+
+def test_scheduler_pause_control_skips_heartbeat_execution():
+    """Paused control state should skip agent heartbeat execution."""
+    config = _make_scheduler_config(provider="foundry")
+    mock_heartbeat = AsyncMock()
+    q = _make_event_queue()
+
+    with _scheduler_patches(mock_heartbeat), \
+         patch(
+             "scheduler.load_scheduler_control",
+             new_callable=AsyncMock,
+             return_value=SchedulerControlState(paused=True),
+         ), \
+         patch("scheduler._wait_for_event_or_timeout", new_callable=AsyncMock, return_value=None):
+        asyncio.run(run_scheduler(config, max_iterations=1, event_queue=q))
+
+    assert mock_heartbeat.call_count == 0
+
+
+def test_scheduler_maintenance_control_skips_heartbeat_execution():
+    """Maintenance mode should skip agent heartbeat execution."""
+    config = _make_scheduler_config(provider="foundry")
+    mock_heartbeat = AsyncMock()
+    q = _make_event_queue()
+
+    with _scheduler_patches(mock_heartbeat), \
+         patch(
+             "scheduler.load_scheduler_control",
+             new_callable=AsyncMock,
+             return_value=SchedulerControlState(maintenance_mode=True),
+         ), \
+         patch("scheduler._wait_for_event_or_timeout", new_callable=AsyncMock, return_value=None):
+        asyncio.run(run_scheduler(config, max_iterations=1, event_queue=q))
+
+    assert mock_heartbeat.call_count == 0
+
+
+def test_scheduler_drain_control_exits_loop_without_running_heartbeat():
+    """Drain request should stop scheduler loop gracefully."""
+    config = _make_scheduler_config(provider="foundry")
+    mock_heartbeat = AsyncMock()
+    q = _make_event_queue()
+    control = SchedulerControlState(drain_requested=True)
+
+    with _scheduler_patches(mock_heartbeat), \
+         patch(
+             "scheduler.load_scheduler_control",
+             new_callable=AsyncMock,
+             side_effect=[control, control],
+         ), \
+         patch("scheduler.save_scheduler_control", new_callable=AsyncMock) as mock_save_control:
+        asyncio.run(run_scheduler(config, max_iterations=1, event_queue=q))
+
+    assert mock_heartbeat.call_count == 0
+    assert mock_save_control.await_count >= 2

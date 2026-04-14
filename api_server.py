@@ -88,6 +88,7 @@ from tasks import (
     start_task,
 )
 from operator_status import build_operator_status
+from scheduler_control import load_scheduler_control, update_scheduler_control
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,10 @@ class BrainContradictionRequest(BaseModel):
     contradicting_note_id: str
     reason: str = ""
     supersede: bool | None = None
+
+
+class SchedulerControlRequest(BaseModel):
+    reason: str = ""
 
 
 # ── App factory ──────────────────────────────────────────────────────
@@ -816,19 +821,69 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     async def api_scheduler_status():
         from scheduler import get_scheduler_lock_info
         lock_info = get_scheduler_lock_info(config.state_file)
+        control = await load_scheduler_control(config.state_file)
         task = getattr(app.state, "scheduler_task", None)
         if task is None:
-            return {"running": False, "lock": lock_info}
+            return {"running": False, "lock": lock_info, "control": asdict(control)}
         if not task.done():
-            return {"running": True, "lock": lock_info}
+            return {"running": True, "lock": lock_info, "control": asdict(control)}
         # Task finished (error or completed) — clean up
         app.state.scheduler_task = None
         exc = task.exception() if not task.cancelled() else None
         return {
             "running": False,
             "lock": lock_info,
+            "control": asdict(control),
             "error": str(exc) if exc else None,
         }
+
+    @app.post("/api/scheduler/pause")
+    async def api_scheduler_pause(req: SchedulerControlRequest):
+        control = await update_scheduler_control(
+            config.state_file,
+            paused=True,
+            reason=req.reason or "paused via api",
+        )
+        return {"status": "paused", "control": asdict(control)}
+
+    @app.post("/api/scheduler/resume")
+    async def api_scheduler_resume(req: SchedulerControlRequest):
+        control = await update_scheduler_control(
+            config.state_file,
+            paused=False,
+            maintenance_mode=False,
+            reason=req.reason or "resumed via api",
+        )
+        return {"status": "resumed", "control": asdict(control)}
+
+    @app.post("/api/scheduler/drain")
+    async def api_scheduler_drain(req: SchedulerControlRequest):
+        control = await update_scheduler_control(
+            config.state_file,
+            drain_requested=True,
+            reason=req.reason or "drain requested via api",
+        )
+        return {"status": "drain_requested", "control": asdict(control)}
+
+    @app.post("/api/scheduler/maintenance/enable")
+    async def api_scheduler_maintenance_enable(req: SchedulerControlRequest):
+        control = await update_scheduler_control(
+            config.state_file,
+            maintenance_mode=True,
+            paused=True,
+            reason=req.reason or "maintenance mode enabled via api",
+        )
+        return {"status": "maintenance_enabled", "control": asdict(control)}
+
+    @app.post("/api/scheduler/maintenance/disable")
+    async def api_scheduler_maintenance_disable(req: SchedulerControlRequest):
+        control = await update_scheduler_control(
+            config.state_file,
+            maintenance_mode=False,
+            paused=False,
+            reason=req.reason or "maintenance mode disabled via api",
+        )
+        return {"status": "maintenance_disabled", "control": asdict(control)}
 
     # ── Report endpoints ─────────────────────────────────────────
 

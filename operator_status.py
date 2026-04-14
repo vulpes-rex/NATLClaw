@@ -10,6 +10,7 @@ from error_classification import classify_error_text, top_error_types
 from execution_log import recent_entries
 from messaging import load_outbox
 from scheduler import get_scheduler_lock_info, get_scheduler_runtime_backpressure_stats
+from scheduler_control import load_scheduler_control
 from state import load_state
 from tasks import get_active_task, get_blocked_tasks, load_tasks
 
@@ -132,6 +133,7 @@ async def build_operator_status(
     outbox = await load_outbox(config.state_file)
 
     lock = get_scheduler_lock_info(config.state_file)
+    control = await load_scheduler_control(config.state_file)
     heartbeat = _heartbeat_snapshot(state.last_heartbeat)
 
     active_task = get_active_task(tasks, config.persona)
@@ -159,6 +161,14 @@ async def build_operator_status(
             "in_process_task_running": in_process_scheduler_running,
             "lock": lock,
             "backpressure": get_scheduler_runtime_backpressure_stats(),
+            "control": {
+                "paused": control.paused,
+                "maintenance_mode": control.maintenance_mode,
+                "drain_requested": control.drain_requested,
+                "drain_in_progress": control.drain_in_progress,
+                "updated_at": control.updated_at,
+                "reason": control.reason,
+            },
         },
         "heartbeat": {
             "count": state.execution_count,

@@ -937,6 +937,15 @@ def cmd_status(args: argparse.Namespace, config: AppConfig) -> None:
         f"Scheduler: {'RUNNING' if sched['running'] else 'STOPPED'} "
         f"(in-process={sched['in_process_task_running']})"
     )
+    control = sched.get("control", {})
+    if control:
+        print(
+            "Control plane: "
+            f"paused={control.get('paused', False)} | "
+            f"maintenance={control.get('maintenance_mode', False)} | "
+            f"drain_requested={control.get('drain_requested', False)} | "
+            f"drain_in_progress={control.get('drain_in_progress', False)}"
+        )
     bp = sched.get("backpressure", {})
     if bp:
         print(
@@ -995,6 +1004,108 @@ def cmd_status(args: argparse.Namespace, config: AppConfig) -> None:
             f"error_rate={err_rate_str} | "
             f"stale_lock={reliability.get('stale_lock', False)}"
         )
+
+
+def _scheduler_control_reason(args: argparse.Namespace, default: str) -> str:
+    reason = (getattr(args, "reason", "") or "").strip()
+    return reason or default
+
+
+def cmd_scheduler_status(args: argparse.Namespace, config: AppConfig) -> None:
+    """Show persisted scheduler control-plane status."""
+    from scheduler_control import load_scheduler_control
+
+    control = asyncio.run(load_scheduler_control(config.state_file))
+    print("Scheduler Control")
+    print("-----------------")
+    print(f"Paused:            {control.paused}")
+    print(f"Maintenance mode:  {control.maintenance_mode}")
+    print(f"Drain requested:   {control.drain_requested}")
+    print(f"Drain in progress: {control.drain_in_progress}")
+    print(f"Updated at:        {control.updated_at or '-'}")
+    print(f"Reason:            {control.reason or '-'}")
+
+
+def cmd_scheduler_pause(args: argparse.Namespace, config: AppConfig) -> None:
+    """Pause scheduler work (heartbeat loop remains alive)."""
+    from scheduler_control import update_scheduler_control
+
+    control = asyncio.run(
+        update_scheduler_control(
+            config.state_file,
+            paused=True,
+            reason=_scheduler_control_reason(args, "paused via cli"),
+        )
+    )
+    print(f"Scheduler paused. reason={control.reason or '-'}")
+
+
+def cmd_scheduler_resume(args: argparse.Namespace, config: AppConfig) -> None:
+    """Resume scheduler work and disable maintenance mode."""
+    from scheduler_control import update_scheduler_control
+
+    control = asyncio.run(
+        update_scheduler_control(
+            config.state_file,
+            paused=False,
+            maintenance_mode=False,
+            reason=_scheduler_control_reason(args, "resumed via cli"),
+        )
+    )
+    print(f"Scheduler resumed. reason={control.reason or '-'}")
+
+
+def cmd_scheduler_drain(args: argparse.Namespace, config: AppConfig) -> None:
+    """Request graceful scheduler drain and shutdown."""
+    from scheduler_control import update_scheduler_control
+
+    control = asyncio.run(
+        update_scheduler_control(
+            config.state_file,
+            drain_requested=True,
+            reason=_scheduler_control_reason(args, "drain requested via cli"),
+        )
+    )
+    print(
+        "Scheduler drain requested. "
+        f"drain_requested={control.drain_requested}, reason={control.reason or '-'}"
+    )
+
+
+def cmd_scheduler_maintenance_enable(args: argparse.Namespace, config: AppConfig) -> None:
+    """Enable maintenance mode and pause scheduler work."""
+    from scheduler_control import update_scheduler_control
+
+    control = asyncio.run(
+        update_scheduler_control(
+            config.state_file,
+            maintenance_mode=True,
+            paused=True,
+            reason=_scheduler_control_reason(args, "maintenance enabled via cli"),
+        )
+    )
+    print(
+        "Maintenance mode enabled. "
+        f"maintenance_mode={control.maintenance_mode}, paused={control.paused}"
+    )
+
+
+def cmd_scheduler_maintenance_disable(args: argparse.Namespace, config: AppConfig) -> None:
+    """Disable maintenance mode and resume scheduler work."""
+    from scheduler_control import update_scheduler_control
+
+    control = asyncio.run(
+        update_scheduler_control(
+            config.state_file,
+            maintenance_mode=False,
+            paused=False,
+            reason=_scheduler_control_reason(args, "maintenance disabled via cli"),
+        )
+    )
+    print(
+        "Maintenance mode disabled. "
+        f"maintenance_mode={control.maintenance_mode}, paused={control.paused}"
+    )
 
 
 def cmd_config_validate(args: argparse.Namespace, config: AppConfig) -> None:
@@ -1695,6 +1806,21 @@ def build_parser() -> argparse.ArgumentParser:
     hook_p = watch_sub.add_parser("install-hook", help="Install git post-commit hook")
     hook_p.add_argument("path", nargs="?", default=".", help="Git repo path (default: current)")
 
+    # scheduler
+    scheduler_p = sub.add_parser("scheduler", help="Scheduler control-plane actions")
+    scheduler_sub = scheduler_p.add_subparsers(dest="scheduler_command")
+    scheduler_sub.add_parser("status", help="Show scheduler control state")
+    sched_pause_p = scheduler_sub.add_parser("pause", help="Pause scheduler work")
+    sched_pause_p.add_argument("--reason", default="", help="Optional operator reason")
+    sched_resume_p = scheduler_sub.add_parser("resume", help="Resume scheduler work")
+    sched_resume_p.add_argument("--reason", default="", help="Optional operator reason")
+    sched_drain_p = scheduler_sub.add_parser("drain", help="Request graceful scheduler drain/stop")
+    sched_drain_p.add_argument("--reason", default="", help="Optional operator reason")
+    sched_maint_enable_p = scheduler_sub.add_parser("maintenance-enable", help="Enable maintenance mode")
+    sched_maint_enable_p.add_argument("--reason", default="", help="Optional operator reason")
+    sched_maint_disable_p = scheduler_sub.add_parser("maintenance-disable", help="Disable maintenance mode")
+    sched_maint_disable_p.add_argument("--reason", default="", help="Optional operator reason")
+
     # config
     config_p = sub.add_parser("config", help="Configuration management")
     config_sub = config_p.add_subparsers(dest="config_command")
@@ -1767,6 +1893,14 @@ def main(argv: list[str] | None = None) -> None:
             "stop": cmd_watch_stop,
             "status": cmd_watch_status,
             "install-hook": cmd_watch_install_hook,
+        },
+        "scheduler": {
+            "status": cmd_scheduler_status,
+            "pause": cmd_scheduler_pause,
+            "resume": cmd_scheduler_resume,
+            "drain": cmd_scheduler_drain,
+            "maintenance-enable": cmd_scheduler_maintenance_enable,
+            "maintenance-disable": cmd_scheduler_maintenance_disable,
         },
         "config": {
             "show": cmd_config_show,

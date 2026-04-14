@@ -182,6 +182,8 @@ def test_scheduler_status_not_running(client):
     assert data["running"] is False
     assert "lock" in data
     assert data["lock"]["exists"] is False
+    assert "control" in data
+    assert data["control"]["paused"] is False
 
 
 def test_scheduler_start(client):
@@ -217,6 +219,51 @@ def test_scheduler_status_includes_stale_lock_info(client, tmp_path):
     assert data["lock"]["pid"] == 999999
     assert data["lock"]["pid_alive"] is False
     assert data["lock"]["stale"] is True
+
+
+def test_scheduler_pause_resume_endpoints(client):
+    r = client.post("/api/scheduler/pause", json={"reason": "incident"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "paused"
+    assert data["control"]["paused"] is True
+    assert data["control"]["reason"] == "incident"
+
+    r = client.post("/api/scheduler/resume", json={"reason": "incident resolved"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "resumed"
+    assert data["control"]["paused"] is False
+    assert data["control"]["maintenance_mode"] is False
+
+
+def test_scheduler_maintenance_enable_disable_endpoints(client):
+    r = client.post("/api/scheduler/maintenance/enable", json={"reason": "db maintenance"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "maintenance_enabled"
+    assert data["control"]["maintenance_mode"] is True
+    assert data["control"]["paused"] is True
+
+    r = client.post("/api/scheduler/maintenance/disable", json={"reason": "maintenance done"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "maintenance_disabled"
+    assert data["control"]["maintenance_mode"] is False
+    assert data["control"]["paused"] is False
+
+
+def test_scheduler_drain_endpoint_sets_flag(client):
+    r = client.post("/api/scheduler/drain", json={"reason": "safe shutdown"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "drain_requested"
+    assert data["control"]["drain_requested"] is True
+
+    r = client.get("/api/scheduler/status")
+    assert r.status_code == 200
+    status_data = r.json()
+    assert status_data["control"]["drain_requested"] is True
 
 
 # ── Reports ───────────────────────────────────────────────────────────

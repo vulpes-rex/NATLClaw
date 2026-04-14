@@ -28,6 +28,10 @@ from second_brain import (
     save_brain,
 )
 from state import AgentState, load_state, save_state
+from scheduler_control import (
+    load_scheduler_control,
+    save_scheduler_control,
+)
 
 from messaging import (
     append_message,
@@ -327,6 +331,8 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
     _load_outbox = retry()(load_outbox)
     _save_outbox = retry()(save_outbox)
     _load_projects = retry()(load_projects)
+    _load_scheduler_control = retry()(load_scheduler_control)
+    _save_scheduler_control = retry()(save_scheduler_control)
     max_events_per_heartbeat = max(
         1,
         int(
@@ -392,6 +398,7 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
         last_mcp_mtime = 0.0
 
     iteration_count = 0
+    drain_shutdown_requested = False
     try:
         while True:
             iteration_count += 1
@@ -414,6 +421,14 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                     last_mcp_mtime = cur_mtime
             except OSError:
                 pass  # file might be temporarily unavailable
+
+            control = await _load_scheduler_control(config.state_file)
+            if control.drain_requested:
+                logger.info("Drain requested by operator — stopping scheduler loop gracefully")
+                control.drain_in_progress = True
+                await _save_scheduler_control(control, config.state_file)
+                drain_shutdown_requested = True
+                break
 
             state = await _load_state(config.state_file)
 
@@ -557,6 +572,15 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
 
             active_task = directives.get("active_task")
             skip_agent = directives.get("skip_agent", False)
+            if control.paused or control.maintenance_mode:
+                skip_agent = True
+                control_mode = "maintenance_mode" if control.maintenance_mode else "paused"
+                logger.info(
+                    "Scheduler control active (%s) — skipping agent execution this heartbeat",
+                    control_mode,
+                )
+                # During maintenance we do not actively execute task work.
+                active_task = None
 
             if directives.get("extra_context"):
                 enriched_instructions += directives["extra_context"]
@@ -761,6 +785,14 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                 logger.error("Error waiting for events: %s", str(e), exc_info=True)
 
     finally:
+        if drain_shutdown_requested:
+            try:
+                control = await _load_scheduler_control(config.state_file)
+                control.drain_requested = False
+                control.drain_in_progress = False
+                await _save_scheduler_control(control, config.state_file)
+            except Exception as drain_err:
+                logger.warning("Failed to finalize drain state: %s", drain_err)
         release_scheduler_lock()
         metrics_store.close()
         event_watcher.stop()
