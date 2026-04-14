@@ -30,7 +30,7 @@ def _tmp_data(tmp_path, monkeypatch):
         AppConfig(
             state_file=state_file,
             surface_ingress_enabled=True,
-            surface_channels_enabled=("canary",),
+            surface_channels_enabled=("canary", "canary_webhook"),
         ),
     )
     return tmp_path
@@ -451,6 +451,27 @@ def test_surface_ingress_append_inbox_bridge(client, state_file):
     assert outbox[0].payload["surface_event_id"] == "evt_group_0001"
 
 
+def test_surface_ingress_second_channel_webhook_bridge(client, state_file):
+    event = _surface_event(
+        event_id="evt_webhook_0001",
+        adapter="canary_webhook",
+        requires_reply=True,
+        idempotency_key="canary_webhook:u_42:msg_1",
+    )
+    event["payload"] = {"message": "Please create task from webhook payload"}
+
+    r = client.post("/api/surface/events", json=event)
+    assert r.status_code == 202
+    body = r.json()
+    assert body["decision"] == "create_task"
+    assert body["task_id"]
+
+    tasks = asyncio.run(load_tasks(state_file))
+    assert len(tasks) == 1
+    assert tasks[0].id == body["task_id"]
+    assert "webhook payload" in tasks[0].title.lower()
+
+
 def test_surface_ingress_duplicate_is_idempotent_noop(client, state_file):
     event = _surface_event(idempotency_key="canary:u_42:msg_dup")
 
@@ -613,3 +634,117 @@ def test_surface_ingress_returns_503_when_disabled(tmp_path, monkeypatch):
         local_client = TestClient(app)
         r = local_client.post("/api/surface/events", json=_surface_event())
         assert r.status_code == 503
+
+
+def test_surface_routing_is_deterministic_for_same_input_and_session(client):
+    base = _surface_event(
+        event_id="evt_determinism_0001",
+        idempotency_key="canary:determinism:1",
+        requires_reply=False,
+        text="FYI only: deployment completed.",
+    )
+    first = client.post("/api/surface/events", json=base)
+    assert first.status_code == 202
+
+    second_event = _surface_event(
+        event_id="evt_determinism_0002",
+        idempotency_key="canary:determinism:2",
+        requires_reply=False,
+        text="FYI only: deployment completed.",
+    )
+    second = client.post("/api/surface/events", json=second_event)
+    assert second.status_code == 202
+
+    assert first.json()["decision"] == second.json()["decision"]
+
+
+def test_surface_invalid_persona_hint_falls_back_to_default(client):
+    event = _surface_event(
+        event_id="evt_persona_fallback_0001",
+        idempotency_key="canary:persona:fallback:1",
+        requires_reply=True,
+    )
+    event["routing"]["persona_hint"] = "definitely-not-a-real-persona"
+
+    r = client.post("/api/surface/events", json=event)
+    assert r.status_code == 202
+    body = r.json()
+    assert body["persona"] == "default"
+    assert "fell back to default" in body["reason"]
+
+
+def test_surface_dm_and_group_sessions_do_not_collide(client):
+    dm_event = _surface_event(
+        event_id="evt_dm_session_0001",
+        idempotency_key="canary:dm:session:1",
+    )
+    group_event = _surface_event(
+        event_id="evt_group_session_0001",
+        idempotency_key="canary:group:session:1",
+    )
+    group_event["session"] = {
+        "session_id": "sess_canary_group_ops_001",
+        "thread_id": "ops-room",
+        "user_id": "u_ops_1",
+        "group_id": "g_ops",
+    }
+
+    assert client.post("/api/surface/events", json=dm_event).status_code == 202
+    assert client.post("/api/surface/events", json=group_event).status_code == 202
+
+    sessions = client.get("/api/surface/sessions")
+    assert sessions.status_code == 200
+    ids = {entry["session_id"] for entry in sessions.json()}
+    assert "sess_canary_u_42" in ids
+    assert "sess_canary_group_ops_001" in ids
+    assert len(ids) >= 2
+
+
+def test_surface_suspended_session_suppresses_task_without_override(client, state_file):
+    sessions_path = Path(state_file).with_name("surface_sessions.json")
+    sessions_path.write_text(
+        json.dumps(
+            {
+                "sess_canary_u_42": {
+                    "session_id": "sess_canary_u_42",
+                    "channel_type": "canary",
+                    "origin_type": "dm",
+                    "active_persona": "default",
+                    "state": "suspended",
+                    "reply_mode": "manual_review",
+                    "last_event_ts": "2026-04-14T20:00:00Z",
+                    "last_event_id": "seed_suspended",
+                    "last_adapter": "canary",
+                    "updated_at": "2026-04-14T20:00:00Z"
+                }
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    blocked = _surface_event(
+        event_id="evt_suspended_0001",
+        idempotency_key="canary:suspended:1",
+        requires_reply=True,
+        text="Please create a task while suspended",
+    )
+    blocked_resp = client.post("/api/surface/events", json=blocked)
+    assert blocked_resp.status_code == 202
+    blocked_body = blocked_resp.json()
+    assert blocked_body["decision"] == "append_inbox_message"
+    assert "suppressed" in blocked_body["reason"]
+    assert blocked_body["task_id"] is None
+
+    override = _surface_event(
+        event_id="evt_suspended_0002",
+        idempotency_key="canary:suspended:2",
+        requires_reply=True,
+        text="Please create a task with override",
+    )
+    override["routing"]["allow_suspended_override"] = True
+    override_resp = client.post("/api/surface/events", json=override)
+    assert override_resp.status_code == 202
+    override_body = override_resp.json()
+    assert override_body["decision"] == "create_task"
+    assert override_body["task_id"]

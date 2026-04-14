@@ -72,12 +72,15 @@ def create_agent(config: AppConfig) -> Agent:
 ```
 
 Provider dispatch:
-| `config.provider` | Agent/Client class | Auth |
-|-|-|-|
-| `"copilot"` (default) | `GitHubCopilotAgent` | `gh auth login` session |
-| `"foundry"` | `Agent` + `FoundryChatClient` | `AzureCliCredential` |
-| `"openai"` | `Agent` + `OpenAIChatClient` | API key |
-| `"ollama"` | `Agent` + `OllamaChatClient` | None |
+
+
+| `config.provider`     | Agent/Client class            | Auth                    |
+| --------------------- | ----------------------------- | ----------------------- |
+| `"copilot"` (default) | `GitHubCopilotAgent`          | `gh auth login` session |
+| `"foundry"`           | `Agent` + `FoundryChatClient` | `AzureCliCredential`    |
+| `"openai"`            | `Agent` + `OpenAIChatClient`  | API key                 |
+| `"ollama"`            | `Agent` + `OllamaChatClient`  | None                    |
+
 
 Returns a configured `Agent(client=..., name=..., instructions=...)`.
 
@@ -93,6 +96,7 @@ def build_context_block(state: AgentState, max_recent: int = 5) -> str:
 ```
 
 Context block format (injected before each heartbeat):
+
 ```
 == AGENT MEMORY ==
 Last heartbeat: 2026-04-07T10:00:00
@@ -109,20 +113,24 @@ async def run_heartbeat(agent: Agent, state: AgentState, config: AppConfig) -> N
 ```
 
 **Step 1 — Status Check:**
+
 - Prompt the agent with its own state summary (execution count, last run, recent errors).
 - Agent responds with a status assessment.
 
 **Step 2 — Task Execution:**
+
 - Prompt the agent with the primary task.
 - For POC: a configurable task prompt (e.g., "Research the latest developments in AI agents").
 - The status check result is included as context.
 
 **Step 3 — Report Generation:**
+
 - Prompt the agent to summarize the heartbeat cycle.
 - Input: status check + task execution results.
 - Output is logged and stored in execution history.
 
 Each step:
+
 1. Logs step name + start time.
 2. Calls `agent.run(prompt)`.
 3. Records result in `state.execution_history`.
@@ -137,6 +145,7 @@ async def run_scheduler(config: AppConfig) -> None:
 ```
 
 Loop:
+
 1. Load state.
 2. Create agent (fresh each heartbeat to pick up config changes).
 3. Enrich agent instructions with `learning.build_context_block(state)`.
@@ -254,3 +263,4 @@ AGENT_INSTRUCTIONS=You are an autonomous agent that performs periodic tasks, lea
 3. Lessons from previous heartbeats appear in the context of subsequent ones.
 4. Switching `PROVIDER` from `copilot` to `openai` or `ollama` works with only `.env` changes.
 5. Ctrl+C shuts down cleanly with state saved.
+

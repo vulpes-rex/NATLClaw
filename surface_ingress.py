@@ -40,6 +40,24 @@ _ACTION_HINTS = (
 )
 
 
+def _normalize_canary_event(event: dict[str, Any]) -> dict[str, Any]:
+    return event
+
+
+def _normalize_canary_webhook_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Normalize webhook-style canary payloads into surface-event text shape."""
+    payload = dict(event.get("payload", {}))
+    if not payload.get("text") and isinstance(payload.get("message"), str):
+        payload["text"] = payload["message"]
+    return {**event, "payload": payload}
+
+
+_ADAPTER_NORMALIZERS: dict[str, Any] = {
+    "canary": _normalize_canary_event,
+    "canary_webhook": _normalize_canary_webhook_event,
+}
+
+
 class SurfaceIngressError(ValueError):
     """Base class for surface ingress validation and processing errors."""
 
@@ -159,12 +177,19 @@ def _infer_origin_type(event: dict[str, Any]) -> str:
     return "dm"
 
 
-def _choose_persona(event: dict[str, Any], default_persona: str) -> str:
+def _choose_persona(
+    event: dict[str, Any],
+    default_persona: str,
+    allowed_personas: set[str] | None = None,
+) -> tuple[str, bool]:
     routing = event.get("routing", {})
     hinted = routing.get("persona_hint")
     if isinstance(hinted, str) and hinted.strip():
-        return hinted.strip()
-    return default_persona
+        hinted_name = hinted.strip()
+        if allowed_personas and hinted_name not in allowed_personas:
+            return default_persona, True
+        return hinted_name, False
+    return default_persona, False
 
 
 def _upsert_surface_session(
@@ -423,6 +448,7 @@ async def process_surface_event(
     ingress_enabled: bool,
     allowed_channels: set[str],
     default_persona: str = "default",
+    allowed_personas: set[str] | None = None,
 ) -> dict[str, Any]:
     """Route a validated surface event into task/inbox outcomes."""
     if not ingress_enabled:
@@ -435,6 +461,9 @@ async def process_surface_event(
         raise SurfaceAdapterNotAllowedError(
             f"Adapter '{adapter}' is not enabled for surface ingress"
         )
+    normalizer = _ADAPTER_NORMALIZERS.get(adapter)
+    if callable(normalizer):
+        event = normalizer(event)
 
     idem_key = _idempotency_key(event)
     idem_hash = _payload_hash(event)
@@ -443,7 +472,15 @@ async def process_surface_event(
     if isinstance(existing, dict):
         existing_hash = existing.get("payload_hash")
         if existing_hash == idem_hash:
-            persona = str(existing.get("persona") or _choose_persona(event, default_persona=default_persona))
+            chosen_persona, persona_fallback = _choose_persona(
+                event,
+                default_persona=default_persona,
+                allowed_personas=allowed_personas,
+            )
+            persona = str(existing.get("persona") or chosen_persona)
+            reason = "idempotency replay accepted as no-op"
+            if persona_fallback:
+                reason = "idempotency replay accepted; invalid persona hint fell back to default"
             _upsert_surface_session(
                 event,
                 state_file=state_file,
@@ -453,7 +490,7 @@ async def process_surface_event(
                 state_file=state_file,
                 event=event,
                 decision=str(existing.get("decision", "duplicate")),
-                reason="idempotency replay accepted as no-op",
+                reason=reason,
                 persona=persona,
                 task_id=existing.get("task_id"),
                 message_id=existing.get("message_id"),
@@ -469,15 +506,31 @@ async def process_surface_event(
                 "status": "accepted_noop",
                 "task_id": existing.get("task_id"),
                 "message_id": existing.get("message_id"),
+                "reason": reason,
             }
         raise SurfaceIdempotencyConflictError(
             f"Idempotency key '{idem_key}' was already used for a different payload"
         )
 
     decision, reason = _derive_decision(event)
-    persona = _choose_persona(event, default_persona=default_persona)
+    persona, persona_fallback = _choose_persona(
+        event,
+        default_persona=default_persona,
+        allowed_personas=allowed_personas,
+    )
     task_id = None
     message_id = None
+
+    prior_session = get_surface_session(state_file, event["session"]["session_id"]) or {}
+    if (
+        prior_session.get("state") == "suspended"
+        and decision == "create_task"
+        and not bool(event.get("routing", {}).get("allow_suspended_override", False))
+    ):
+        decision = "append_inbox_message"
+        reason = "session suspended; task creation suppressed without override"
+    if persona_fallback:
+        reason = f"{reason}; invalid persona hint fell back to default '{default_persona}'"
 
     try:
         if decision == "create_task":

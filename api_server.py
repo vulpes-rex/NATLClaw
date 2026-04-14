@@ -418,6 +418,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 ingress_enabled=bool(config.surface_ingress_enabled),
                 allowed_channels={c.strip() for c in config.surface_channels_enabled if c.strip()},
                 default_persona=config.persona,
+                allowed_personas=set(list_personas()),
             )
         except SurfaceIngressDisabledError as exc:
             raise HTTPException(503, str(exc)) from exc

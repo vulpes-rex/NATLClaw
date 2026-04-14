@@ -1,0 +1,33 @@
+{
+  "name": "canary_webhook_info",
+  "expected_decision": "append_inbox_message",
+  "event": {
+    "spec_version": "1.0",
+    "event_id": "evt_fixture_webhook_info_0001",
+    "event_type": "message.received",
+    "ts": "2026-04-14T20:30:00Z",
+    "source": {
+      "adapter": "canary_webhook",
+      "channel_type": "webhook",
+      "channel_instance": "ops-room"
+    },
+    "session": {
+      "session_id": "sess_fixture_webhook_group_001",
+      "thread_id": "ops-room",
+      "user_id": "u_fixture_2",
+      "group_id": "g_ops"
+    },
+    "routing": {
+      "persona_hint": null,
+      "priority": "normal",
+      "requires_reply": false
+    },
+    "payload": {
+      "message": "FYI only: build and deploy completed successfully."
+    },
+    "meta": {
+      "trace_id": "trace_fixture_webhook_info_0001",
+      "idempotency_key": "fixture:webhook:info:0001"
+    }
+  }
+}
