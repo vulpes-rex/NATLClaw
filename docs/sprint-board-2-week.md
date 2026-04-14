@@ -63,18 +63,28 @@
   - **Goal:** Make session identity and routing decisions visible to operators.
   - **Accept:** Session and route status are queryable and traceable in logs/API.
   - **Measure:** Operator can trace inbound event -> route decision -> task/inbox result.
+  - **Progress:**
+    - [x] Added persistent surface session store updates during ingress handling (`surface_ingress.py`).
+    - [x] Added persistent recent route decision logs with event/session/outcome trace fields (`surface_ingress.py`).
+    - [x] Added operator read APIs for sessions and recent routes (`/api/surface/sessions`, `/api/surface/sessions/{session_id}`, `/api/surface/routes/recent`) in `api_server.py`.
+    - [x] Added integration coverage for session queryability, route trace visibility, and idempotent replay route history (`tests/integration/test_api_server.py`).
 
 - [ ] **S20: Surface hardening + staged rollout**
   - **Goal:** Safely roll out channel surfaces with rollback controls.
   - **Accept:** Feature-flag rollout, soak/backpressure tests, and incident playbook are documented.
   - **Measure:** Canary rollout can be enabled/disabled in minutes without scheduler degradation.
+  - **Progress:**
+    - [x] Added surface health API for rollout/canary visibility (`/api/surface/health`) including channel allowlist and recent route outcomes (`api_server.py`, `surface_ingress.py`).
+    - [x] Added hardening coverage for disabled-ingress fail-open behavior (`503`), adapter allowlist enforcement (`400`), and idempotency conflict detection (`409`) (`tests/integration/test_api_server.py`).
+    - [x] Confirmed staged rollout and rollback playbook documentation is in place and cross-linked (`openclaw-surface-rollout.md`).
+    - [x] Extended integration suite to validate surface observability + hardening regressions alongside existing scheduler/API controls (`tests/integration/test_api_server.py`).
 
 ## In Progress (WIP Limit: 3)
 
 - [ ] **S13: Persistence integrity + crash consistency**
 - [ ] **S14: Scheduler backpressure + bounded work per heartbeat**
 - [ ] **S15: Operator control plane hardening**
-- [ ] **S18: Single-channel ingress MVP bridge**
+- [ ] **S20: Surface hardening + staged rollout**
 - [ ] **S16: Regression gate for core flows (CI-grade)**
 
 ## Done

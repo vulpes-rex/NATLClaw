@@ -475,3 +475,141 @@ def test_surface_ingress_invalid_payload_returns_400(client):
     r = client.post("/api/surface/events", json={"event_id": "broken"})
     assert r.status_code == 400
     assert "spec_version" in r.json()["detail"]
+
+
+def test_surface_sessions_are_queryable(client):
+    event = _surface_event(
+        event_id="evt_session_0001",
+        idempotency_key="canary:sess:evt_session_0001",
+    )
+    r = client.post("/api/surface/events", json=event)
+    assert r.status_code == 202
+
+    sessions = client.get("/api/surface/sessions")
+    assert sessions.status_code == 200
+    data = sessions.json()
+    assert len(data) >= 1
+    session = next((s for s in data if s["session_id"] == "sess_canary_u_42"), None)
+    assert session is not None
+    assert session["active_persona"]
+    assert session["last_event_id"] == "evt_session_0001"
+
+    detail = client.get("/api/surface/sessions/sess_canary_u_42")
+    assert detail.status_code == 200
+    assert detail.json()["session_id"] == "sess_canary_u_42"
+
+
+def test_surface_routes_recent_trace_includes_outcome(client):
+    event = _surface_event(
+        event_id="evt_route_trace_0001",
+        idempotency_key="canary:trace:evt_route_trace_0001",
+        requires_reply=True,
+    )
+    accepted = client.post("/api/surface/events", json=event)
+    assert accepted.status_code == 202
+    accepted_body = accepted.json()
+
+    routes = client.get("/api/surface/routes/recent?limit=10")
+    assert routes.status_code == 200
+    rows = routes.json()
+    trace = next((r for r in rows if r["event_id"] == "evt_route_trace_0001"), None)
+    assert trace is not None
+    assert trace["session_id"] == "sess_canary_u_42"
+    assert trace["decision"] == "create_task"
+    assert trace["task_id"] == accepted_body["task_id"]
+    assert trace["status"] == "accepted"
+
+    filtered = client.get("/api/surface/routes/recent?event_id=evt_route_trace_0001")
+    assert filtered.status_code == 200
+    filtered_rows = filtered.json()
+    assert len(filtered_rows) >= 1
+    assert all(r["event_id"] == "evt_route_trace_0001" for r in filtered_rows)
+
+
+def test_surface_routes_capture_idempotent_replay(client):
+    event = _surface_event(
+        event_id="evt_replay_0001",
+        idempotency_key="canary:replay:evt_replay_0001",
+        requires_reply=False,
+        text="FYI replay candidate",
+    )
+    first = client.post("/api/surface/events", json=event)
+    assert first.status_code == 202
+    second = client.post("/api/surface/events", json=event)
+    assert second.status_code == 202
+    assert second.json()["idempotent"] is True
+
+    routes = client.get("/api/surface/routes/recent?event_id=evt_replay_0001")
+    assert routes.status_code == 200
+    rows = routes.json()
+    statuses = {row["status"] for row in rows}
+    assert "accepted" in statuses
+    assert "accepted_noop" in statuses
+
+
+def test_surface_health_endpoint_reflects_rollout_state(client):
+    seed = _surface_event(
+        event_id="evt_health_0001",
+        idempotency_key="canary:health:evt_health_0001",
+    )
+    accepted = client.post("/api/surface/events", json=seed)
+    assert accepted.status_code == 202
+
+    health = client.get("/api/surface/health")
+    assert health.status_code == 200
+    body = health.json()
+    assert body["ingress_enabled"] is True
+    assert "canary" in body["allowed_channels"]
+    assert body["session_count"] >= 1
+    assert body["recent_routes_count"] >= 1
+    assert body["latest_route"]["event_id"] == "evt_health_0001"
+
+
+def test_surface_ingress_adapter_allowlist_rejects_unknown(client):
+    event = _surface_event(
+        event_id="evt_unknown_adapter_0001",
+        adapter="discord",
+        idempotency_key="discord:u_42:evt_unknown_adapter_0001",
+    )
+    r = client.post("/api/surface/events", json=event)
+    assert r.status_code == 400
+    assert "not enabled" in r.json()["detail"]
+
+
+def test_surface_ingress_conflicting_idempotency_key_returns_409(client):
+    first = _surface_event(
+        event_id="evt_conflict_0001",
+        idempotency_key="canary:conflict:key-1",
+        text="first payload",
+    )
+    second = _surface_event(
+        event_id="evt_conflict_0002",
+        idempotency_key="canary:conflict:key-1",
+        text="different payload",
+    )
+    r1 = client.post("/api/surface/events", json=first)
+    assert r1.status_code == 202
+    r2 = client.post("/api/surface/events", json=second)
+    assert r2.status_code == 409
+    assert "already used for a different payload" in r2.json()["detail"]
+
+
+def test_surface_ingress_returns_503_when_disabled(tmp_path, monkeypatch):
+    state_file = str(tmp_path / "agent_state.json")
+    cfg = AppConfig(
+        state_file=state_file,
+        surface_ingress_enabled=False,
+        surface_channels_enabled=("canary",),
+    )
+    monkeypatch.setattr("api_server._default_config", cfg)
+
+    async def _noop_scheduler(*a, **kw):
+        await asyncio.sleep(999)
+
+    with patch("scheduler.run_scheduler", side_effect=_noop_scheduler), \
+         patch("scheduler.acquire_scheduler_lock", return_value=True), \
+         patch("scheduler.release_scheduler_lock"):
+        app = create_app(cfg)
+        local_client = TestClient(app)
+        r = local_client.post("/api/surface/events", json=_surface_event())
+        assert r.status_code == 503

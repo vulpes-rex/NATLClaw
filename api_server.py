@@ -94,6 +94,10 @@ from surface_ingress import (
     SurfaceIdempotencyConflictError,
     SurfaceIngressDisabledError,
     SurfaceIngressError,
+    get_surface_health,
+    get_surface_session,
+    list_recent_surface_routes,
+    list_surface_sessions,
     process_surface_event,
     validate_surface_event,
 )
@@ -413,6 +417,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 state_file=config.state_file,
                 ingress_enabled=bool(config.surface_ingress_enabled),
                 allowed_channels={c.strip() for c in config.surface_channels_enabled if c.strip()},
+                default_persona=config.persona,
             )
         except SurfaceIngressDisabledError as exc:
             raise HTTPException(503, str(exc)) from exc
@@ -424,6 +429,43 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(400, str(exc)) from exc
 
         return JSONResponse(status_code=202, content=result)
+
+    @app.get("/api/surface/sessions")
+    async def api_surface_sessions():
+        """List known surface sessions for operator observability."""
+        return list_surface_sessions(config.state_file)
+
+    @app.get("/api/surface/sessions/{session_id}")
+    async def api_surface_session_detail(session_id: str):
+        """Get one surface session state."""
+        session = get_surface_session(config.state_file, session_id)
+        if session is None:
+            raise HTTPException(404, f"Surface session '{session_id}' not found")
+        return session
+
+    @app.get("/api/surface/routes/recent")
+    async def api_surface_routes_recent(
+        limit: int = Query(50, ge=1, le=500),
+        session_id: str | None = Query(None),
+        event_id: str | None = Query(None),
+    ):
+        """List recent route decisions for event->outcome tracing."""
+        return list_recent_surface_routes(
+            config.state_file,
+            limit=limit,
+            session_id=session_id,
+            event_id=event_id,
+        )
+
+    @app.get("/api/surface/health")
+    async def api_surface_health():
+        """Return rollout-oriented surface health and canary status details."""
+        allowed_channels = {c.strip() for c in config.surface_channels_enabled if c.strip()}
+        return get_surface_health(
+            config.state_file,
+            ingress_enabled=bool(config.surface_ingress_enabled),
+            allowed_channels=allowed_channels,
+        )
 
     # ── Task management endpoints ────────────────────────────────
 

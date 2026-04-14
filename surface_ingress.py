@@ -60,6 +60,14 @@ def _idempotency_store_path(state_file: str) -> str:
     return os.path.join(os.path.dirname(state_file), "surface_idempotency.json")
 
 
+def _sessions_store_path(state_file: str) -> str:
+    return os.path.join(os.path.dirname(state_file), "surface_sessions.json")
+
+
+def _routes_store_path(state_file: str) -> str:
+    return os.path.join(os.path.dirname(state_file), "surface_routes.json")
+
+
 def _payload_hash(event: dict[str, Any]) -> str:
     payload = json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -94,6 +102,198 @@ def _save_idempotency_store(state_file: str, store: dict[str, Any]) -> None:
         except OSError:
             pass
         raise
+
+
+def _load_json_object(path: str) -> dict[str, Any]:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            return raw
+    except (OSError, json.JSONDecodeError, TypeError):
+        logger.warning("Failed to load JSON object store from %s", path, exc_info=True)
+    return {}
+
+
+def _load_json_list(path: str) -> list[dict[str, Any]]:
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, list):
+            return [entry for entry in raw if isinstance(entry, dict)]
+    except (OSError, json.JSONDecodeError, TypeError):
+        logger.warning("Failed to load JSON list store from %s", path, exc_info=True)
+    return []
+
+
+def _save_json_atomic(path: str, value: Any) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    dir_name = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(value, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _infer_origin_type(event: dict[str, Any]) -> str:
+    session = event.get("session", {})
+    source = event.get("source", {})
+    if session.get("group_id"):
+        return "group"
+    if session.get("thread_id"):
+        return "api"
+    channel_type = str(source.get("channel_type", "")).lower()
+    if channel_type in {"webhook", "api"}:
+        return channel_type
+    return "dm"
+
+
+def _choose_persona(event: dict[str, Any], default_persona: str) -> str:
+    routing = event.get("routing", {})
+    hinted = routing.get("persona_hint")
+    if isinstance(hinted, str) and hinted.strip():
+        return hinted.strip()
+    return default_persona
+
+
+def _upsert_surface_session(
+    event: dict[str, Any],
+    *,
+    state_file: str,
+    persona: str,
+) -> dict[str, Any]:
+    sessions_path = _sessions_store_path(state_file)
+    sessions = _load_json_object(sessions_path)
+
+    session = event["session"]
+    source = event["source"]
+    session_id = session["session_id"]
+    requires_reply = bool(event.get("routing", {}).get("requires_reply", False))
+
+    current = sessions.get(session_id, {})
+    if not isinstance(current, dict):
+        current = {}
+    current.update(
+        {
+            "session_id": session_id,
+            "channel_type": source.get("channel_type"),
+            "origin_type": _infer_origin_type(event),
+            "active_persona": persona,
+            "state": "active",
+            "reply_mode": "manual_review" if requires_reply else "auto",
+            "last_event_ts": event.get("ts"),
+            "last_event_id": event.get("event_id"),
+            "last_adapter": source.get("adapter"),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    sessions[session_id] = current
+    _save_json_atomic(sessions_path, sessions)
+    return current
+
+
+def _append_route_record(
+    *,
+    state_file: str,
+    event: dict[str, Any],
+    decision: str,
+    reason: str,
+    persona: str,
+    task_id: str | None,
+    message_id: str | None,
+    idempotent: bool,
+    status: str,
+) -> dict[str, Any]:
+    routes_path = _routes_store_path(state_file)
+    routes = _load_json_list(routes_path)
+    route = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event_id": event.get("event_id"),
+        "session_id": event.get("session", {}).get("session_id"),
+        "decision": decision,
+        "persona": persona,
+        "priority": event.get("routing", {}).get("priority", "normal"),
+        "reason": reason,
+        "task_id": task_id,
+        "message_id": message_id,
+        "adapter": event.get("source", {}).get("adapter"),
+        "event_type": event.get("event_type"),
+        "status": status,
+        "idempotent": idempotent,
+    }
+    routes.append(route)
+    if len(routes) > 1000:
+        routes = routes[-1000:]
+    _save_json_atomic(routes_path, routes)
+    return route
+
+
+def list_surface_sessions(state_file: str) -> list[dict[str, Any]]:
+    """Return all known surface sessions sorted by latest event timestamp."""
+    sessions = _load_json_object(_sessions_store_path(state_file))
+    values = [entry for entry in sessions.values() if isinstance(entry, dict)]
+    return sorted(values, key=lambda item: str(item.get("last_event_ts", "")), reverse=True)
+
+
+def get_surface_session(state_file: str, session_id: str) -> dict[str, Any] | None:
+    """Return one session by ID, if present."""
+    sessions = _load_json_object(_sessions_store_path(state_file))
+    entry = sessions.get(session_id)
+    if isinstance(entry, dict):
+        return entry
+    return None
+
+
+def list_recent_surface_routes(
+    state_file: str,
+    *,
+    limit: int = 50,
+    session_id: str | None = None,
+    event_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return recent route records, optionally filtered by session/event."""
+    routes = _load_json_list(_routes_store_path(state_file))
+    if session_id:
+        routes = [r for r in routes if r.get("session_id") == session_id]
+    if event_id:
+        routes = [r for r in routes if r.get("event_id") == event_id]
+    routes = sorted(routes, key=lambda item: str(item.get("timestamp", "")), reverse=True)
+    return routes[: max(1, int(limit))]
+
+
+def get_surface_health(
+    state_file: str,
+    *,
+    ingress_enabled: bool,
+    allowed_channels: set[str],
+) -> dict[str, Any]:
+    """Build a lightweight health snapshot for surface rollout operations."""
+    sessions = list_surface_sessions(state_file)
+    routes = list_recent_surface_routes(state_file, limit=200)
+    accepted = sum(1 for row in routes if row.get("status") == "accepted")
+    accepted_noop = sum(1 for row in routes if row.get("status") == "accepted_noop")
+    escalated = sum(1 for row in routes if row.get("decision") == "escalate_operator")
+    return {
+        "ingress_enabled": ingress_enabled,
+        "allowed_channels": sorted(allowed_channels),
+        "session_count": len(sessions),
+        "recent_routes_count": len(routes),
+        "recent_accepted_count": accepted,
+        "recent_idempotent_noop_count": accepted_noop,
+        "recent_escalation_count": escalated,
+        "latest_route": routes[0] if routes else None,
+    }
 
 
 def _require_object(raw: Any, field: str) -> dict[str, Any]:
@@ -222,6 +422,7 @@ async def process_surface_event(
     state_file: str,
     ingress_enabled: bool,
     allowed_channels: set[str],
+    default_persona: str = "default",
 ) -> dict[str, Any]:
     """Route a validated surface event into task/inbox outcomes."""
     if not ingress_enabled:
@@ -242,10 +443,28 @@ async def process_surface_event(
     if isinstance(existing, dict):
         existing_hash = existing.get("payload_hash")
         if existing_hash == idem_hash:
+            persona = str(existing.get("persona") or _choose_persona(event, default_persona=default_persona))
+            _upsert_surface_session(
+                event,
+                state_file=state_file,
+                persona=persona,
+            )
+            _append_route_record(
+                state_file=state_file,
+                event=event,
+                decision=str(existing.get("decision", "duplicate")),
+                reason="idempotency replay accepted as no-op",
+                persona=persona,
+                task_id=existing.get("task_id"),
+                message_id=existing.get("message_id"),
+                idempotent=True,
+                status="accepted_noop",
+            )
             return {
                 "event_id": event["event_id"],
                 "session_id": event["session"]["session_id"],
                 "decision": existing.get("decision", "duplicate"),
+                "persona": persona,
                 "idempotent": True,
                 "status": "accepted_noop",
                 "task_id": existing.get("task_id"),
@@ -256,6 +475,7 @@ async def process_surface_event(
         )
 
     decision, reason = _derive_decision(event)
+    persona = _choose_persona(event, default_persona=default_persona)
     task_id = None
     message_id = None
 
@@ -320,10 +540,28 @@ async def process_surface_event(
         reason = "bridge failure escalated to operator inbox"
         message_id = alert.id
 
+    _upsert_surface_session(
+        event,
+        state_file=state_file,
+        persona=persona,
+    )
+    _append_route_record(
+        state_file=state_file,
+        event=event,
+        decision=decision,
+        reason=reason,
+        persona=persona,
+        task_id=task_id,
+        message_id=message_id,
+        idempotent=False,
+        status="accepted",
+    )
+
     store[idem_key] = {
         "event_id": event["event_id"],
         "session_id": event["session"]["session_id"],
         "decision": decision,
+        "persona": persona,
         "payload_hash": idem_hash,
         "task_id": task_id,
         "message_id": message_id,
@@ -335,6 +573,7 @@ async def process_surface_event(
         "event_id": event["event_id"],
         "session_id": event["session"]["session_id"],
         "decision": decision,
+        "persona": persona,
         "idempotent": False,
         "status": "accepted",
         "reason": reason,
