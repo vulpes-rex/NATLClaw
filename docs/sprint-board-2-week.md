@@ -43,6 +43,11 @@
   - **Goal:** Define normalized ingress event/session/routing contracts without changing core runtime behavior.
   - **Accept:** Architecture doc + contract examples + boundary policy are merged and cross-linked.
   - **Measure:** Adapter teams can build against a stable contract with no core-loop edits.
+  - **Progress:**
+    - [x] Confirmed normalized architecture contract and machine-readable schema foundations (`openclaw-surface-architecture.md`, `surface-event-v1.schema.json`).
+    - [x] Added dedicated contract examples guide for adapter/session/routing implementation (`openclaw-surface-contract-examples.md`).
+    - [x] Added explicit boundary/ownership policy doc with enforcement checklist (`openclaw-surface-boundary-policy.md`).
+    - [x] Cross-linked architecture, adoption, MVP, and session/routing docs to contract examples and boundary policy.
 
 - [ ] **S18: Single-channel ingress MVP bridge**
   - **Goal:** Map one inbound channel path into existing task/inbox primitives.
@@ -64,6 +69,7 @@
 - [ ] **S13: Persistence integrity + crash consistency**
 - [ ] **S14: Scheduler backpressure + bounded work per heartbeat**
 - [ ] **S15: Operator control plane hardening**
+- [ ] **S17: OpenClaw surface contract foundation**
 - [ ] **S16: Regression gate for core flows (CI-grade)**
 
 ## Done
@@ -119,4 +125,6 @@
 
 - [OpenClaw Surface Adoption Plan](./openclaw-surface-adoption-plan.md)
 - [OpenClaw Surface Architecture](./openclaw-surface-architecture.md)
+- [OpenClaw Surface Contract Examples](./openclaw-surface-contract-examples.md)
+- [OpenClaw Surface Boundary Policy](./openclaw-surface-boundary-policy.md)
 - [OpenClaw Surface Rollout](./openclaw-surface-rollout.md)

@@ -103,5 +103,7 @@ Response:
 ## Dependencies
 
 - [OpenClaw Surface Architecture](./openclaw-surface-architecture.md)
+- [OpenClaw Surface Contract Examples](./openclaw-surface-contract-examples.md)
+- [OpenClaw Surface Boundary Policy](./openclaw-surface-boundary-policy.md)
 - [OpenClaw Surface Rollout](./openclaw-surface-rollout.md)
 
