@@ -49,6 +49,10 @@ class AppConfig:
     # API authentication (optional — if set, all API endpoints require Bearer token)
     api_key: str = ""
 
+    # Surface ingress (OpenClaw MVP bridge)
+    surface_ingress_enabled: bool = False
+    surface_channels_enabled: tuple[str, ...] = field(default_factory=tuple)
+
 
 VALID_PROVIDERS = ("copilot", "foundry", "openai", "openrouter", "azure_openai", "ollama")
 
@@ -90,6 +94,18 @@ def load_config(env_path: str = ".env") -> AppConfig:
     """Load configuration from .env file and environment variables."""
     load_dotenv(env_path)
 
+    def _parse_bool(value: str | None, default: bool = False) -> bool:
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    channels_raw = os.getenv("SURFACE_CHANNELS_ENABLED", "")
+    channels = tuple(
+        part.strip()
+        for part in channels_raw.split(",")
+        if part.strip()
+    )
+
     return AppConfig(
         provider=os.getenv("PROVIDER", "copilot").lower(),
         model=os.getenv("GITHUB_COPILOT_MODEL")
@@ -117,4 +133,6 @@ def load_config(env_path: str = ".env") -> AppConfig:
         persona=os.getenv("PERSONA", "default"),
         agent_instructions=os.getenv("AGENT_INSTRUCTIONS", ""),
         api_key=os.getenv("NATL_API_KEY", ""),
+        surface_ingress_enabled=_parse_bool(os.getenv("SURFACE_INGRESS_ENABLED"), default=False),
+        surface_channels_enabled=channels,
     )

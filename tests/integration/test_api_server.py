@@ -18,14 +18,21 @@ from fastapi.testclient import TestClient
 from api_server import create_app
 from config import AppConfig
 from execution_log import append_entry
-from messaging import Message, save_outbox
-from tasks import Task, save_tasks
+from messaging import Message, load_outbox, save_outbox
+from tasks import Task, load_tasks, save_tasks
 
 
 @pytest.fixture(autouse=True)
 def _tmp_data(tmp_path, monkeypatch):
     state_file = str(tmp_path / "agent_state.json")
-    monkeypatch.setattr("api_server._default_config", AppConfig(state_file=state_file))
+    monkeypatch.setattr(
+        "api_server._default_config",
+        AppConfig(
+            state_file=state_file,
+            surface_ingress_enabled=True,
+            surface_channels_enabled=("canary",),
+        ),
+    )
     return tmp_path
 
 
@@ -51,6 +58,46 @@ def client(config):
 @pytest.fixture()
 def state_file(config):
     return config.state_file
+
+
+def _surface_event(
+    *,
+    event_id: str = "evt_dm_0001",
+    adapter: str = "canary",
+    text: str = "Please summarize blockers and create follow-up tasks.",
+    requires_reply: bool = True,
+    idempotency_key: str = "canary:u_42:msg_0001",
+) -> dict:
+    return {
+        "spec_version": "1.0",
+        "event_id": event_id,
+        "event_type": "message.received",
+        "ts": "2026-04-14T20:25:01Z",
+        "source": {
+            "adapter": adapter,
+            "channel_type": "canary",
+            "channel_instance": "primary",
+        },
+        "session": {
+            "session_id": "sess_canary_u_42",
+            "thread_id": None,
+            "user_id": "u_42",
+            "group_id": None,
+        },
+        "routing": {
+            "persona_hint": "project_manager",
+            "priority": "high",
+            "requires_reply": requires_reply,
+        },
+        "payload": {
+            "text": text,
+            "attachments": [],
+        },
+        "meta": {
+            "trace_id": "trc_0001",
+            "idempotency_key": idempotency_key,
+        },
+    }
 
 
 # ── Dashboard ──────────────────────────────────────────────────────────
@@ -365,3 +412,66 @@ class TestApiAuth:
         """When api_key is empty, no auth required."""
         r = client.get("/api/personas")
         assert r.status_code == 200
+
+
+def test_surface_ingress_create_task_bridge(client, state_file):
+    event = _surface_event(requires_reply=True)
+
+    r = client.post("/api/surface/events", json=event)
+    assert r.status_code == 202
+    body = r.json()
+    assert body["decision"] == "create_task"
+    assert body["status"] == "accepted"
+    assert body["idempotent"] is False
+    assert body["task_id"]
+
+    tasks = asyncio.run(load_tasks(state_file))
+    assert len(tasks) == 1
+    assert tasks[0].id == body["task_id"]
+    assert tasks[0].status == "pending"
+
+
+def test_surface_ingress_append_inbox_bridge(client, state_file):
+    event = _surface_event(
+        event_id="evt_group_0001",
+        text="FYI: CI is green and deployment completed.",
+        requires_reply=False,
+        idempotency_key="canary:g_ops:msg_100",
+    )
+
+    r = client.post("/api/surface/events", json=event)
+    assert r.status_code == 202
+    body = r.json()
+    assert body["decision"] == "append_inbox_message"
+    assert body["message_id"]
+
+    outbox = asyncio.run(load_outbox(state_file))
+    assert len(outbox) == 1
+    assert outbox[0].id == body["message_id"]
+    assert outbox[0].payload["surface_event_id"] == "evt_group_0001"
+
+
+def test_surface_ingress_duplicate_is_idempotent_noop(client, state_file):
+    event = _surface_event(idempotency_key="canary:u_42:msg_dup")
+
+    first = client.post("/api/surface/events", json=event)
+    assert first.status_code == 202
+    first_body = first.json()
+    assert first_body["idempotent"] is False
+    task_id = first_body["task_id"]
+
+    second = client.post("/api/surface/events", json=event)
+    assert second.status_code == 202
+    second_body = second.json()
+    assert second_body["idempotent"] is True
+    assert second_body["status"] == "accepted_noop"
+    assert second_body["task_id"] == task_id
+
+    tasks = asyncio.run(load_tasks(state_file))
+    assert len(tasks) == 1
+
+
+def test_surface_ingress_invalid_payload_returns_400(client):
+    r = client.post("/api/surface/events", json={"event_id": "broken"})
+    assert r.status_code == 400
+    assert "spec_version" in r.json()["detail"]

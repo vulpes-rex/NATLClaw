@@ -53,6 +53,11 @@
   - **Goal:** Map one inbound channel path into existing task/inbox primitives.
   - **Accept:** One canary channel can create actionable task/inbox outcomes through normalized ingress.
   - **Measure:** End-to-end ingestion success and idempotency checks pass in integration tests.
+  - **Progress:**
+    - [x] Added `POST /api/surface/events` ingress endpoint with `surface-event-v1` validation and canary adapter allowlist checks (`api_server.py`, `surface_ingress.py`).
+    - [x] Bridged normalized route decisions to existing task/inbox primitives with scheduler wake signaling for task outcomes (`surface_ingress.py`, `event_watcher.py`).
+    - [x] Added idempotency key replay handling (`accepted_noop`) and conflict detection for mismatched payload reuse (`surface_ingress.py`).
+    - [x] Added integration coverage for create-task path, inbox path, duplicate no-op idempotency, and invalid payload rejection (`tests/integration/test_api_server.py`).
 
 - [ ] **S19: Session/routing observability**
   - **Goal:** Make session identity and routing decisions visible to operators.
@@ -69,7 +74,7 @@
 - [ ] **S13: Persistence integrity + crash consistency**
 - [ ] **S14: Scheduler backpressure + bounded work per heartbeat**
 - [ ] **S15: Operator control plane hardening**
-- [ ] **S17: OpenClaw surface contract foundation**
+- [ ] **S18: Single-channel ingress MVP bridge**
 - [ ] **S16: Regression gate for core flows (CI-grade)**
 
 ## Done

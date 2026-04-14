@@ -89,6 +89,14 @@ from tasks import (
 )
 from operator_status import build_operator_status
 from scheduler_control import load_scheduler_control, update_scheduler_control
+from surface_ingress import (
+    SurfaceAdapterNotAllowedError,
+    SurfaceIdempotencyConflictError,
+    SurfaceIngressDisabledError,
+    SurfaceIngressError,
+    process_surface_event,
+    validate_surface_event,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -390,6 +398,32 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             await save_state(state, config.state_file, config.max_history)
 
         return JSONResponse(_make_completion_response(text, persona_name, completion_id))
+
+    @app.post("/api/surface/events")
+    async def api_surface_ingress(event: dict[str, Any]):
+        """Ingress bridge for normalized surface events (S18 MVP)."""
+        try:
+            normalized = validate_surface_event(event)
+        except SurfaceIngressError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        try:
+            result = await process_surface_event(
+                normalized,
+                state_file=config.state_file,
+                ingress_enabled=bool(config.surface_ingress_enabled),
+                allowed_channels={c.strip() for c in config.surface_channels_enabled if c.strip()},
+            )
+        except SurfaceIngressDisabledError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        except SurfaceAdapterNotAllowedError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except SurfaceIdempotencyConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except SurfaceIngressError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        return JSONResponse(status_code=202, content=result)
 
     # ── Task management endpoints ────────────────────────────────
 
