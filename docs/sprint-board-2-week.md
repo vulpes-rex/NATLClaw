@@ -34,6 +34,10 @@
   - **Goal:** Prevent regressions in scheduler/task/status/idempotency core.
   - **Accept:** A slim core suite test target exists and is required before merge.
   - **Measure:** Every PR runs core suite; regressions are caught pre-merge.
+  - **Progress:**
+    - [x] Added a slim core suite manifest and runner target (`core_suite_tests.txt`, `run_core_suite.py`).
+    - [x] Added CI workflow to execute core suite on PRs and `master` pushes (`.github/workflows/core-suite.yml`).
+    - [ ] Wire branch protection to require `Core Regression Suite` before merge.
 
 - [ ] **S17: OpenClaw surface contract foundation**
   - **Goal:** Define normalized ingress event/session/routing contracts without changing core runtime behavior.
@@ -60,6 +64,7 @@
 - [ ] **S13: Persistence integrity + crash consistency**
 - [ ] **S14: Scheduler backpressure + bounded work per heartbeat**
 - [ ] **S15: Operator control plane hardening**
+- [ ] **S16: Regression gate for core flows (CI-grade)**
 
 ## Done
 

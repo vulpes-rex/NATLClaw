@@ -1,0 +1,15 @@
+tests/unit/test_scheduler.py::test_scheduler_records_backpressure_stats
+tests/unit/test_scheduler.py::test_scheduler_pause_control_skips_heartbeat_execution
+tests/unit/test_scheduler.py::test_scheduler_maintenance_control_skips_heartbeat_execution
+tests/unit/test_scheduler.py::test_scheduler_drain_control_exits_loop_without_running_heartbeat
+tests/unit/test_scheduler.py::test_scheduler_event_wakes_from_sleep
+tests/unit/test_tasks.py::TestLifecycle::test_answer_task
+tests/unit/test_tasks.py::TestLifecycle::test_retry_failed_task
+tests/unit/test_tasks.py::TestSchedulerIntegration::test_task_priority_ordering
+tests/integration/test_api.py::test_answer_task_replay_is_idempotent
+tests/integration/test_api.py::test_cancel_task_replay_is_idempotent
+tests/integration/test_api.py::test_retry_task_replay_is_idempotent
+tests/integration/test_api_server.py::test_operator_status_snapshot
+tests/integration/test_api_server.py::test_scheduler_pause_resume_endpoints
+tests/integration/test_api_server.py::test_scheduler_maintenance_enable_disable_endpoints
+tests/integration/test_api_server.py::test_scheduler_drain_endpoint_sets_flag

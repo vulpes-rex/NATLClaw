@@ -41,7 +41,7 @@ py-modules = [
     "copilot_auth", "daily_digest", "decision_engine", "dump_brain",
     "event_config", "event_watcher", "execution_log", "goals",
     "ingest", "learning", "messaging", "metrics", "persona_loader",
-    "project_context", "prompts", "scheduler", "second_brain",
+    "project_context", "prompts", "scheduler", "scheduler_control", "second_brain",
     "state", "tasks", "workflow",
 ]
 include-package-data = true
