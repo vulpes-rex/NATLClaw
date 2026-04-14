@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
 import signal
@@ -12,6 +13,7 @@ from typing import Callable, TypeVar, cast
 
 from agent_setup import create_agent
 from config import AppConfig
+from error_classification import classify_error_text
 from execution_log import set_db_path as _set_log_db_path
 from goals import auto_expire_goals, build_goals_block
 from learning import build_context_block
@@ -28,23 +30,20 @@ from second_brain import (
 from state import AgentState, load_state, save_state
 
 from messaging import (
+    append_message,
     build_inbox_summary,
     emit_alert,
-    emit_task_started,
     emit_task_timed_out,
+    extend_messages,
     load_outbox,
     prune_old_messages,
     save_outbox,
 )
 from tasks import (
-    assign_task,
     auto_timeout_tasks,
     find_task,
-    get_active_task,
-    get_pending_tasks,
     load_tasks,
     save_tasks,
-    start_task,
 )
 from workflow import run_heartbeat, run_task_heartbeat
 
@@ -100,6 +99,174 @@ def retry(max_attempts: int = 3, delay: float = 0.5, backoff: float = 2.0):
     return decorator
 
 logger = logging.getLogger(__name__)
+EVENT_WAKE_POLL_SEC = 0.5
+
+
+# ── Scheduler singleton lock ────────────────────────────────────────
+
+_LOCK_FILE: str | None = None
+
+
+def _lock_path(state_file: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(state_file)), "scheduler.lock")
+
+
+def get_scheduler_lock_info(state_file: str) -> dict[str, object]:
+    """Return diagnostic information for the scheduler lock file."""
+    path = _lock_path(state_file)
+    info: dict[str, object] = {
+        "path": path,
+        "exists": False,
+        "pid": None,
+        "pid_alive": None,
+        "stale": None,
+        "age_sec": None,
+        "malformed": False,
+    }
+    if not os.path.exists(path):
+        return info
+
+    info["exists"] = True
+    try:
+        stat = os.stat(path)
+        info["age_sec"] = max(0.0, time.time() - stat.st_mtime)
+    except OSError:
+        info["age_sec"] = None
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except (ValueError, OSError):
+        info["malformed"] = True
+        info["stale"] = True
+        return info
+
+    info["pid"] = pid
+    alive = _is_pid_alive(pid)
+    info["pid_alive"] = alive
+    info["stale"] = not alive
+    return info
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Check if a process with the given PID exists."""
+    if sys.platform == "win32":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x100000, False, pid)  # SYNCHRONIZE
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+
+def acquire_scheduler_lock(state_file: str) -> bool:
+    """Try to acquire the scheduler lock. Returns True if acquired."""
+    global _LOCK_FILE
+    path = _lock_path(state_file)
+
+    def _write_lock_file() -> bool:
+        """Atomically create lock file with the current process PID."""
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except OSError as e:
+            if e.errno == errno.EEXIST:
+                return False
+            logger.error("Failed to create scheduler lock: %s", e)
+            return False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+        except OSError as e:
+            logger.error("Failed to write scheduler lock: %s", e)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return False
+        return True
+
+    # Fast path: try atomic create first.
+    if _write_lock_file():
+        _LOCK_FILE = path
+        return True
+
+    # Existing lock file path. Check if stale and retry atomically.
+    try:
+        with open(path, encoding="utf-8") as f:
+            old_pid = int(f.read().strip())
+    except (ValueError, OSError):
+        old_pid = None
+
+    if old_pid is not None and _is_pid_alive(old_pid):
+        logger.warning("Scheduler already running (pid %d)", old_pid)
+        return False
+
+    try:
+        if old_pid is not None:
+            logger.warning("Removing stale lock file (pid %d dead)", old_pid)
+        else:
+            logger.warning("Removing malformed scheduler lock file")
+        os.unlink(path)
+    except OSError as e:
+        logger.warning("Could not remove existing scheduler lock %s: %s", path, e)
+        return False
+
+    if _write_lock_file():
+        _LOCK_FILE = path
+        return True
+    return False
+
+
+def release_scheduler_lock() -> None:
+    """Release the scheduler lock."""
+    global _LOCK_FILE
+    if _LOCK_FILE and os.path.exists(_LOCK_FILE):
+        try:
+            os.unlink(_LOCK_FILE)
+        except OSError:
+            pass
+    _LOCK_FILE = None
+
+
+async def _wait_for_event_or_timeout(
+    event_queue: asyncio.PriorityQueue[tuple[int, str, dict]],
+    *,
+    timeout_sec: float,
+    poll_interval_sec: float,
+    drain_pending_events_fn: Callable[[asyncio.PriorityQueue[tuple[int, str, dict]]], int],
+) -> tuple[int, str, dict] | None:
+    """Wait for an event while periodically draining cross-process pending events.
+
+    Returns:
+        Event tuple if one arrives before timeout, else ``None``.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while True:
+        drained = drain_pending_events_fn(event_queue)
+        if drained:
+            logger.info("Drained %d pending events during sleep", drained)
+
+        try:
+            return event_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+
+        wait_time = min(max(0.01, poll_interval_sec), remaining)
+        try:
+            return await asyncio.wait_for(event_queue.get(), timeout=wait_time)
+        except asyncio.TimeoutError:
+            continue
 
 
 async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_queue: asyncio.PriorityQueue[tuple[int, str, dict]] | None = None) -> None:
@@ -110,6 +277,9 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
         max_iterations: If > 0, stop after this many heartbeats (for testing).
         event_queue: Optional event queue to use. If None, a new one is created.
     """
+    if not acquire_scheduler_lock(config.state_file):
+        raise RuntimeError("Another scheduler is already running")
+
     # Create retry-wrapped I/O helpers once per scheduler invocation.
     # This resolves the current module-level references (which tests may
     # have patched) instead of capturing the originals at import time.
@@ -211,27 +381,14 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
             for tid in timed_out:
                 t = find_task(tasks, tid)
                 if t:
-                    outbox.append(emit_task_timed_out(
-                        t, persona=persona.name, heartbeat=state.execution_count,
-                    ))
+                    append_message(
+                        outbox,
+                        emit_task_timed_out(
+                            t, persona=persona.name, heartbeat=state.execution_count,
+                        ),
+                    )
             if timed_out:
                 logger.info("Auto-timed-out %d task(s): %s", len(timed_out), timed_out)
-
-            # Determine if there's a task to work on this cycle
-            active_task = get_active_task(tasks, persona.name)
-            if active_task is None:
-                pending = get_pending_tasks(tasks)
-                if pending:
-                    active_task = pending[0]
-                    assign_task(active_task, persona.name)
-                    start_task(active_task)
-                    outbox.append(emit_task_started(
-                        active_task, persona=persona.name, heartbeat=state.execution_count,
-                    ))
-                    logger.info(
-                        "Picked up task %s: %s (priority=%s)",
-                        active_task.id, active_task.title, active_task.priority,
-                    )
 
             # ── Daily digest: first heartbeat of a new day ───────
             from daily_digest import is_first_run_today, build_digest, save_digest
@@ -267,6 +424,7 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                     f"- Name: {current_project.name}\n"
                     f"- Language: {current_project.language}\n"
                     f"- Framework: {current_project.framework}\n"
+                    f"- Branch: {current_project.branch or 'unknown'}\n"
                     f"- Active work: {current_project.active_work or 'None'}\n"
                 )
             elif projects:
@@ -276,6 +434,7 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                     f"- Name: {p.name}\n"
                     f"- Language: {p.language}\n"
                     f"- Framework: {p.framework}\n"
+                    f"- Branch: {p.branch or 'unknown'}\n"
                     f"- Active work: {p.active_work or 'None'}\n"
                 )
 
@@ -292,18 +451,68 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                 + (f"\n\n{project_block}" if project_block else "")
             )
 
-            agent = create_agent(
-                config,
-                enriched_instructions,
-                tools=persona.tools,
-                mcp_servers=persona.mcp_servers,
+            # ── Decision engine ─────────────────────────────────────
+            from decision_engine import (
+                build_decision_context,
+                evaluate_heartbeat as evaluate_decision,
+                apply_decision,
+                record_decision,
+                record_decision_outcome,
+                update_consecutive_empty,
             )
+
+            # Drain queued events into a list for the decision context
+            pending_events: list[tuple[int, str, dict]] = []
+            while not event_queue.empty():
+                try:
+                    pending_events.append(event_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            decision_ctx = build_decision_context(
+                state, brain, tasks, outbox, pending_events, persona,
+            )
+            decision = evaluate_decision(decision_ctx, persona.decision_policy)
+            directives = apply_decision(
+                decision, state, brain, tasks, outbox, persona, config,
+            )
+            decision_note_id = record_decision(brain, decision, decision_ctx)
+
+            logger.info(
+                "Decision: %s (score=%.1f, reason=%s)",
+                decision.chosen.action.value,
+                decision.chosen.score,
+                decision.chosen.rationale,
+            )
+
+            active_task = directives.get("active_task")
+            skip_agent = directives.get("skip_agent", False)
+
+            if directives.get("extra_context"):
+                enriched_instructions += directives["extra_context"]
+            if directives.get("outbox_messages"):
+                extend_messages(outbox, directives["outbox_messages"])
+
+            if skip_agent:
+                update_consecutive_empty(state)
+                logger.info("Decision engine: SKIP_CYCLE — skipping agent this heartbeat")
+
+            if not skip_agent:
+                agent = create_agent(
+                    config,
+                    enriched_instructions,
+                    tools=persona.tools,
+                    mcp_servers=persona.mcp_servers,
+                )
 
             notes_before = len(brain.notes)
             conns_before = len(brain.connections)
+            had_error = False
 
             try:
-                if active_task:
+                if skip_agent:
+                    pass  # nothing to run
+                elif active_task:
                     logger.info(
                         "Working on task %s (%d/%d heartbeats): %s",
                         active_task.id, active_task.heartbeats_spent + 1,
@@ -319,7 +528,7 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                             agent, state, brain, config, persona, active_task,
                         )
                     if task_msgs:
-                        outbox.extend(task_msgs)
+                        extend_messages(outbox, task_msgs)
                 elif config.provider == "copilot":
                     async with agent:
                         await run_heartbeat(agent, state, brain, config, persona)
@@ -343,12 +552,38 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                 raise
             except asyncio.TimeoutError:
                 elapsed = time.monotonic() - cycle_start
-                logger.error("Heartbeat timed out after %.1f seconds", elapsed)
+                had_error = True
+                logger.error("Heartbeat timed out after %.1f seconds [error_type=timeout]", elapsed)
             except Exception as e:
                 elapsed = time.monotonic() - cycle_start
-                logger.error("Error during heartbeat #%d: %s", state.execution_count, str(e))
+                had_error = True
+                error_type = classify_error_text(str(e))
+                logger.error(
+                    "Error during heartbeat #%d: %s [error_type=%s]",
+                    state.execution_count,
+                    str(e),
+                    error_type,
+                )
                 logger.debug("Detailed error:", exc_info=True)
             finally:
+                # Record decision outcome for brain learning
+                try:
+                    new_notes_count = len(brain.notes) - notes_before
+                    if had_error:
+                        outcome = "error"
+                    elif elapsed > 120:
+                        outcome = "slow"
+                    elif skip_agent:
+                        outcome = "skipped"
+                    else:
+                        outcome = "success"
+                    record_decision_outcome(
+                        brain, decision_note_id, outcome,
+                        {"elapsed": round(elapsed, 1), "notes_created": new_notes_count},
+                    )
+                except Exception as rec_err:
+                    logger.debug("Failed to record decision outcome: %s", rec_err)
+
                 try:
                     await _save_state(state, config.state_file, config.max_history)
                 except Exception as e:
@@ -411,7 +646,14 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
 
             # ── Event-driven sleep: wait for event OR timeout ────
             try:
-                event = await asyncio.wait_for(event_queue.get(), timeout=interval)
+                event = await _wait_for_event_or_timeout(
+                    event_queue,
+                    timeout_sec=float(interval),
+                    poll_interval_sec=EVENT_WAKE_POLL_SEC,
+                    drain_pending_events_fn=drain_pending_events,
+                )
+                if event is None:
+                    continue
                 priority, event_type, payload = event
                 logger.info(
                     "Woke on event: %s (priority=%d, payload_keys=%s)",
@@ -441,5 +683,6 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                 logger.error("Error waiting for events: %s", str(e), exc_info=True)
 
     finally:
+        release_scheduler_lock()
         metrics_store.close()
         event_watcher.stop()

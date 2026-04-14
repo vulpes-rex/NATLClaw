@@ -323,6 +323,22 @@ class TestCrossProcessEvents:
         count = drain_pending_events(q)
         assert count == 1  # only the valid line
 
+    def test_drain_dedupes_identical_replayed_events(self, tmp_path, monkeypatch):
+        ndjson = tmp_path / "pending_events.ndjson"
+        monkeypatch.setattr(event_watcher, "_PENDING_EVENTS_FILE", ndjson)
+
+        enqueue_event("task_created", {"task_id": "t001"})
+        enqueue_event("task_created", {"task_id": "t001"})
+        enqueue_event("task_created", {"task_id": "t001"})
+
+        q = asyncio.PriorityQueue()
+        count = drain_pending_events(q)
+        assert count == 1
+        assert q.qsize() == 1
+        event = q.get_nowait()
+        assert event[1] == "task_created"
+        assert event[2] == {"task_id": "t001"}
+
     def test_push_event_nowait_includes_priority(self):
         """_push_event_nowait should produce (priority, event_type, payload) tuples."""
         q = asyncio.PriorityQueue(maxsize=10)

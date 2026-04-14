@@ -67,6 +67,7 @@ from second_brain import (
 from state import AgentState, load_state, save_state
 from tasks import (
     Task,
+    TaskTransitionError,
     answer_task,
     assign_task,
     auto_timeout_tasks,
@@ -86,6 +87,7 @@ from tasks import (
     save_tasks,
     start_task,
 )
+from operator_status import build_operator_status
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +169,25 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 logger.info("Brain vector index built: %d notes indexed", count)
         except Exception:
             logger.warning("Failed to build brain vector index on startup", exc_info=True)
+
+        # ── Auto-start scheduler as background asyncio task ──────
+        from scheduler import run_scheduler
+        scheduler_task = asyncio.create_task(
+            run_scheduler(config), name="natl-scheduler",
+        )
+        app.state.scheduler_task = scheduler_task
+        logger.info("Scheduler auto-started as background task")
+
         yield
+
+        # ── Shutdown: cancel scheduler ───────────────────────────
+        if not scheduler_task.done():
+            scheduler_task.cancel()
+            try:
+                await scheduler_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        logger.info("Scheduler stopped")
 
     app = FastAPI(
         title="NATLClaw API",
@@ -204,7 +224,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     # Share state across requests via app.state
     app.state.config = config
     app.state.sessions: dict[str, Any] = {}  # model -> AgentSession
-    app.state.scheduler_proc: subprocess.Popen | None = None
+    app.state.scheduler_task: asyncio.Task | None = None
     app.state.report_proc: subprocess.Popen | None = None
 
     # Initialise execution log DB path
@@ -417,11 +437,18 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         task = find_task(tasks, task_id)
         if task is None:
             raise HTTPException(404, f"Task '{task_id}' not found")
-        if task.status != "blocked":
-            raise HTTPException(409, f"Task is not blocked (status={task.status})")
-        answer_task(task, req.answer)
+        if (
+            task.status in ("assigned", "in_progress")
+            and task.answers
+            and task.answers[-1].get("answer", "") == req.answer
+        ):
+            return {"id": task.id, "status": task.status, "idempotent": True}
+        try:
+            answer_task(task, req.answer)
+        except TaskTransitionError as exc:
+            raise HTTPException(409, str(exc)) from exc
         await save_tasks(tasks, config.state_file)
-        return {"id": task.id, "status": task.status}
+        return {"id": task.id, "status": task.status, "idempotent": False}
 
     @app.post("/api/tasks/{task_id}/cancel")
     async def api_cancel_task(task_id: str, req: TaskCancelRequest | None = None):
@@ -429,11 +456,16 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         task = find_task(tasks, task_id)
         if task is None:
             raise HTTPException(404, f"Task '{task_id}' not found")
-        if task.status in ("completed", "failed"):
-            raise HTTPException(409, f"Task is already terminal (status={task.status})")
-        cancel_task(task, reason=req.reason if req else "")
+        if task.status == "failed" and any(
+            note.startswith("CANCELLED") for note in task.progress_notes
+        ):
+            return {"id": task.id, "status": task.status, "idempotent": True}
+        try:
+            cancel_task(task, reason=req.reason if req else "")
+        except TaskTransitionError as exc:
+            raise HTTPException(409, str(exc)) from exc
         await save_tasks(tasks, config.state_file)
-        return {"id": task.id, "status": task.status}
+        return {"id": task.id, "status": task.status, "idempotent": False}
 
     @app.post("/api/tasks/{task_id}/retry")
     async def api_retry_task(task_id: str):
@@ -441,11 +473,16 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         task = find_task(tasks, task_id)
         if task is None:
             raise HTTPException(404, f"Task '{task_id}' not found")
-        if task.status not in ("failed", "blocked"):
-            raise HTTPException(409, f"Task cannot be retried (status={task.status})")
-        retry_task(task)
+        if task.status == "pending" and any(
+            note == "RETRIED by developer" for note in task.progress_notes
+        ):
+            return {"id": task.id, "status": task.status, "idempotent": True}
+        try:
+            retry_task(task)
+        except TaskTransitionError as exc:
+            raise HTTPException(409, str(exc)) from exc
         await save_tasks(tasks, config.state_file)
-        return {"id": task.id, "status": task.status}
+        return {"id": task.id, "status": task.status, "idempotent": False}
 
     # ── Brain endpoints ──────────────────────────────────────────
 
@@ -645,6 +682,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         from scheduler import run_scheduler
         try:
             await run_scheduler(config, max_iterations=1)
+        except RuntimeError as exc:
+            if "already running" in str(exc).lower():
+                raise HTTPException(409, "Scheduler is already running") from exc
+            raise HTTPException(500, str(exc)) from exc
         except Exception as exc:
             raise HTTPException(500, str(exc)) from exc
         return {"status": "completed", "iterations": 1}
@@ -682,6 +723,11 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "last_heartbeat": state.last_heartbeat,
         }
 
+    @app.get("/api/status")
+    async def api_status():
+        task = getattr(app.state, "scheduler_task", None)
+        return await build_operator_status(config, scheduler_task=task)
+
     # ── Heartbeat status & log ───────────────────────────────────
 
     @app.get("/api/heartbeat/status")
@@ -702,13 +748,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         else:
             status = "never_run"
 
-        proc = app.state.scheduler_proc
-        scheduler_running = False
-        if proc is not None:
-            if proc.poll() is None:
-                scheduler_running = True
-            else:
-                app.state.scheduler_proc = None
+        task = getattr(app.state, "scheduler_task", None)
+        scheduler_running = task is not None and not task.done()
 
         return {
             "status": status,
@@ -747,51 +788,47 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
     @app.post("/api/scheduler/start")
     async def api_scheduler_start():
-        proc = app.state.scheduler_proc
-        if proc is not None and proc.poll() is None:
-            return {"status": "already_running", "pid": proc.pid}
-        cmd = [sys.executable, "-m", "cli", "run"]
-        try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                cwd=os.path.dirname(os.path.abspath(__file__)),
-                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-            )
-            app.state.scheduler_proc = proc
-            return {"status": "started", "pid": proc.pid}
-        except Exception as e:
-            raise HTTPException(500, f"Failed to start scheduler: {e}")
+        task = getattr(app.state, "scheduler_task", None)
+        if task is not None and not task.done():
+            return {"status": "already_running"}
+        from scheduler import run_scheduler
+        task = asyncio.create_task(
+            run_scheduler(config), name="natl-scheduler",
+        )
+        app.state.scheduler_task = task
+        return {"status": "started"}
 
     @app.post("/api/scheduler/stop")
     async def api_scheduler_stop():
-        proc = app.state.scheduler_proc
-        if proc is None or proc.poll() is not None:
-            app.state.scheduler_proc = None
+        task = getattr(app.state, "scheduler_task", None)
+        if task is None or task.done():
+            app.state.scheduler_task = None
             return {"status": "not_running"}
+        task.cancel()
         try:
-            if sys.platform == "win32":
-                proc.send_signal(signal.CTRL_BREAK_EVENT)
-            else:
-                proc.terminate()
-            proc.wait(timeout=10)
-            app.state.scheduler_proc = None
-            return {"status": "stopped"}
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            app.state.scheduler_proc = None
-            return {"status": "killed"}
-        except Exception as e:
-            raise HTTPException(500, f"Failed to stop scheduler: {e}")
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        app.state.scheduler_task = None
+        return {"status": "stopped"}
 
     @app.get("/api/scheduler/status")
     async def api_scheduler_status():
-        proc = app.state.scheduler_proc
-        if proc is None:
-            return {"running": False, "pid": None}
-        if proc.poll() is None:
-            return {"running": True, "pid": proc.pid}
-        app.state.scheduler_proc = None
-        return {"running": False, "pid": None, "exit_code": proc.returncode}
+        from scheduler import get_scheduler_lock_info
+        lock_info = get_scheduler_lock_info(config.state_file)
+        task = getattr(app.state, "scheduler_task", None)
+        if task is None:
+            return {"running": False, "lock": lock_info}
+        if not task.done():
+            return {"running": True, "lock": lock_info}
+        # Task finished (error or completed) — clean up
+        app.state.scheduler_task = None
+        exc = task.exception() if not task.cancelled() else None
+        return {
+            "running": False,
+            "lock": lock_info,
+            "error": str(exc) if exc else None,
+        }
 
     # ── Report endpoints ─────────────────────────────────────────
 

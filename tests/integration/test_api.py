@@ -16,7 +16,10 @@ from fastapi.testclient import TestClient
 from api_server import create_app
 from config import AppConfig
 from messaging import Message, save_outbox
-from tasks import Task, save_tasks
+from tasks import Task, load_tasks, save_tasks
+from workflow import run_task_heartbeat
+from second_brain import BrainState
+from state import AgentState
 
 _SECRET_FIELDS = frozenset({
     "openai_api_key", "github_pat", "openrouter_api_key", "azure_openai_api_key",
@@ -115,6 +118,20 @@ def test_answer_non_blocked_task(client):
     assert r.status_code == 409
 
 
+def test_answer_task_replay_is_idempotent(client, state_file):
+    task = Task(title="Blocked task", status="blocked")
+    task.questions.append({"question": "Which DB?", "timestamp": "t"})
+    asyncio.run(save_tasks([task], state_file))
+
+    r1 = client.post(f"/api/tasks/{task.id}/answer", json={"answer": "PostgreSQL"})
+    assert r1.status_code == 200
+    assert r1.json()["idempotent"] is False
+
+    r2 = client.post(f"/api/tasks/{task.id}/answer", json={"answer": "PostgreSQL"})
+    assert r2.status_code == 200
+    assert r2.json()["idempotent"] is True
+
+
 def test_cancel_task(client):
     r = client.post("/api/tasks", json={"title": "To be cancelled"})
     task_id = r.json()["id"]
@@ -122,6 +139,19 @@ def test_cancel_task(client):
     r = client.post(f"/api/tasks/{task_id}/cancel", json={"reason": "no longer needed"})
     assert r.status_code == 200
     assert r.json()["status"] == "failed"
+
+
+def test_cancel_task_replay_is_idempotent(client):
+    r = client.post("/api/tasks", json={"title": "To be cancelled"})
+    task_id = r.json()["id"]
+
+    r1 = client.post(f"/api/tasks/{task_id}/cancel", json={"reason": "no longer needed"})
+    assert r1.status_code == 200
+    assert r1.json()["idempotent"] is False
+
+    r2 = client.post(f"/api/tasks/{task_id}/cancel", json={"reason": "no longer needed"})
+    assert r2.status_code == 200
+    assert r2.json()["idempotent"] is True
 
 
 def test_cancel_terminal_task(client, state_file):
@@ -141,11 +171,63 @@ def test_retry_failed_task(client, state_file):
     assert r.json()["status"] == "pending"
 
 
+def test_retry_task_replay_is_idempotent(client, state_file):
+    task = Task(title="Retry me", status="failed")
+    asyncio.run(save_tasks([task], state_file))
+
+    r1 = client.post(f"/api/tasks/{task.id}/retry")
+    assert r1.status_code == 200
+    assert r1.json()["idempotent"] is False
+
+    r2 = client.post(f"/api/tasks/{task.id}/retry")
+    assert r2.status_code == 200
+    assert r2.json()["idempotent"] is True
+
+
 def test_retry_pending_task(client):
     r = client.post("/api/tasks", json={"title": "Pending"})
     task_id = r.json()["id"]
     r = client.post(f"/api/tasks/{task_id}/retry")
     assert r.status_code == 409
+
+
+def test_blocked_answered_resumed_to_terminal_round_trip(client, state_file):
+    task = Task(title="Round trip", status="blocked", assigned_to="default")
+    task.questions.append({"question": "Need API URL?", "timestamp": "t"})
+    asyncio.run(save_tasks([task], state_file))
+
+    r = client.post(f"/api/tasks/{task.id}/answer", json={"answer": "Use https://api.example.com"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "assigned"
+
+    tasks_after_answer = asyncio.run(load_tasks(state_file))
+    resumed = next(t for t in tasks_after_answer if t.id == task.id)
+    assert resumed.status == "assigned"
+    assert resumed.answers[-1]["answer"].startswith("Use https://")
+
+    class _Agent:
+        def __init__(self):
+            self._responses = [
+                "Plan: update endpoint setting",
+                "Applied endpoint and validated requests",
+                "DONE\n- config.py\n- tests/integration/test_api.py",
+                '{"topic":"endpoint configured","content":"Task completed after developer answer","tags":["api"],"category":"projects"}',
+            ]
+
+        async def run(self, _prompt):
+            class _Resp:
+                def __init__(self, text):
+                    self.text = text
+            return _Resp(self._responses.pop(0))
+
+    state = AgentState(execution_count=1)
+    brain = BrainState()
+    cfg = AppConfig(state_file=state_file)
+    persona = type("P", (), {"name": "default"})()
+
+    asyncio.run(run_task_heartbeat(_Agent(), state, brain, cfg, persona, resumed))
+    assert resumed.status == "completed"
+    assert resumed.completed_at is not None
 
 
 # ── Inbox ──────────────────────────────────────────────────────────────

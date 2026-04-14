@@ -28,6 +28,7 @@ with patch.dict("sys.modules", {
     from config import AppConfig, validate_config
     from metrics import MetricsStore, JsonFormatter
     from second_brain import BrainState, add_note, assign_note_to_topic, load_brain, relate_topics, save_brain
+    from tasks import Task, save_tasks
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -63,6 +64,11 @@ class TestCLIParser:
         parser = build_parser()
         args = parser.parse_args(["run", "--once"])
         assert args.once
+
+    def test_status_subcommand(self):
+        parser = build_parser()
+        args = parser.parse_args(["status"])
+        assert args.command == "status"
 
     def test_brain_stats_subcommand(self):
         parser = build_parser()
@@ -204,6 +210,120 @@ class TestCLIBrainCommands:
 
         out = capsys.readouterr().out
         assert "warning" in out.lower() or "info" in out.lower()
+
+
+class TestCLIStatusCommand:
+    def test_status_output(self, capsys):
+        config = _fresh_config()
+        args = MagicMock()
+
+        snapshot = {
+            "scheduler": {"running": True, "in_process_task_running": False},
+            "heartbeat": {
+                "status": "active",
+                "count": 12,
+                "last": "2026-01-01T00:00:00+00:00",
+                "seconds_ago": 2.5,
+            },
+            "tasks": {
+                "total": 3,
+                "blocked_count": 1,
+                "active": {
+                    "id": "t123",
+                    "title": "Fix login",
+                    "status": "in_progress",
+                    "priority": "high",
+                    "heartbeats_spent": 2,
+                    "max_heartbeats": 10,
+                },
+                "sla": {
+                    "at_risk_count": 1,
+                    "breached_count": 0,
+                    "oldest_pending_age_sec": 123.4,
+                },
+            },
+            "inbox": {"unread_count": 2, "requires_response_count": 1},
+            "errors": {
+                "recent_error_count": 1,
+                "last_error": {"step": "task_execute", "timestamp": "ts"},
+                "top_error_types": [{"type": "network", "count": 1}],
+            },
+            "reliability": {
+                "status": "healthy",
+                "window_heartbeats": 12,
+                "recent_error_count": 1,
+                "error_rate": 0.083,
+                "stale_lock": False,
+                "reasons": [],
+            },
+        }
+
+        async def _status(*_a, **_kw):
+            return snapshot
+
+        with patch("operator_status.build_operator_status", side_effect=_status):
+            cli_mod.cmd_status(args, config)
+
+        out = capsys.readouterr().out
+        assert "Operator Status" in out
+        assert "Scheduler: RUNNING" in out
+        assert "Heartbeat: active" in out
+        assert "Active task:" in out
+        assert "Blocked tasks: 1" in out
+        assert "SLA risk: at_risk=1 | breached=0" in out
+        assert "Top error types: network=1" in out
+        assert "Soak reliability: healthy" in out
+
+
+class TestCLITaskIdempotency:
+    def test_task_answer_replay_is_noop(self, capsys, tmp_path):
+        config = _fresh_config(state_file=str(tmp_path / "state.json"))
+        task = Task(title="Blocked task", status="blocked")
+        task.questions.append({"question": "Which DB?", "timestamp": "t"})
+        asyncio.run(save_tasks([task], config.state_file))
+
+        first = MagicMock(task_id=task.id, answer="PostgreSQL")
+        second = MagicMock(task_id=task.id, answer="PostgreSQL")
+
+        with patch("event_watcher.enqueue_event"):
+            cli_mod.cmd_task_answer(first, config)
+            cli_mod.cmd_task_answer(second, config)
+
+        out = capsys.readouterr().out
+        assert "Answered task" in out
+        assert "No-op: task" in out
+
+    def test_task_cancel_replay_is_noop(self, capsys, tmp_path):
+        config = _fresh_config(state_file=str(tmp_path / "state.json"))
+        task = Task(title="Cancel me", status="pending")
+        asyncio.run(save_tasks([task], config.state_file))
+
+        first = MagicMock(task_id=task.id, reason="duplicate call")
+        second = MagicMock(task_id=task.id, reason="duplicate call")
+
+        with patch("event_watcher.enqueue_event"):
+            cli_mod.cmd_task_cancel(first, config)
+            cli_mod.cmd_task_cancel(second, config)
+
+        out = capsys.readouterr().out
+        assert "Cancelled task" in out
+        assert "No-op: task" in out
+
+    def test_task_retry_replay_is_noop(self, capsys, tmp_path):
+        config = _fresh_config(state_file=str(tmp_path / "state.json"))
+        task = Task(title="Retry me", status="failed")
+        asyncio.run(save_tasks([task], config.state_file))
+
+        first = MagicMock(task_id=task.id)
+        second = MagicMock(task_id=task.id)
+
+        with patch("event_watcher.enqueue_event"):
+            cli_mod.cmd_task_retry(first, config)
+            cli_mod.cmd_task_retry(second, config)
+
+        out = capsys.readouterr().out
+        assert "Retried task" in out
+        assert "No-op: task" in out
 
     def test_brain_export_to_stdout(self, capsys):
         brain = _fresh_brain()

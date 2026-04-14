@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 import pytest
 import sys
 from unittest.mock import MagicMock, patch, AsyncMock
@@ -16,8 +18,16 @@ sys.modules['agent_framework.openai'] = MagicMock()
 sys.modules['agent_framework.ollama'] = MagicMock()
 sys.modules['azure.identity'] = MagicMock()
 
-from scheduler import retry, run_scheduler
+from scheduler import (
+    retry,
+    run_scheduler,
+    _wait_for_event_or_timeout,
+    acquire_scheduler_lock,
+    get_scheduler_lock_info,
+    release_scheduler_lock,
+)
 from config import AppConfig
+from project_context import Project
 from state import AgentState, load_state, save_state
 from second_brain import BrainState, load_brain, save_brain
 
@@ -258,6 +268,18 @@ def _make_scheduler_config(**overrides):
     return config
 
 
+def _mock_decision_directives():
+    """Build a default apply_decision return value for scheduler tests."""
+    return {
+        "action": "run_heartbeat",
+        "active_task": None,
+        "workflow_override": None,
+        "skip_agent": False,
+        "extra_context": "",
+        "outbox_messages": [],
+    }
+
+
 def _scheduler_patches(mock_heartbeat, mock_persona=None):
     """Return a contextmanager that applies all standard scheduler mocks."""
     from contextlib import contextmanager
@@ -269,23 +291,44 @@ def _scheduler_patches(mock_heartbeat, mock_persona=None):
     mock_watcher.start = MagicMock()
     mock_watcher.stop = MagicMock()
 
+    # Decision engine mocks
+    mock_decision = MagicMock()
+    mock_decision.chosen.action.value = "run_heartbeat"
+    mock_decision.chosen.score = 50.0
+    mock_decision.chosen.rationale = "test"
+    mock_decision.supplementary_actions = []
+
     @contextmanager
     def ctx():
-        with patch("scheduler.load_persona", return_value=mock_persona), \
-             patch("scheduler.load_state", new_callable=AsyncMock, return_value=AgentState()), \
-             patch("scheduler.load_brain", new_callable=AsyncMock, return_value=BrainState()), \
-             patch("scheduler.save_state", new_callable=AsyncMock), \
-             patch("scheduler.save_brain", new_callable=AsyncMock), \
-             patch("scheduler.load_tasks", new_callable=AsyncMock, return_value=[]), \
-             patch("scheduler.save_tasks", new_callable=AsyncMock), \
-             patch("scheduler.load_outbox", new_callable=AsyncMock, return_value=[]), \
-             patch("scheduler.save_outbox", new_callable=AsyncMock), \
-             patch("scheduler.load_projects", new_callable=AsyncMock, return_value=[]), \
-             patch("scheduler.detect_and_save_project", return_value=None), \
-             patch("scheduler.create_agent", return_value=MagicMock()), \
-             patch("scheduler.run_heartbeat", mock_heartbeat), \
-             patch("event_watcher.EventWatcher", return_value=mock_watcher), \
-             patch("event_watcher.drain_pending_events", return_value=0):
+        from contextlib import ExitStack
+        patches = [
+            patch("scheduler.load_persona", return_value=mock_persona),
+            patch("scheduler.load_state", new_callable=AsyncMock, return_value=AgentState()),
+            patch("scheduler.load_brain", new_callable=AsyncMock, return_value=BrainState()),
+            patch("scheduler.save_state", new_callable=AsyncMock),
+            patch("scheduler.save_brain", new_callable=AsyncMock),
+            patch("scheduler.load_tasks", new_callable=AsyncMock, return_value=[]),
+            patch("scheduler.save_tasks", new_callable=AsyncMock),
+            patch("scheduler.load_outbox", new_callable=AsyncMock, return_value=[]),
+            patch("scheduler.save_outbox", new_callable=AsyncMock),
+            patch("scheduler.load_projects", new_callable=AsyncMock, return_value=[]),
+            patch("scheduler.detect_and_save_project", return_value=None),
+            patch("scheduler.create_agent", return_value=MagicMock()),
+            patch("scheduler.run_heartbeat", mock_heartbeat),
+            patch("decision_engine.build_decision_context", return_value=MagicMock()),
+            patch("decision_engine.evaluate_heartbeat", return_value=mock_decision),
+            patch("decision_engine.apply_decision", return_value=_mock_decision_directives()),
+            patch("decision_engine.record_decision", return_value="mock-note-id"),
+            patch("decision_engine.record_decision_outcome"),
+            patch("decision_engine.update_consecutive_empty"),
+            patch("scheduler.acquire_scheduler_lock", return_value=True),
+            patch("scheduler.release_scheduler_lock"),
+            patch("event_watcher.EventWatcher", return_value=mock_watcher),
+            patch("event_watcher.drain_pending_events", return_value=0),
+        ]
+        with ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
             yield
     return ctx()
 
@@ -376,6 +419,87 @@ def test_retry_decorator_with_negative_attempts():
         asyncio.run(func())
 
 
+# ── Scheduler lock reliability tests ───────────────────────────────────
+
+
+def test_scheduler_lock_prevents_duplicate_instances(tmp_path):
+    """Second lock acquire should fail while first scheduler holds lock."""
+    state_file = str(tmp_path / "state.json")
+    try:
+        assert acquire_scheduler_lock(state_file) is True
+        with patch("scheduler._is_pid_alive", return_value=True):
+            assert acquire_scheduler_lock(state_file) is False
+    finally:
+        release_scheduler_lock()
+
+
+def test_scheduler_lock_recovers_from_stale_pid(tmp_path):
+    """Stale PID lock should be removed and replaced atomically."""
+    state_file = str(tmp_path / "state.json")
+    lock_file = tmp_path / "scheduler.lock"
+    lock_file.write_text("999999", encoding="utf-8")
+
+    try:
+        with patch("scheduler._is_pid_alive", return_value=False):
+            assert acquire_scheduler_lock(state_file) is True
+
+        assert lock_file.exists()
+        assert lock_file.read_text(encoding="utf-8").strip() == str(os.getpid())
+    finally:
+        release_scheduler_lock()
+
+
+def test_scheduler_lock_recovers_from_malformed_file(tmp_path):
+    """Malformed lock file content should not block scheduler startup."""
+    state_file = str(tmp_path / "state.json")
+    lock_file = tmp_path / "scheduler.lock"
+    lock_file.write_text("not-a-pid", encoding="utf-8")
+
+    try:
+        assert acquire_scheduler_lock(state_file) is True
+        assert lock_file.read_text(encoding="utf-8").strip() == str(os.getpid())
+    finally:
+        release_scheduler_lock()
+
+
+def test_get_scheduler_lock_info_reports_missing_lock(tmp_path):
+    """Lock diagnostics should report no lock when file is absent."""
+    state_file = str(tmp_path / "state.json")
+    info = get_scheduler_lock_info(state_file)
+    assert info["exists"] is False
+    assert info["pid"] is None
+    assert info["pid_alive"] is None
+    assert info["stale"] is None
+
+
+def test_get_scheduler_lock_info_reports_active_lock(tmp_path):
+    """Lock diagnostics should expose lock pid and liveness."""
+    state_file = str(tmp_path / "state.json")
+    try:
+        assert acquire_scheduler_lock(state_file) is True
+        info = get_scheduler_lock_info(state_file)
+        assert info["exists"] is True
+        assert info["pid"] == os.getpid()
+        assert info["pid_alive"] is True
+        assert info["stale"] is False
+    finally:
+        release_scheduler_lock()
+
+
+def test_get_scheduler_lock_info_reports_malformed_lock(tmp_path):
+    """Malformed lock files should be flagged as stale/malformed diagnostics."""
+    state_file = str(tmp_path / "state.json")
+    lock_file = tmp_path / "scheduler.lock"
+    lock_file.write_text("not-a-pid", encoding="utf-8")
+
+    info = get_scheduler_lock_info(state_file)
+    assert info["exists"] is True
+    assert info["pid"] is None
+    assert info["pid_alive"] is None
+    assert info["stale"] is True
+    assert info["malformed"] is True
+
+
 # ── Event-driven scheduler tests ──────────────────────────────────────
 
 
@@ -411,3 +535,76 @@ def test_scheduler_event_wakes_from_sleep():
         asyncio.run(run_scheduler(config, max_iterations=2, event_queue=q))
 
     assert mock_heartbeat.call_count >= 1
+
+
+def test_scheduler_injects_project_branch_and_active_work_into_agent_instructions():
+    """Scheduler should pass branch + active-work project context into create_agent."""
+    config = _make_scheduler_config(provider="foundry")
+    mock_heartbeat = AsyncMock()
+    q = _make_event_queue()
+
+    current_project = Project(
+        path=".",
+        name="NATLClaw",
+        language="python",
+        framework="setuptools",
+        branch="feature/s11-context",
+        active_work="Working on scheduler context accuracy",
+    )
+
+    with _scheduler_patches(mock_heartbeat), \
+         patch("scheduler.detect_and_save_project", return_value=current_project), \
+         patch("scheduler.create_agent", return_value=MagicMock()) as mock_create_agent:
+        asyncio.run(run_scheduler(config, max_iterations=1, event_queue=q))
+
+    assert mock_create_agent.called
+    enriched_instructions = mock_create_agent.call_args[0][1]
+    assert "Project Context:" in enriched_instructions
+    assert "- Branch: feature/s11-context" in enriched_instructions
+    assert "Working on scheduler context accuracy" in enriched_instructions
+
+
+def test_wait_for_event_or_timeout_returns_none_when_timeout():
+    """Helper returns None if no in-memory or pending-file events arrive."""
+    q = asyncio.PriorityQueue()
+
+    async def _run():
+        return await _wait_for_event_or_timeout(
+            q,
+            timeout_sec=0.05,
+            poll_interval_sec=0.01,
+            drain_pending_events_fn=lambda _q: 0,
+        )
+
+    result = asyncio.run(_run())
+    assert result is None
+
+
+def test_wait_for_event_or_timeout_drains_pending_events_file(tmp_path, monkeypatch):
+    """Pending file events should wake scheduler without waiting full timeout."""
+    from event_watcher import drain_pending_events, enqueue_event
+
+    monkeypatch.chdir(tmp_path)
+    q = asyncio.PriorityQueue()
+
+    async def _emit_later():
+        await asyncio.sleep(0.05)
+        enqueue_event("task_created", {"task_id": "t-file"})
+
+    async def _run():
+        emit_task = asyncio.create_task(_emit_later())
+        start = time.monotonic()
+        event = await _wait_for_event_or_timeout(
+            q,
+            timeout_sec=1.0,
+            poll_interval_sec=0.02,
+            drain_pending_events_fn=drain_pending_events,
+        )
+        elapsed = time.monotonic() - start
+        await emit_task
+        return event, elapsed
+
+    event, elapsed = asyncio.run(_run())
+    assert event is not None
+    assert event[1] == "task_created"
+    assert elapsed < 0.5, f"event wake-up took too long: {elapsed:.3f}s"

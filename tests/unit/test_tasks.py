@@ -4,11 +4,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from unittest.mock import patch
 
 import pytest
 
 from tasks import (
     Task,
+    TaskTransitionError,
     answer_task,
     assign_task,
     auto_timeout_tasks,
@@ -87,6 +89,7 @@ class TestLifecycle:
 
     def test_advance_task(self):
         t = create_task("Work")
+        assign_task(t, "dev")
         start_task(t)
         advance_task(t, "Made progress on step 1")
         assert t.heartbeats_spent == 1
@@ -94,11 +97,14 @@ class TestLifecycle:
 
     def test_advance_task_truncates_long_notes(self):
         t = create_task("Work")
+        assign_task(t, "dev")
+        start_task(t)
         advance_task(t, "x" * 1000)
         assert len(t.progress_notes[0]) == 500
 
     def test_block_task(self):
         t = create_task("Work")
+        assign_task(t, "dev")
         start_task(t)
         block_task(t, "Which database?", heartbeat_number=3)
         assert t.status == "blocked"
@@ -108,6 +114,7 @@ class TestLifecycle:
 
     def test_answer_task(self):
         t = create_task("Work")
+        assign_task(t, "dev")
         start_task(t)
         block_task(t, "Which DB?")
         answer_task(t, "PostgreSQL")
@@ -117,6 +124,7 @@ class TestLifecycle:
 
     def test_complete_task(self):
         t = create_task("Work")
+        assign_task(t, "dev")
         start_task(t)
         complete_task(t, deliverables=["src/main.py", "tests/test_main.py"])
         assert t.status == "completed"
@@ -125,12 +133,15 @@ class TestLifecycle:
 
     def test_complete_task_no_deliverables(self):
         t = create_task("Work")
+        assign_task(t, "dev")
+        start_task(t)
         complete_task(t)
         assert t.status == "completed"
         assert t.deliverables == []
 
     def test_fail_task(self):
         t = create_task("Work")
+        assign_task(t, "dev")
         start_task(t)
         fail_task(t, "API key missing")
         assert t.status == "failed"
@@ -158,23 +169,24 @@ class TestLifecycle:
         assert t.status == "failed"
         assert any("CANCELLED by developer" in n for n in t.progress_notes)
 
-    def test_cancel_task_noop_on_completed(self):
+    def test_cancel_task_raises_on_completed(self):
         t = create_task("Work")
+        assign_task(t, "dev")
+        start_task(t)
         complete_task(t)
-        original_at = t.completed_at
-        cancel_task(t, "too late")
-        assert t.status == "completed"  # unchanged
-        assert t.completed_at == original_at
+        with pytest.raises(TaskTransitionError):
+            cancel_task(t, "too late")
 
-    def test_cancel_task_noop_on_failed(self):
+    def test_cancel_task_raises_on_failed(self):
         t = create_task("Work")
         fail_task(t, "boom")
-        cancel_task(t, "try cancel")
-        # Should remain failed — cancel is a no-op on terminal states
+        with pytest.raises(TaskTransitionError):
+            cancel_task(t, "try cancel")
         assert any("FAILED: boom" in n for n in t.progress_notes)
 
     def test_cancel_blocked_task(self):
         t = create_task("Work")
+        assign_task(t, "dev")
         start_task(t)
         block_task(t, "Need info")
         cancel_task(t, "Giving up")
@@ -197,6 +209,7 @@ class TestLifecycle:
 
     def test_retry_blocked_task(self):
         t = create_task("Work")
+        assign_task(t, "dev")
         start_task(t)
         block_task(t, "Need DB creds")
         retry_task(t)
@@ -205,6 +218,7 @@ class TestLifecycle:
 
     def test_retry_preserves_progress_notes(self):
         t = create_task("Work")
+        assign_task(t, "dev")
         start_task(t)
         advance_task(t, "Made progress")
         fail_task(t, "oops")
@@ -214,11 +228,44 @@ class TestLifecycle:
         assert any("RETRIED" in n for n in t.progress_notes)
 
 
+    def test_invalid_assign_requires_pending(self):
+        t = create_task("Work")
+        assign_task(t, "dev")
+        with pytest.raises(TaskTransitionError):
+            assign_task(t, "dev2")
+
+    def test_invalid_start_requires_assigned_or_in_progress(self):
+        t = create_task("Work")
+        with pytest.raises(TaskTransitionError):
+            start_task(t)
+
+    def test_invalid_block_requires_in_progress(self):
+        t = create_task("Work")
+        with pytest.raises(TaskTransitionError):
+            block_task(t, "Need info")
+
+    def test_invalid_answer_requires_blocked(self):
+        t = create_task("Work")
+        with pytest.raises(TaskTransitionError):
+            answer_task(t, "Any answer")
+
+    def test_invalid_complete_requires_in_progress(self):
+        t = create_task("Work")
+        with pytest.raises(TaskTransitionError):
+            complete_task(t)
+
+    def test_invalid_retry_requires_failed_or_blocked(self):
+        t = create_task("Work")
+        with pytest.raises(TaskTransitionError):
+            retry_task(t)
+
+
 # ── Auto-timeout ──────────────────────────────────────────────────────
 
 class TestAutoTimeout:
     def test_times_out_exceeded_tasks(self):
         t = create_task("Work", max_heartbeats=3)
+        assign_task(t, "dev")
         start_task(t)
         t.heartbeats_spent = 3
         timed_out = auto_timeout_tasks([t])
@@ -227,6 +274,7 @@ class TestAutoTimeout:
 
     def test_does_not_timeout_under_limit(self):
         t = create_task("Work", max_heartbeats=5)
+        assign_task(t, "dev")
         start_task(t)
         t.heartbeats_spent = 4
         timed_out = auto_timeout_tasks([t])
@@ -236,6 +284,8 @@ class TestAutoTimeout:
     def test_ignores_completed_tasks(self):
         t = create_task("Work", max_heartbeats=1)
         t.heartbeats_spent = 5
+        assign_task(t, "dev")
+        start_task(t)
         complete_task(t)
         timed_out = auto_timeout_tasks([t])
         assert timed_out == []
@@ -249,9 +299,11 @@ class TestQueryHelpers:
         t2 = create_task("Urgent", priority="urgent")
         t3 = create_task("Medium", priority="medium")
         t4 = create_task("In progress")
+        assign_task(t4, "dev")
         start_task(t4)
         t4.assigned_to = "dev"
         t5 = create_task("Blocked")
+        assign_task(t5, "dev")
         start_task(t5)
         block_task(t5, "Need info")
         return [t1, t2, t3, t4, t5]
@@ -360,6 +412,7 @@ class TestDisplay:
     def test_format_task_list_shows_all(self):
         t1 = create_task("A")
         t2 = create_task("B")
+        assign_task(t2, "dev")
         start_task(t2)
         output = format_task_list([t1, t2])
         assert "A" in output
@@ -368,6 +421,8 @@ class TestDisplay:
     def test_format_task_list_filters_by_status(self):
         t1 = create_task("Pending")
         t2 = create_task("Done")
+        assign_task(t2, "dev")
+        start_task(t2)
         complete_task(t2)
         output = format_task_list([t1, t2], status_filter="completed")
         assert "Done" in output
@@ -418,6 +473,38 @@ class TestSchedulerIntegration:
         assert pending[1].priority == "high"
         assert pending[2].priority == "low"
 
+    def test_task_fairness_old_low_priority_promotes_over_new_high(self):
+        """A very old low-priority task should be promoted to avoid starvation."""
+        old_low = create_task("Old low", priority="low")
+        old_low.created_at = "2026-01-01T00:00:00+00:00"
+        new_high = create_task("New high", priority="high")
+        new_high.created_at = "2026-01-04T11:00:00+00:00"
+
+        with patch("tasks.datetime") as mock_dt:
+            from datetime import datetime, timezone
+            mock_dt.now.return_value = datetime(2026, 1, 4, 12, 0, 0, tzinfo=timezone.utc)
+            mock_dt.fromisoformat = datetime.fromisoformat
+            pending = get_pending_tasks([new_high, old_low])
+
+        assert pending[0].title == "Old low"
+        assert pending[1].title == "New high"
+
+    def test_task_fairness_same_effective_rank_prefers_older(self):
+        """When promoted ranks tie, deterministic order is oldest first."""
+        older = create_task("Older high", priority="high")
+        older.created_at = "2026-01-01T00:00:00+00:00"
+        newer = create_task("New urgent", priority="urgent")
+        newer.created_at = "2026-01-04T11:59:00+00:00"
+
+        with patch("tasks.datetime") as mock_dt:
+            from datetime import datetime, timezone
+            mock_dt.now.return_value = datetime(2026, 1, 4, 12, 0, 0, tzinfo=timezone.utc)
+            mock_dt.fromisoformat = datetime.fromisoformat
+            pending = get_pending_tasks([newer, older])
+
+        assert pending[0].title == "Older high"
+        assert pending[1].title == "New urgent"
+
     def test_active_task_prevents_new_pickup(self):
         """When a task is already in progress, no new one should be picked."""
         t1 = create_task("Already working")
@@ -431,6 +518,7 @@ class TestSchedulerIntegration:
     def test_blocked_task_not_returned_as_active(self):
         """Blocked tasks are NOT picked up as active."""
         t = create_task("Blocked")
+        assign_task(t, "dev")
         start_task(t)
         block_task(t, "Waiting for user input")
         active = get_active_task([t])

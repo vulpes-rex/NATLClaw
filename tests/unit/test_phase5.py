@@ -195,19 +195,48 @@ class TestRetryConsolidation:
                 return (0, "test_event", {})
             def put_nowait(self, item):
                 pass  # noop
+            def empty(self):
+                return True
+            def get_nowait(self):
+                raise asyncio.QueueEmpty
 
         mock_queue = MockQueue()
 
-        with patch("scheduler.load_persona", return_value=mock_persona), \
-             patch("scheduler.load_state", side_effect=mock_load_state), \
-             patch("scheduler.load_brain", new_callable=AsyncMock, return_value=BrainState()), \
-             patch("scheduler.save_state", new_callable=AsyncMock), \
-             patch("scheduler.save_brain", new_callable=AsyncMock), \
-             patch("scheduler.load_projects", return_value=[]), \
-             patch("scheduler.detect_and_save_project", return_value=None), \
-             patch("scheduler.create_agent", return_value=MagicMock()), \
-             patch("scheduler.run_heartbeat", new_callable=AsyncMock), \
-             patch("scheduler.asyncio.PriorityQueue.get", new_callable=AsyncMock, return_value=(0, "test_event", {})):
+        # Decision engine mock
+        mock_decision = MagicMock()
+        mock_decision.chosen.action.value = "run_heartbeat"
+        mock_decision.chosen.score = 50.0
+        mock_decision.chosen.rationale = "test"
+        mock_decision.supplementary_actions = []
+        mock_directives = {
+            "action": "run_heartbeat", "active_task": None,
+            "workflow_override": None, "skip_agent": False,
+            "extra_context": "", "outbox_messages": [],
+        }
+
+        from contextlib import ExitStack
+        patches = [
+            patch("scheduler.load_persona", return_value=mock_persona),
+            patch("scheduler.load_state", side_effect=mock_load_state),
+            patch("scheduler.load_brain", new_callable=AsyncMock, return_value=BrainState()),
+            patch("scheduler.save_state", new_callable=AsyncMock),
+            patch("scheduler.save_brain", new_callable=AsyncMock),
+            patch("scheduler.load_projects", return_value=[]),
+            patch("scheduler.detect_and_save_project", return_value=None),
+            patch("scheduler.create_agent", return_value=MagicMock()),
+            patch("scheduler.run_heartbeat", new_callable=AsyncMock),
+            patch("decision_engine.build_decision_context", return_value=MagicMock()),
+            patch("decision_engine.evaluate_heartbeat", return_value=mock_decision),
+            patch("decision_engine.apply_decision", return_value=mock_directives),
+            patch("decision_engine.record_decision", return_value="mock-note-id"),
+            patch("decision_engine.record_decision_outcome"),
+            patch("decision_engine.update_consecutive_empty"),
+            patch("scheduler.acquire_scheduler_lock", return_value=True),
+            patch("scheduler.release_scheduler_lock"),
+        ]
+        with ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
             asyncio.run(run_scheduler(config, max_iterations=2, event_queue=mock_queue))
 
         # load_state was called via retry wrapper
@@ -231,16 +260,45 @@ class TestRetryConsolidation:
 
         custom_state = AgentState(execution_count=42)
 
-        with patch("scheduler.load_persona", return_value=mock_persona), \
-             patch("scheduler.load_state", new_callable=AsyncMock, return_value=custom_state), \
-             patch("scheduler.load_brain", new_callable=AsyncMock, return_value=BrainState()), \
-             patch("scheduler.save_state", new_callable=AsyncMock) as mock_save, \
-             patch("scheduler.save_brain", new_callable=AsyncMock), \
-             patch("scheduler.load_projects", return_value=[]), \
-             patch("scheduler.detect_and_save_project", return_value=None), \
-             patch("scheduler.create_agent", return_value=MagicMock()), \
-             patch("scheduler.run_heartbeat", new_callable=AsyncMock), \
-             patch("scheduler.asyncio.sleep", new_callable=AsyncMock):
+        # Decision engine mock
+        mock_decision = MagicMock()
+        mock_decision.chosen.action.value = "run_heartbeat"
+        mock_decision.chosen.score = 50.0
+        mock_decision.chosen.rationale = "test"
+        mock_decision.supplementary_actions = []
+        mock_directives = {
+            "action": "run_heartbeat", "active_task": None,
+            "workflow_override": None, "skip_agent": False,
+            "extra_context": "", "outbox_messages": [],
+        }
+
+        from contextlib import ExitStack
+        patches = [
+            patch("scheduler.load_persona", return_value=mock_persona),
+            patch("scheduler.load_state", new_callable=AsyncMock, return_value=custom_state),
+            patch("scheduler.load_brain", new_callable=AsyncMock, return_value=BrainState()),
+            patch("scheduler.save_state", new_callable=AsyncMock),
+            patch("scheduler.save_brain", new_callable=AsyncMock),
+            patch("scheduler.load_projects", return_value=[]),
+            patch("scheduler.detect_and_save_project", return_value=None),
+            patch("scheduler.create_agent", return_value=MagicMock()),
+            patch("scheduler.run_heartbeat", new_callable=AsyncMock),
+            patch("decision_engine.build_decision_context", return_value=MagicMock()),
+            patch("decision_engine.evaluate_heartbeat", return_value=mock_decision),
+            patch("decision_engine.apply_decision", return_value=mock_directives),
+            patch("decision_engine.record_decision", return_value="mock-note-id"),
+            patch("decision_engine.record_decision_outcome"),
+            patch("decision_engine.update_consecutive_empty"),
+            patch("scheduler.acquire_scheduler_lock", return_value=True),
+            patch("scheduler.release_scheduler_lock"),
+            patch("scheduler.asyncio.sleep", new_callable=AsyncMock),
+        ]
+        with ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            mock_save = stack.enter_context(
+                patch("scheduler.save_state", new_callable=AsyncMock),
+            )
             asyncio.run(run_scheduler(config, max_iterations=1))
 
         # save_state received the custom state (execution_count incremented by scheduler)

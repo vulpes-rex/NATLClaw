@@ -9,7 +9,9 @@ import pytest
 
 from messaging import (
     Message,
+    append_message,
     build_inbox_summary,
+    extend_messages,
     create_message,
     dismiss_all_read,
     emit_alert,
@@ -98,6 +100,7 @@ class TestEmitHelpers:
         assert "completed" in m.title.lower()
         assert "src/main.py" in m.body
         assert m.payload["deliverables"] == ["src/main.py", "tests/test.py"]
+        assert m.payload["severity"] == "normal"
 
     def test_emit_task_blocked(self):
         task = _FakeTask()
@@ -107,6 +110,7 @@ class TestEmitHelpers:
         assert m.requires_response is True
         assert "database" in m.body.lower()
         assert m.payload["question"] == "What database?"
+        assert m.payload["severity"] == "high"
 
     def test_emit_task_failed(self):
         task = _FakeTask()
@@ -115,6 +119,7 @@ class TestEmitHelpers:
         assert m.urgency == "high"
         assert "failed" in m.title.lower()
         assert m.payload["reason"] == "API timeout"
+        assert m.payload["severity"] == "high"
 
     def test_emit_task_started(self):
         task = _FakeTask()
@@ -122,6 +127,7 @@ class TestEmitHelpers:
         assert m.type == "status"
         assert m.urgency == "low"
         assert "started" in m.title.lower()
+        assert m.payload["severity"] == "low"
 
     def test_emit_task_timed_out(self):
         task = _FakeTask(max_heartbeats=5)
@@ -130,17 +136,20 @@ class TestEmitHelpers:
         assert m.urgency == "high"
         assert "timed out" in m.title.lower()
         assert m.payload["max_heartbeats"] == 5
+        assert m.payload["severity"] == "high"
 
     def test_emit_alert(self):
         m = emit_alert("Error spike", "5 errors in last hour", urgency="high")
         assert m.type == "alert"
         assert m.urgency == "high"
         assert m.title == "Error spike"
+        assert m.payload["severity"] == "high"
 
     def test_emit_fyi(self):
         m = emit_fyi("Brain maintenance", "Archived 10 stale notes")
         assert m.type == "fyi"
         assert m.urgency == "low"
+        assert m.payload["severity"] == "low"
 
 
 # ── State transitions ─────────────────────────────────────────────────
@@ -221,6 +230,33 @@ class TestQueryHelpers:
 
     def test_find_message_not_found(self):
         assert find_message([], "nonexistent") is None
+
+
+class TestDedupHelpers:
+    def test_append_message_dedupes_equivalent_unread(self):
+        messages = [create_message("alert", "Failure", body="Task t1 failed", urgency="high", task_id="t1")]
+        dup = create_message("alert", "Failure", body="Task t1 failed", urgency="high", task_id="t1")
+        appended = append_message(messages, dup)
+        assert appended is False
+        assert len(messages) == 1
+
+    def test_append_message_allows_after_dismissed(self):
+        existing = create_message("alert", "Failure", body="Task t1 failed", urgency="high", task_id="t1")
+        mark_dismissed(existing)
+        messages = [existing]
+        dup = create_message("alert", "Failure", body="Task t1 failed", urgency="high", task_id="t1")
+        appended = append_message(messages, dup)
+        assert appended is True
+        assert len(messages) == 2
+
+    def test_extend_messages_returns_appended_count(self):
+        messages = []
+        a = create_message("question", "Need input", body="Q1", urgency="high", task_id="t1")
+        b = create_message("question", "Need input", body="Q1", urgency="high", task_id="t1")
+        c = create_message("alert", "Other", body="different", urgency="high", task_id="t1")
+        count = extend_messages(messages, [a, b, c])
+        assert count == 2
+        assert len(messages) == 2
 
 
 # ── Persistence ───────────────────────────────────────────────────────

@@ -308,6 +308,13 @@ def detect_and_save_project(state_file: str, config: Any) -> Project | None:
     # Try to detect project from current directory
     project = detect_project(".")
     if project:
+        # Keep active-work inference fresh so scheduler prompt context reflects
+        # current branch/work without requiring manual edits.
+        try:
+            project.active_work = infer_active_work(project)
+            project.last_activity = datetime.now(timezone.utc).isoformat()
+        except Exception:
+            logger.debug("Failed to infer active work for project '%s'", project.name, exc_info=True)
         save_project(project, state_file)
         logger.info("Detected project: %s (%s)", project.name, project.language)
     return project

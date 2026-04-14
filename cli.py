@@ -130,47 +130,11 @@ def cmd_run(args: argparse.Namespace, config: AppConfig) -> None:
         sys.exit(1)
 
     if args.once:
-        # Run exactly one heartbeat then exit
-        from persona_loader import load_persona
-        from second_brain import load_brain, save_brain
-        from state import load_state, save_state
-        from workflow import run_heartbeat
-        from agent_setup import create_agent
-        from learning import build_context_block
-        from second_brain import build_brain_summary, decay_stale_notes
-        from goals import auto_expire_goals, build_goals_block
-
-        async def _single_heartbeat():
-            persona = load_persona(config.persona)
-            state = await load_state(config.state_file)
-            brain = await load_brain(config.state_file)
-            decay_stale_notes(brain)
-            auto_expire_goals(state)
-            state.execution_count += 1
-            state.last_heartbeat = datetime.now(timezone.utc).isoformat()
-
-            base_instructions = config.agent_instructions or persona.instructions
-            context_block = build_context_block(state)
-            brain_block = build_brain_summary(brain, max_notes=5)
-            goals_block = build_goals_block(state)
-            enriched = (
-                f"{base_instructions}\n\n{context_block}\n\n{brain_block}"
-                + (f"\n\n{goals_block}" if goals_block else "")
-            )
-
-            agent = create_agent(config, enriched, tools=persona.tools, mcp_servers=persona.mcp_servers)
-
-            if _needs_copilot_session(agent):
-                async with agent:
-                    await run_heartbeat(agent, state, brain, config, persona)
-            else:
-                await run_heartbeat(agent, state, brain, config, persona)
-
-            await save_state(state, config.state_file, config.max_history)
-            await save_brain(brain, config.state_file)
-            print(f"Heartbeat #{state.execution_count} completed.")
-
-        asyncio.run(_single_heartbeat())
+        # Run exactly one heartbeat via the real scheduler loop (full fidelity)
+        try:
+            asyncio.run(run_scheduler(config, max_iterations=1))
+        except KeyboardInterrupt:
+            pass
     else:
         try:
             asyncio.run(run_scheduler(config))
@@ -753,7 +717,7 @@ def cmd_task_status(args: argparse.Namespace, config: AppConfig) -> None:
 
 def cmd_task_answer(args: argparse.Namespace, config: AppConfig) -> None:
     """Answer a blocked task's question to unblock it."""
-    from tasks import answer_task, find_task, load_tasks, save_tasks
+    from tasks import TaskTransitionError, answer_task, find_task, load_tasks, save_tasks
     from event_watcher import enqueue_event
 
     async def _answer():
@@ -762,10 +726,21 @@ def cmd_task_answer(args: argparse.Namespace, config: AppConfig) -> None:
         if task is None:
             print(f"Task '{args.task_id}' not found.")
             sys.exit(1)
+        if (
+            task.status in ("assigned", "in_progress")
+            and task.answers
+            and task.answers[-1].get("answer", "") == args.answer
+        ):
+            print(f"No-op: task {task.id} already recorded this answer.")
+            return
         if task.status != "blocked":
             print(f"Task {task.id} is not blocked (status={task.status}).")
             sys.exit(1)
-        answer_task(task, args.answer)
+        try:
+            answer_task(task, args.answer)
+        except TaskTransitionError as exc:
+            print(str(exc))
+            sys.exit(1)
         await save_tasks(tasks, config.state_file)
         enqueue_event("task_answered", {"task_id": task.id})
         print(f"Answered task {task.id} — it will resume on the next heartbeat.")
@@ -849,7 +824,7 @@ def cmd_inbox_clear(args: argparse.Namespace, config: AppConfig) -> None:
 
 def cmd_task_cancel(args: argparse.Namespace, config: AppConfig) -> None:
     """Cancel a task."""
-    from tasks import cancel_task, find_task, load_tasks, save_tasks
+    from tasks import TaskTransitionError, cancel_task, find_task, load_tasks, save_tasks
     from event_watcher import enqueue_event
 
     async def _cancel():
@@ -858,11 +833,20 @@ def cmd_task_cancel(args: argparse.Namespace, config: AppConfig) -> None:
         if task is None:
             print(f"Task '{args.task_id}' not found.")
             sys.exit(1)
+        if task.status == "failed" and any(
+            note.startswith("CANCELLED") for note in task.progress_notes
+        ):
+            print(f"No-op: task {task.id} is already cancelled.")
+            return
         if task.status in ("completed", "failed"):
             print(f"Task {task.id} is already {task.status} — cannot cancel.")
             sys.exit(1)
         reason = getattr(args, "reason", "") or ""
-        cancel_task(task, reason)
+        try:
+            cancel_task(task, reason)
+        except TaskTransitionError as exc:
+            print(str(exc))
+            sys.exit(1)
         await save_tasks(tasks, config.state_file)
         enqueue_event("task_cancelled", {"task_id": task.id})
         print(f"Cancelled task {task.id}: {task.title}")
@@ -872,7 +856,7 @@ def cmd_task_cancel(args: argparse.Namespace, config: AppConfig) -> None:
 
 def cmd_task_retry(args: argparse.Namespace, config: AppConfig) -> None:
     """Retry a failed or blocked task."""
-    from tasks import find_task, load_tasks, retry_task, save_tasks
+    from tasks import TaskTransitionError, find_task, load_tasks, retry_task, save_tasks
     from event_watcher import enqueue_event
 
     async def _retry():
@@ -881,10 +865,19 @@ def cmd_task_retry(args: argparse.Namespace, config: AppConfig) -> None:
         if task is None:
             print(f"Task '{args.task_id}' not found.")
             sys.exit(1)
+        if task.status == "pending" and any(
+            note == "RETRIED by developer" for note in task.progress_notes
+        ):
+            print(f"No-op: task {task.id} is already retried and pending pickup.")
+            return
         if task.status not in ("failed", "blocked"):
             print(f"Task {task.id} is {task.status} — only failed or blocked tasks can be retried.")
             sys.exit(1)
-        retry_task(task)
+        try:
+            retry_task(task)
+        except TaskTransitionError as exc:
+            print(str(exc))
+            sys.exit(1)
         await save_tasks(tasks, config.state_file)
         enqueue_event("task_retried", {"task_id": task.id})
         print(f"Retried task {task.id}: {task.title} — it will be picked up next heartbeat.")
@@ -921,6 +914,77 @@ def cmd_api(args: argparse.Namespace, config: AppConfig) -> None:
         reload=reload,
         log_level="info",
     )
+
+
+def cmd_status(args: argparse.Namespace, config: AppConfig) -> None:
+    """Print a single operator snapshot of runtime state."""
+    from operator_status import build_operator_status
+
+    snap = asyncio.run(build_operator_status(config))
+
+    sched = snap["scheduler"]
+    hb = snap["heartbeat"]
+    tasks = snap["tasks"]
+    inbox = snap["inbox"]
+    errors = snap["errors"]
+    reliability = snap.get("reliability", {})
+    active = tasks["active"]
+    sla = tasks.get("sla", {})
+
+    print("Operator Status")
+    print("---------------")
+    print(
+        f"Scheduler: {'RUNNING' if sched['running'] else 'STOPPED'} "
+        f"(in-process={sched['in_process_task_running']})"
+    )
+    print(
+        f"Heartbeat: {hb['status']} | count={hb['count']} | "
+        f"last={hb['last'] or '-'} | seconds_ago={hb['seconds_ago']}"
+    )
+    if active:
+        print(
+            "Active task: "
+            f"[{active['id']}] {active['title']} ({active['status']}, {active['priority']}, "
+            f"{active['heartbeats_spent']}/{active['max_heartbeats']})"
+        )
+    else:
+        print("Active task: none")
+    print(f"Blocked tasks: {tasks['blocked_count']} | Total tasks: {tasks['total']}")
+    if sla:
+        oldest_pending = sla.get("oldest_pending_age_sec")
+        oldest_pending_str = (
+            f"{oldest_pending}s" if isinstance(oldest_pending, (int, float)) else "-"
+        )
+        print(
+            "SLA risk: "
+            f"at_risk={sla.get('at_risk_count', 0)} | "
+            f"breached={sla.get('breached_count', 0)} | "
+            f"oldest_pending={oldest_pending_str}"
+        )
+    print(
+        f"Inbox unread: {inbox['unread_count']} "
+        f"(needs response: {inbox['requires_response_count']})"
+    )
+    print(
+        f"Recent errors: {errors['recent_error_count']}"
+        + (f" | last={errors['last_error']['step']} @ {errors['last_error']['timestamp']}"
+           if errors["last_error"] else "")
+    )
+    top_types = errors.get("top_error_types", [])
+    if top_types:
+        top_line = ", ".join(f"{item['type']}={item['count']}" for item in top_types)
+        print(f"Top error types: {top_line}")
+    if reliability:
+        err_rate = reliability.get("error_rate")
+        err_rate_str = f"{err_rate:.3f}" if isinstance(err_rate, (int, float)) else "-"
+        print(
+            "Soak reliability: "
+            f"{reliability.get('status', 'unknown')} | "
+            f"window={reliability.get('window_heartbeats', 0)} hb | "
+            f"errors={reliability.get('recent_error_count', 0)} | "
+            f"error_rate={err_rate_str} | "
+            f"stale_lock={reliability.get('stale_lock', False)}"
+        )
 
 
 def cmd_config_validate(args: argparse.Namespace, config: AppConfig) -> None:
@@ -1470,6 +1534,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_p = sub.add_parser("run", help="Start the heartbeat scheduler")
     run_p.add_argument("--once", action="store_true", help="Run a single heartbeat and exit")
 
+    # status
+    sub.add_parser("status", help="Show unified operator status snapshot")
+
     # serve — API server + dashboard
     serve_p = sub.add_parser("serve", help="Start the API server with dashboard")
     serve_p.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
@@ -1649,6 +1716,7 @@ def main(argv: list[str] | None = None) -> None:
 
     dispatch = {
         "run": cmd_run,
+        "status": cmd_status,
         "serve": cmd_serve,
         "chat": cmd_chat,
         "brief": cmd_brief,

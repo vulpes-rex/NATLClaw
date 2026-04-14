@@ -947,6 +947,53 @@ class TestRunTaskHeartbeat:
         assert len(task.progress_notes) >= 3
         assert task.status == "in_progress"
 
+    def test_blocked_answered_resumed_to_done_round_trip(self, state, brain, config, persona):
+        """Blocked task can be answered and then completed in a later heartbeat."""
+        from tasks import answer_task
+
+        task = self._make_task()
+
+        first_capture = json.dumps({
+            "topic": "Blocked on config",
+            "content": "Need environment value from developer",
+            "tags": ["blocked"],
+            "category": "resources",
+        })
+        blocked_agent = _json_agent(
+            "Plan: read deployment config",
+            "Config key is missing from env",
+            "BLOCKED: What should APP_REGION be set to?",
+            first_capture,
+        )
+
+        asyncio.run(run_task_heartbeat(blocked_agent, state, brain, config, persona, task))
+        assert task.status == "blocked"
+        assert len(task.questions) == 1
+        assert "APP_REGION" in task.questions[0]["question"]
+
+        answer_task(task, "Set APP_REGION=us-east")
+        assert task.status == "assigned"
+        assert len(task.answers) == 1
+
+        second_capture = json.dumps({
+            "topic": "Region configured",
+            "content": "Applied APP_REGION and validated deployment path",
+            "tags": ["config", "deploy"],
+            "category": "projects",
+        })
+        resumed_agent = _json_agent(
+            "Plan: apply provided region value",
+            "Updated env and verified startup",
+            "DONE\n- src/config.py\n- docs/deploy.md",
+            second_capture,
+        )
+
+        asyncio.run(run_task_heartbeat(resumed_agent, state, brain, config, persona, task))
+        assert task.status == "completed"
+        assert task.completed_at is not None
+        assert any("config.py" in d for d in task.deliverables)
+        assert len(task.answers) == 1
+
 
 # ══════════════════════════════════════════════════════════════════════
 # K. _extract_deliverables tests

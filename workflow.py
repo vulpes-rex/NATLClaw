@@ -151,13 +151,15 @@ async def run_task_heartbeat(
     responsible for appending them to the outbox and persisting.
     """
     from tasks import (
-        advance_task, block_task, build_task_context,
+        advance_task, assign_task, block_task, build_task_context,
         complete_task, fail_task, start_task,
     )
 
     _outbox: list = []  # collects Message objects for the caller
     try:
         seen_fps: set[str] = set()
+        if task.status == "pending":
+            assign_task(task, persona.name)
         start_task(task)
 
         task_ctx = build_task_context(task)

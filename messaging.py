@@ -81,6 +81,17 @@ def _urgency_key(msg: Message) -> tuple[int, str]:
     return (_URGENCY_RANK.get(msg.urgency, 9), msg.created_at)
 
 
+def _message_fingerprint(message: Message) -> tuple[str, str, str, str, str]:
+    """Stable fingerprint for deduping semantically identical messages."""
+    return (
+        message.type,
+        message.task_id,
+        message.title.strip(),
+        message.body.strip(),
+        message.urgency,
+    )
+
+
 # ── Persistence ────────────────────────────────────────────────────────
 
 
@@ -167,6 +178,38 @@ def create_message(
     )
 
 
+def append_message(
+    messages: list[Message],
+    message: Message,
+    *,
+    dedupe_statuses: tuple[str, ...] = ("unread", "read"),
+) -> bool:
+    """Append message unless an equivalent active message already exists.
+
+    Returns True when appended, False when deduped.
+    """
+    fp = _message_fingerprint(message)
+    for existing in messages:
+        if existing.status in dedupe_statuses and _message_fingerprint(existing) == fp:
+            return False
+    messages.append(message)
+    return True
+
+
+def extend_messages(
+    messages: list[Message],
+    new_messages: list[Message],
+    *,
+    dedupe_statuses: tuple[str, ...] = ("unread", "read"),
+) -> int:
+    """Append multiple messages with dedupe. Returns number appended."""
+    appended = 0
+    for msg in new_messages:
+        if append_message(messages, msg, dedupe_statuses=dedupe_statuses):
+            appended += 1
+    return appended
+
+
 def emit_task_completed(
     task, *, persona: str = "", heartbeat: int = 0,
 ) -> Message:
@@ -186,6 +229,7 @@ def emit_task_completed(
         payload={
             "deliverables": task.deliverables[:20],
             "heartbeats_spent": task.heartbeats_spent,
+            "severity": "normal",
         },
     )
 
@@ -203,7 +247,7 @@ def emit_task_blocked(
         persona=persona,
         heartbeat=heartbeat,
         requires_response=True,
-        payload={"question": question},
+        payload={"question": question, "severity": "high"},
     )
 
 
@@ -219,7 +263,11 @@ def emit_task_failed(
         task_id=task.id,
         persona=persona,
         heartbeat=heartbeat,
-        payload={"reason": reason, "heartbeats_spent": task.heartbeats_spent},
+        payload={
+            "reason": reason,
+            "heartbeats_spent": task.heartbeats_spent,
+            "severity": "high",
+        },
     )
 
 
@@ -235,6 +283,7 @@ def emit_task_started(
         task_id=task.id,
         persona=persona,
         heartbeat=heartbeat,
+        payload={"severity": "low"},
     )
 
 
@@ -253,7 +302,7 @@ def emit_task_timed_out(
         task_id=task.id,
         persona=persona,
         heartbeat=heartbeat,
-        payload={"max_heartbeats": task.max_heartbeats},
+        payload={"max_heartbeats": task.max_heartbeats, "severity": "high"},
     )
 
 
@@ -274,7 +323,7 @@ def emit_alert(
         urgency=urgency,
         persona=persona,
         heartbeat=heartbeat,
-        payload=payload or {},
+        payload={**(payload or {}), "severity": urgency},
     )
 
 
@@ -294,7 +343,7 @@ def emit_fyi(
         urgency="low",
         persona=persona,
         heartbeat=heartbeat,
-        payload=payload or {},
+        payload={**(payload or {}), "severity": "low"},
     )
 
 

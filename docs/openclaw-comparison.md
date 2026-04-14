@@ -222,3 +222,24 @@ NATLClaw and OpenClaw occupy different niches in the agentic AI space:
 - **OpenClaw** is a **communication platform** — massive, polished, channel-first, and reactive.
 
 The sweet spot is using NATLClaw's knowledge architecture as the memory layer beneath OpenClaw's multi-channel reach, giving the assistant continuous learning capabilities across every surface it touches.
+
+---
+
+## 9  Adopted Strategy for NATLClaw
+
+NATLClaw will adopt **OpenClaw-style surfaces**, not an OpenClaw runtime replacement.
+
+Decisions:
+
+1. Keep core learning/runtime modules (`scheduler.py`, `workflow.py`, `second_brain.py`) as-is.
+2. Add an adapter-first ingress surface (event envelope, session model, routing decisions).
+3. Map channel-origin events into existing task and inbox primitives.
+4. Roll out via feature flags and canary channels before wider enablement.
+
+Authoritative planning docs:
+
+- [OpenClaw Surface Adoption Plan](./openclaw-surface-adoption-plan.md)
+- [OpenClaw Surface Architecture](./openclaw-surface-architecture.md)
+- [OpenClaw Surface Rollout](./openclaw-surface-rollout.md)
+- [OpenClaw Surface MVP Design](./openclaw-surface-mvp-design.md)
+- [OpenClaw Session and Routing Design](./openclaw-session-routing-design.md)

@@ -12,6 +12,7 @@ from project_context import (
     PROJECT_DEFAULTS,
     Project,
     detect_project,
+    detect_and_save_project,
     infer_active_work,
     save_project,
     load_projects,
@@ -180,6 +181,29 @@ class TestPersistence:
         projects_file = tmp_path / "projects.json"
         projects_file.write_text("not json", encoding="utf-8")
         assert load_projects(state_file) == []
+
+    def test_detect_and_save_project_infers_active_work(self, tmp_path):
+        state_file = str(tmp_path / "agent_state.json")
+        proj = Project(
+            path=str(tmp_path),
+            name="natlclaw",
+            language="python",
+            framework="setuptools",
+            branch="feature/s11",
+            vcs="git",
+        )
+
+        with patch("project_context.detect_project", return_value=proj), \
+             patch("project_context.infer_active_work", return_value="Working on scheduler reliability"):
+            detected = detect_and_save_project(state_file, config=None)
+
+        assert detected is not None
+        assert detected.active_work == "Working on scheduler reliability"
+        assert detected.last_activity != ""
+        loaded = load_projects(state_file)
+        assert len(loaded) == 1
+        assert loaded[0].active_work == "Working on scheduler reliability"
+        assert loaded[0].branch == "feature/s11"
 
 
 # ── Project defaults ──────────────────────────────────────────────────

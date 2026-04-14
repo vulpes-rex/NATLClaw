@@ -27,6 +27,21 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 TASKS_FILE = os.path.join("data", "tasks.json")
+TERMINAL_TASK_STATUSES = frozenset({"completed", "failed"})
+
+
+class TaskTransitionError(ValueError):
+    """Raised when a task lifecycle transition is invalid."""
+
+
+def _require_status(task: "Task", *, allowed: tuple[str, ...], action: str) -> None:
+    """Validate task status for a transition."""
+    if task.status not in allowed:
+        allowed_str = ", ".join(allowed)
+        raise TaskTransitionError(
+            f"Cannot {action} task {task.id} from status={task.status}; "
+            f"allowed statuses: {allowed_str}"
+        )
 
 # ── Data model ─────────────────────────────────────────────────────────
 
@@ -69,9 +84,46 @@ class Task:
 _PRIORITY_RANK = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
 
 
-def _priority_key(task: Task) -> tuple[int, str]:
-    """Sort key: lower rank number = higher priority, then oldest first."""
-    return (_PRIORITY_RANK.get(task.priority, 9), task.created_at)
+def _task_age_hours(task: Task) -> float:
+    """Best-effort task age in hours (0 when timestamp is missing/invalid)."""
+    created = (task.created_at or "").strip()
+    if not created:
+        return 0.0
+    # Support legacy "Z" timestamps as UTC.
+    created = created.replace("Z", "+00:00")
+    try:
+        created_dt = datetime.fromisoformat(created)
+    except (ValueError, TypeError):
+        return 0.0
+    if created_dt.tzinfo is None:
+        created_dt = created_dt.replace(tzinfo=timezone.utc)
+    age_sec = (datetime.now(timezone.utc) - created_dt).total_seconds()
+    return max(0.0, age_sec / 3600.0)
+
+
+def _effective_priority_rank(task: Task) -> int:
+    """Priority rank with deterministic anti-starvation age promotion."""
+    base_rank = _PRIORITY_RANK.get(task.priority, 9)
+    age_h = _task_age_hours(task)
+    # Promote old tasks to avoid indefinite starvation under mixed loads.
+    # 6h: +1 level, 24h: +2 levels, 72h: +3 levels (can reach urgent tier).
+    promotion = 0
+    if age_h >= 72:
+        promotion = 3
+    elif age_h >= 24:
+        promotion = 2
+    elif age_h >= 6:
+        promotion = 1
+    return max(0, base_rank - promotion)
+
+
+def _priority_key(task: Task) -> tuple[int, str, int]:
+    """Sort key: effective rank, oldest first, then base rank."""
+    return (
+        _effective_priority_rank(task),
+        task.created_at,
+        _PRIORITY_RANK.get(task.priority, 9),
+    )
 
 
 # ── Persistence ────────────────────────────────────────────────────────
@@ -176,6 +228,7 @@ def find_task(tasks: list[Task], task_id: str) -> Task | None:
 
 def assign_task(task: Task, persona_name: str) -> None:
     """Assign a pending task to a persona."""
+    _require_status(task, allowed=("pending",), action="assign")
     task.status = "assigned"
     task.assigned_to = persona_name
     task.started_at = datetime.now(timezone.utc).isoformat()
@@ -183,6 +236,7 @@ def assign_task(task: Task, persona_name: str) -> None:
 
 def start_task(task: Task) -> None:
     """Move an assigned task to in_progress."""
+    _require_status(task, allowed=("assigned", "in_progress"), action="start")
     task.status = "in_progress"
     if not task.started_at:
         task.started_at = datetime.now(timezone.utc).isoformat()
@@ -190,6 +244,7 @@ def start_task(task: Task) -> None:
 
 def advance_task(task: Task, note: str) -> None:
     """Record one heartbeat of progress on a task."""
+    _require_status(task, allowed=("in_progress",), action="advance")
     task.heartbeats_spent += 1
     if note:
         task.progress_notes.append(note[:500])
@@ -197,6 +252,7 @@ def advance_task(task: Task, note: str) -> None:
 
 def block_task(task: Task, question: str, heartbeat_number: int = 0) -> None:
     """Mark a task as blocked with a question for the developer."""
+    _require_status(task, allowed=("in_progress",), action="block")
     task.status = "blocked"
     task.questions.append({
         "question": question,
@@ -207,6 +263,7 @@ def block_task(task: Task, question: str, heartbeat_number: int = 0) -> None:
 
 def answer_task(task: Task, answer: str) -> None:
     """Provide a developer answer to unblock a task."""
+    _require_status(task, allowed=("blocked",), action="answer")
     task.answers.append({
         "answer": answer,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -217,6 +274,7 @@ def answer_task(task: Task, answer: str) -> None:
 
 def complete_task(task: Task, deliverables: list[str] | None = None) -> None:
     """Mark a task as completed."""
+    _require_status(task, allowed=("in_progress",), action="complete")
     task.status = "completed"
     task.completed_at = datetime.now(timezone.utc).isoformat()
     if deliverables:
@@ -225,6 +283,10 @@ def complete_task(task: Task, deliverables: list[str] | None = None) -> None:
 
 def fail_task(task: Task, reason: str = "") -> None:
     """Mark a task as failed."""
+    if task.status in TERMINAL_TASK_STATUSES:
+        raise TaskTransitionError(
+            f"Cannot fail task {task.id} from status={task.status}; task is already terminal"
+        )
     task.status = "failed"
     task.completed_at = datetime.now(timezone.utc).isoformat()
     if reason:
@@ -233,8 +295,10 @@ def fail_task(task: Task, reason: str = "") -> None:
 
 def cancel_task(task: Task, reason: str = "") -> None:
     """Cancel a task that is not yet completed or failed."""
-    if task.status in ("completed", "failed"):
-        return  # already terminal — no-op
+    if task.status in TERMINAL_TASK_STATUSES:
+        raise TaskTransitionError(
+            f"Cannot cancel task {task.id} from status={task.status}; task is already terminal"
+        )
     task.status = "failed"
     task.completed_at = datetime.now(timezone.utc).isoformat()
     label = f"CANCELLED: {reason[:500]}" if reason else "CANCELLED by developer"
@@ -247,6 +311,7 @@ def retry_task(task: Task) -> None:
     Clears heartbeat count and resets status to pending so the scheduler
     will assign it on the next cycle.
     """
+    _require_status(task, allowed=("failed", "blocked"), action="retry")
     task.status = "pending"
     task.assigned_to = ""
     task.started_at = None

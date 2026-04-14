@@ -17,6 +17,9 @@ from fastapi.testclient import TestClient
 
 from api_server import create_app
 from config import AppConfig
+from execution_log import append_entry
+from messaging import Message, save_outbox
+from tasks import Task, save_tasks
 
 
 @pytest.fixture(autouse=True)
@@ -34,8 +37,15 @@ def config():
 
 @pytest.fixture()
 def client(config):
-    app = create_app(config)
-    return TestClient(app)
+    # Mock the scheduler so the lifespan auto-start doesn't run a real scheduler
+    async def _noop_scheduler(*a, **kw):
+        await asyncio.sleep(999)
+
+    with patch("scheduler.run_scheduler", side_effect=_noop_scheduler), \
+         patch("scheduler.acquire_scheduler_lock", return_value=True), \
+         patch("scheduler.release_scheduler_lock"):
+        app = create_app(config)
+        yield TestClient(app)
 
 
 @pytest.fixture()
@@ -96,6 +106,52 @@ def test_heartbeat_status_active(client, state_file):
     assert data["heartbeat_count"] == 5
 
 
+def test_operator_status_snapshot(client, state_file):
+    from state import AgentState, save_state
+    from datetime import datetime, timezone
+
+    state = AgentState()
+    state.last_heartbeat = datetime.now(timezone.utc).isoformat()
+    state.execution_count = 7
+    asyncio.run(save_state(state, state_file))
+
+    active = Task(title="Do S6", status="in_progress", priority="high")
+    active.assigned_to = "default"
+    blocked = Task(title="Need input", status="blocked")
+    asyncio.run(save_tasks([active, blocked], state_file))
+
+    unread = Message(type="question", title="Need answer", requires_response=True, status="unread")
+    asyncio.run(save_outbox([unread], state_file))
+
+    append_entry(
+        "task_execute",
+        "do task",
+        "ERROR: failed to connect to service",
+        db_path=os.path.join(os.path.dirname(state_file), "execution_log.db"),
+    )
+
+    r = client.get("/api/status")
+    assert r.status_code == 200
+    data = r.json()
+
+    assert data["heartbeat"]["count"] == 7
+    assert data["tasks"]["active"] is not None
+    assert data["tasks"]["active"]["id"] == active.id
+    assert data["tasks"]["blocked_count"] == 1
+    assert "sla" in data["tasks"]
+    assert "at_risk_count" in data["tasks"]["sla"]
+    assert "breached_count" in data["tasks"]["sla"]
+    assert data["inbox"]["unread_count"] == 1
+    assert data["inbox"]["requires_response_count"] == 1
+    assert data["errors"]["recent_error_count"] >= 1
+    assert data["errors"]["last_error"]["type"] == "network"
+    assert data["errors"]["top_error_types"]
+    assert data["errors"]["top_error_types"][0]["type"] == "network"
+    assert data["reliability"]["status"] in ("healthy", "degraded")
+    assert data["reliability"]["window_heartbeats"] == 7
+    assert data["reliability"]["recent_error_count"] >= 1
+
+
 # ── Heartbeat log / metrics ──────────────────────────────────────────
 
 
@@ -124,25 +180,43 @@ def test_scheduler_status_not_running(client):
     assert r.status_code == 200
     data = r.json()
     assert data["running"] is False
+    assert "lock" in data
+    assert data["lock"]["exists"] is False
 
 
 def test_scheduler_start(client):
-    mock_proc = MagicMock()
-    mock_proc.poll.return_value = None
-    mock_proc.pid = 12345
+    # Scheduler runs as an asyncio task now, not a subprocess.
+    # Mock run_scheduler to be a no-op coroutine so it doesn't actually start.
+    async def _noop_scheduler(*a, **kw):
+        await asyncio.sleep(999)
 
-    with patch("subprocess.Popen", return_value=mock_proc):
+    with patch("scheduler.run_scheduler", side_effect=_noop_scheduler):
         r = client.post("/api/scheduler/start")
     assert r.status_code == 200
     data = r.json()
     assert data["status"] == "started"
-    assert data["pid"] == 12345
 
 
 def test_scheduler_stop_not_running(client):
     r = client.post("/api/scheduler/stop")
     assert r.status_code == 200
     assert r.json()["status"] == "not_running"
+
+
+def test_scheduler_status_includes_stale_lock_info(client, tmp_path):
+    lock_file = tmp_path / "scheduler.lock"
+    lock_file.write_text("999999", encoding="utf-8")
+
+    with patch("scheduler._is_pid_alive", return_value=False):
+        r = client.get("/api/scheduler/status")
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["running"] is False
+    assert data["lock"]["exists"] is True
+    assert data["lock"]["pid"] == 999999
+    assert data["lock"]["pid_alive"] is False
+    assert data["lock"]["stale"] is True
 
 
 # ── Reports ───────────────────────────────────────────────────────────
@@ -209,8 +283,13 @@ class TestApiAuth:
         state_file = str(tmp_path / "agent_state.json")
         cfg = AppConfig(state_file=state_file, api_key="test-secret-key")
         monkeypatch.setattr("api_server._default_config", cfg)
-        app = create_app(cfg)
-        return TestClient(app)
+        async def _noop_scheduler(*a, **kw):
+            await asyncio.sleep(999)
+        with patch("scheduler.run_scheduler", side_effect=_noop_scheduler), \
+             patch("scheduler.acquire_scheduler_lock", return_value=True), \
+             patch("scheduler.release_scheduler_lock"):
+            app = create_app(cfg)
+            yield TestClient(app)
 
     def test_no_key_blocks_api(self, auth_client):
         r = auth_client.get("/api/personas")

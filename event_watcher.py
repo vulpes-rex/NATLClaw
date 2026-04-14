@@ -241,11 +241,12 @@ def drain_pending_events(
 ) -> int:
     """Read and clear pending events from the file, pushing them to the queue.
 
-    Returns the number of events drained.
+    Returns the number of events enqueued (after in-batch dedupe).
     """
     if not _PENDING_EVENTS_FILE.exists():
         return 0
     count = 0
+    seen: set[tuple[int, str, str]] = set()
     try:
         lines = _PENDING_EVENTS_FILE.read_text(encoding="utf-8").splitlines()
         # Clear the file immediately to avoid double-processing
@@ -256,13 +257,23 @@ def drain_pending_events(
                 continue
             try:
                 record = json.loads(line)
-                event_queue.put_nowait((
-                    record["priority"],
-                    record["event_type"],
-                    record.get("payload", {}),
-                ))
+                priority = int(record["priority"])
+                event_type = str(record["event_type"])
+                payload = record.get("payload", {})
+                if not isinstance(payload, dict):
+                    payload = {}
+
+                # Idempotency hardening: replayed identical records in one drain
+                # cycle are treated as one logical event.
+                payload_key = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+                fingerprint = (priority, event_type, payload_key)
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+
+                event_queue.put_nowait((priority, event_type, payload))
                 count += 1
-            except (json.JSONDecodeError, KeyError) as e:
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
                 logger.warning("Skipping malformed pending event: %s", e)
     except OSError as e:
         logger.warning("Failed to drain pending events: %s", e)
