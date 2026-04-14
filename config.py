@@ -34,6 +34,8 @@ class AppConfig:
     # Scheduler
     heartbeat_interval_sec: int = 120
     watch_path: str = "."
+    max_events_per_heartbeat: int = 50
+    queue_depth_warn_threshold: int = 200
 
     # State
     state_file: str = "data/agent_state.json"
@@ -73,6 +75,14 @@ def validate_config(config: AppConfig) -> list[str]:
             errors.append("AZURE_OPENAI_DEPLOYMENT is required for provider=azure_openai")
     if config.max_history < 1:
         errors.append(f"max_history={config.max_history} must be >= 1")
+    if config.max_events_per_heartbeat < 1:
+        errors.append(
+            f"max_events_per_heartbeat={config.max_events_per_heartbeat} must be >= 1"
+        )
+    if config.queue_depth_warn_threshold < 1:
+        errors.append(
+            f"queue_depth_warn_threshold={config.queue_depth_warn_threshold} must be >= 1"
+        )
     return errors
 
 
@@ -99,6 +109,8 @@ def load_config(env_path: str = ".env") -> AppConfig:
         azure_openai_embedding_deployment=os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", ""),
         azure_openai_embedding_api_version=os.getenv("AZURE_OPENAI_EMBEDDING_API_VERSION", "2023-05-15"),
         heartbeat_interval_sec=int(os.getenv("HEARTBEAT_INTERVAL_SEC", "120")),
+        max_events_per_heartbeat=int(os.getenv("MAX_EVENTS_PER_HEARTBEAT", "50")),
+        queue_depth_warn_threshold=int(os.getenv("QUEUE_DEPTH_WARN_THRESHOLD", "200")),
         state_file=os.getenv("STATE_FILE", "data/agent_state.json"),
         max_history=int(os.getenv("MAX_HISTORY", "100")),
         agent_name=os.getenv("AGENT_NAME", "NATLClaw"),

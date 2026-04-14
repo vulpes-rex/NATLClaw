@@ -937,6 +937,16 @@ def cmd_status(args: argparse.Namespace, config: AppConfig) -> None:
         f"Scheduler: {'RUNNING' if sched['running'] else 'STOPPED'} "
         f"(in-process={sched['in_process_task_running']})"
     )
+    bp = sched.get("backpressure", {})
+    if bp:
+        print(
+            "Queue pressure: "
+            f"depth={bp.get('queue_depth_before_decision', 0)} | "
+            f"decision_used={bp.get('events_consumed_for_decision', 0)} | "
+            f"decision_spill={bp.get('decision_spillover_events', 0)} | "
+            f"wake_used={bp.get('wake_batch_events', 0)} | "
+            f"wake_spill={bp.get('wake_spillover_events', 0)}"
+        )
     print(
         f"Heartbeat: {hb['status']} | count={hb['count']} | "
         f"last={hb['last'] or '-'} | seconds_ago={hb['seconds_ago']}"

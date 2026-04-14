@@ -22,8 +22,10 @@ from scheduler import (
     retry,
     run_scheduler,
     _wait_for_event_or_timeout,
+    _drain_event_queue_bounded,
     acquire_scheduler_lock,
     get_scheduler_lock_info,
+    get_scheduler_runtime_backpressure_stats,
     release_scheduler_lock,
 )
 from config import AppConfig
@@ -42,6 +44,8 @@ def mock_config():
     config.model = "test-model"
     config.agent_name = "test-agent"
     config.heartbeat_interval_sec = 0.1  # Short interval for testing
+    config.max_events_per_heartbeat = 50
+    config.queue_depth_warn_threshold = 200
     config.state_file = "test_state.json"
     return config
 
@@ -260,6 +264,8 @@ def _make_scheduler_config(**overrides):
     config.model = overrides.get("model", "test-model")
     config.agent_name = "test-agent"
     config.heartbeat_interval_sec = 0.01
+    config.max_events_per_heartbeat = overrides.get("max_events_per_heartbeat", 50)
+    config.queue_depth_warn_threshold = overrides.get("queue_depth_warn_threshold", 200)
     config.state_file = "test_state.json"
     config.max_history = 100
     config.agent_instructions = None
@@ -608,3 +614,35 @@ def test_wait_for_event_or_timeout_drains_pending_events_file(tmp_path, monkeypa
     assert event is not None
     assert event[1] == "task_created"
     assert elapsed < 0.5, f"event wake-up took too long: {elapsed:.3f}s"
+
+
+def test_drain_event_queue_bounded_caps_and_reports_remaining():
+    """Bounded queue drain should leave spillover queued for next heartbeat."""
+    q = asyncio.PriorityQueue()
+    for i in range(6):
+        q.put_nowait((3, f"event_{i}", {"i": i}))
+
+    drained, remaining = _drain_event_queue_bounded(q, max_items=3)
+
+    assert len(drained) == 3
+    assert remaining == 3
+    assert q.qsize() == 3
+
+
+def test_scheduler_records_backpressure_stats():
+    """Scheduler should expose latest queue depth/cap usage stats."""
+    config = _make_scheduler_config(provider="foundry", max_events_per_heartbeat=2)
+    mock_heartbeat = AsyncMock()
+    q = asyncio.PriorityQueue()
+    # Enough events to force decision spillover with cap=2.
+    for i in range(5):
+        q.put_nowait((3, f"queued_{i}", {"i": i}))
+
+    with _scheduler_patches(mock_heartbeat), \
+         patch("scheduler._wait_for_event_or_timeout", new_callable=AsyncMock, return_value=None):
+        asyncio.run(run_scheduler(config, max_iterations=1, event_queue=q))
+
+    stats = get_scheduler_runtime_backpressure_stats()
+    assert stats["queue_depth_before_decision"] >= 5
+    assert stats["events_consumed_for_decision"] == 2
+    assert stats["decision_spillover_events"] >= 1

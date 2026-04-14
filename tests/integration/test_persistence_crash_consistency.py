@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from contextlib import ExitStack
 from unittest.mock import patch
@@ -229,4 +230,124 @@ async def test_scheduler_restart_path_remains_consistent_when_state_persistence_
     loaded = await load_state(state_file)
     assert loaded.execution_count == 5
     assert loaded.memory.get("checkpoint") == "stable"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_restart_path_recovers_brain_after_snapshot_replace_failures(tmp_path):
+    """Scheduler restart should recover brain state from SQLite after snapshot replace failures."""
+    state_file = str(tmp_path / "agent_state.json")
+    snapshot_path = _brain_path(state_file)
+
+    config = AppConfig(
+        provider="openai",
+        model="test-model",
+        openai_api_key="test-key",
+        heartbeat_interval_sec=10,
+        state_file=state_file,
+        max_history=50,
+        persona="default",
+        watch_path=str(tmp_path),
+    )
+
+    persona = MagicMock(name="persona")
+    persona.name = "default"
+    persona.instructions = "test"
+    persona.tools = []
+    persona.mcp_servers = {}
+    persona.workflow = "second_brain"
+    persona.heartbeat_schema = ""
+    persona.brain_schema = ""
+    persona.decision_policy = {}
+
+    decision = MagicMock()
+    decision.chosen.action.value = "run_heartbeat"
+    decision.chosen.score = 50.0
+    decision.chosen.rationale = "run work"
+    decision.supplementary_actions = []
+
+    class _FakeMetricsStore:
+        def __init__(self, *_args, **_kwargs):
+            self.records = 0
+
+        def record_heartbeat(self, **_kwargs):
+            self.records += 1
+
+        def close(self):
+            return None
+
+    heartbeat_counter = 0
+
+    async def _append_note(_agent, _state, brain, _config, _persona):
+        nonlocal heartbeat_counter
+        heartbeat_counter += 1
+        add_note(
+            brain,
+            content=f"scheduler note {heartbeat_counter}",
+            summary=f"scheduler-{heartbeat_counter}",
+        )
+
+    def _patch_scheduler_for_restart_run():
+        return [
+            patch("scheduler.load_persona", return_value=persona),
+            patch("scheduler.load_projects", new_callable=AsyncMock, return_value=[]),
+            patch("scheduler.detect_and_save_project", return_value=None),
+            patch("scheduler.create_agent", return_value=MagicMock()),
+            patch("scheduler.run_heartbeat", side_effect=_append_note),
+            patch("scheduler.decay_stale_notes_from_store", return_value=0),
+            patch(
+                "scheduler._wait_for_event_or_timeout",
+                new_callable=AsyncMock,
+                return_value=(3, "test_tick", {}),
+            ),
+            patch("daily_digest.is_first_run_today", return_value=False),
+            patch("decision_engine.build_decision_context", return_value=MagicMock()),
+            patch("decision_engine.evaluate_heartbeat", return_value=decision),
+            patch(
+                "decision_engine.apply_decision",
+                return_value={
+                    "action": "run_heartbeat",
+                    "active_task": None,
+                    "workflow_override": None,
+                    "skip_agent": False,
+                    "extra_context": "",
+                    "outbox_messages": [],
+                },
+            ),
+            patch("decision_engine.record_decision", return_value="note"),
+            patch("decision_engine.record_decision_outcome"),
+            patch("decision_engine.update_consecutive_empty"),
+            patch(
+                "event_watcher.EventWatcher",
+                return_value=MagicMock(start=MagicMock(), stop=MagicMock()),
+            ),
+            patch("event_watcher.drain_pending_events", return_value=0),
+            patch("scheduler.MetricsStore", _FakeMetricsStore),
+        ]
+
+    with ExitStack() as stack:
+        # Simulate repeated snapshot replace failures during first scheduler run.
+        stack.enter_context(
+            patch("second_brain.os.replace", side_effect=OSError("simulated snapshot replace crash"))
+        )
+        for p in _patch_scheduler_for_restart_run():
+            stack.enter_context(p)
+        await run_scheduler(config, max_iterations=2, event_queue=asyncio.PriorityQueue())
+
+    # Restart path should recover persisted brain data from SQLite.
+    recovered_after_failures = await load_brain(state_file)
+    recovered_summaries = [note.get("summary", "") for note in recovered_after_failures.notes.values()]
+    assert "scheduler-1" in recovered_summaries
+    assert "scheduler-2" in recovered_summaries
+    assert not os.path.exists(snapshot_path)
+
+    with ExitStack() as stack:
+        for p in _patch_scheduler_for_restart_run():
+            stack.enter_context(p)
+        await run_scheduler(config, max_iterations=2, event_queue=asyncio.PriorityQueue())
+
+    # Snapshot writes should reconcile once replace succeeds on restart.
+    reloaded = await load_brain(state_file)
+    final_summaries = [note.get("summary", "") for note in reloaded.notes.values()]
+    assert "scheduler-4" in final_summaries
+    assert os.path.exists(snapshot_path)
 

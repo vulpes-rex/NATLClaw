@@ -9,7 +9,7 @@ from config import AppConfig
 from error_classification import classify_error_text, top_error_types
 from execution_log import recent_entries
 from messaging import load_outbox
-from scheduler import get_scheduler_lock_info
+from scheduler import get_scheduler_lock_info, get_scheduler_runtime_backpressure_stats
 from state import load_state
 from tasks import get_active_task, get_blocked_tasks, load_tasks
 
@@ -158,6 +158,7 @@ async def build_operator_status(
             "running": in_process_scheduler_running or lock_scheduler_running,
             "in_process_task_running": in_process_scheduler_running,
             "lock": lock,
+            "backpressure": get_scheduler_runtime_backpressure_stats(),
         },
         "heartbeat": {
             "count": state.execution_count,

@@ -15,6 +15,10 @@
   - **Goal:** Prevent overload when events/tasks spike.
   - **Accept:** Per-heartbeat work caps, queue depth visibility, and graceful spillover behavior.
   - **Measure:** p95 heartbeat duration remains under target under burst load; no unbounded lag growth.
+  - **Progress:**
+    - [x] Added bounded per-heartbeat event draining with spillover semantics in scheduler (`scheduler.py`).
+    - [x] Added queue/backpressure runtime visibility surfaced through operator status (`operator_status.py`, `cli.py`).
+    - [x] Added burst-load integration validation for bounded spillover behavior (`tests/integration/test_scheduler_soak.py`).
 
 - [ ] **S15: Operator control plane hardening**
   - **Goal:** Give operators deterministic control during incidents.
@@ -49,7 +53,7 @@
 ## In Progress (WIP Limit: 3)
 
 - [ ] **S13: Persistence integrity + crash consistency**
-- [ ] *(empty)*
+- [ ] **S14: Scheduler backpressure + bounded work per heartbeat**
 - [ ] *(empty)*
 
 ## Done

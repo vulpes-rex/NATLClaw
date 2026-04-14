@@ -628,6 +628,16 @@ class TestConfigValidation:
         errors = validate_config(config)
         assert any("max_history" in e for e in errors)
 
+    def test_low_max_events_per_heartbeat(self):
+        config = _fresh_config(max_events_per_heartbeat=0)
+        errors = validate_config(config)
+        assert any("max_events_per_heartbeat" in e for e in errors)
+
+    def test_low_queue_depth_warn_threshold(self):
+        config = _fresh_config(queue_depth_warn_threshold=0)
+        errors = validate_config(config)
+        assert any("queue_depth_warn_threshold" in e for e in errors)
+
     def test_valid_foundry_config(self):
         config = _fresh_config(provider="foundry", project_endpoint="https://example.com")
         errors = validate_config(config)

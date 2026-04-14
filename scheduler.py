@@ -100,6 +100,16 @@ def retry(max_attempts: int = 3, delay: float = 0.5, backoff: float = 2.0):
 
 logger = logging.getLogger(__name__)
 EVENT_WAKE_POLL_SEC = 0.5
+DEFAULT_MAX_EVENTS_PER_HEARTBEAT = 50
+DEFAULT_QUEUE_DEPTH_WARN_THRESHOLD = 200
+
+_runtime_backpressure_stats: dict[str, int] = {
+    "queue_depth_before_decision": 0,
+    "events_consumed_for_decision": 0,
+    "decision_spillover_events": 0,
+    "wake_batch_events": 0,
+    "wake_spillover_events": 0,
+}
 
 
 # ── Scheduler singleton lock ────────────────────────────────────────
@@ -235,6 +245,30 @@ def release_scheduler_lock() -> None:
     _LOCK_FILE = None
 
 
+def _drain_event_queue_bounded(
+    event_queue: asyncio.PriorityQueue[tuple[int, str, dict]],
+    *,
+    max_items: int,
+) -> tuple[list[tuple[int, str, dict]], int]:
+    """Drain at most ``max_items`` events and report remaining queue depth."""
+    if max_items <= 0:
+        return [], event_queue.qsize()
+    drained: list[tuple[int, str, dict]] = []
+    for _ in range(max_items):
+        if event_queue.empty():
+            break
+        try:
+            drained.append(event_queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+    return drained, event_queue.qsize()
+
+
+def get_scheduler_runtime_backpressure_stats() -> dict[str, int]:
+    """Return latest scheduler backpressure/queue metrics for operator visibility."""
+    return dict(_runtime_backpressure_stats)
+
+
 async def _wait_for_event_or_timeout(
     event_queue: asyncio.PriorityQueue[tuple[int, str, dict]],
     *,
@@ -293,6 +327,26 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
     _load_outbox = retry()(load_outbox)
     _save_outbox = retry()(save_outbox)
     _load_projects = retry()(load_projects)
+    max_events_per_heartbeat = max(
+        1,
+        int(
+            getattr(
+                config,
+                "max_events_per_heartbeat",
+                DEFAULT_MAX_EVENTS_PER_HEARTBEAT,
+            )
+        ),
+    )
+    queue_depth_warn_threshold = max(
+        1,
+        int(
+            getattr(
+                config,
+                "queue_depth_warn_threshold",
+                DEFAULT_QUEUE_DEPTH_WARN_THRESHOLD,
+            )
+        ),
+    )
 
     # Event queue for event-driven scheduling
     # Priority queue: (priority, event_type, payload)
@@ -461,13 +515,29 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                 update_consecutive_empty,
             )
 
-            # Drain queued events into a list for the decision context
-            pending_events: list[tuple[int, str, dict]] = []
-            while not event_queue.empty():
-                try:
-                    pending_events.append(event_queue.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
+            # Backpressure: cap queue work per heartbeat and spill excess.
+            queue_depth_before_decision = event_queue.qsize()
+
+            pending_events, decision_spillover = _drain_event_queue_bounded(
+                event_queue,
+                max_items=max_events_per_heartbeat,
+            )
+            _runtime_backpressure_stats["queue_depth_before_decision"] = queue_depth_before_decision
+            _runtime_backpressure_stats["events_consumed_for_decision"] = len(pending_events)
+            _runtime_backpressure_stats["decision_spillover_events"] = decision_spillover
+
+            if queue_depth_before_decision >= queue_depth_warn_threshold:
+                logger.warning(
+                    "Event queue depth elevated before decision phase: depth=%d (threshold=%d)",
+                    queue_depth_before_decision,
+                    queue_depth_warn_threshold,
+                )
+            if decision_spillover > 0:
+                logger.info(
+                    "Backpressure: capped decision events to %d; spilling %d event(s) to next heartbeat",
+                    len(pending_events),
+                    decision_spillover,
+                )
 
             decision_ctx = build_decision_context(
                 state, brain, tasks, outbox, pending_events, persona,
@@ -659,15 +729,23 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                     "Woke on event: %s (priority=%d, payload_keys=%s)",
                     event_type, priority, list(payload.keys()),
                 )
-                # Drain any additional queued events
+                # Drain any additional queued events, bounded per heartbeat.
                 batch = [event]
-                while not event_queue.empty():
-                    try:
-                        batch.append(event_queue.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
+                tail, wake_spillover = _drain_event_queue_bounded(
+                    event_queue,
+                    max_items=max(0, max_events_per_heartbeat - 1),
+                )
+                batch.extend(tail)
+                _runtime_backpressure_stats["wake_batch_events"] = len(batch)
+                _runtime_backpressure_stats["wake_spillover_events"] = wake_spillover
                 if len(batch) > 1:
                     logger.info("Drained %d queued events total", len(batch))
+                if wake_spillover > 0:
+                    logger.info(
+                        "Backpressure: wake batch capped at %d event(s); %d event(s) remain queued",
+                        len(batch),
+                        wake_spillover,
+                    )
                 # Task events → next heartbeat runs immediately
                 has_task_event = any(
                     ev[1] in ("task_created", "task_answered", "task_retried")
