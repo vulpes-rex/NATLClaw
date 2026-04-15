@@ -15,6 +15,21 @@ compounds in value when combined.
 
 ---
 
+## Current Enforced Quality Gates
+
+The runtime lint currently enforces these observer-oriented checks:
+
+- `missing_citation`: workspace observer notes must include concrete evidence
+  (commit hash and/or file paths).
+- `tag_quality`: active notes must include at least one non-generic tag.
+- `stale_pattern`: older repeated "same files touched" observer notes are
+  flagged for cleanup/consolidation.
+
+These checks are in `second_brain.lint_brain()` and are surfaced through
+`brain lint` and heartbeat health context.
+
+---
+
 ## 1. Lint / Health-Check Step
 
 ### 1.1 Problem

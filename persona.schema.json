@@ -61,6 +61,30 @@
       "items": { "type": "string" },
       "uniqueItems": true
     },
+    "dream": {
+      "description": "Idle dream-cycle policy for background memory maintenance.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable automatic scheduler dream runs during idle periods."
+        },
+        "idleStreakMin": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3,
+          "description": "Number of consecutive idle heartbeats required before a dream run."
+        },
+        "maxAgeDays": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30,
+          "description": "Stale-note decay threshold used by dream pruning."
+        }
+      }
+    },
 
     "tools": {
       "description": "Python tool configuration. Use 'file' for a local .py file (recommended for 3rd-party repos) or 'module' for an installed package.",

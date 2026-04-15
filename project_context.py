@@ -264,6 +264,58 @@ def infer_active_work(project: Project) -> str:
     return f"Active in {project.branch or 'default'} branch"
 
 
+def get_active_work_snapshot(project: Project, *, max_files: int = 5) -> dict[str, Any]:
+    """Build a concise active-work snapshot for status surfaces."""
+    branch = project.branch or "unknown"
+    commit_intent = ""
+    files: list[str] = []
+    try:
+        intent_result = subprocess.run(
+            ["git", "-C", project.path, "log", "--format=%s", "-1"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        commit_intent = (intent_result.stdout or "").strip()
+    except Exception:
+        commit_intent = ""
+
+    try:
+        status_result = subprocess.run(
+            ["git", "-C", project.path, "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        lines = [line.rstrip() for line in (status_result.stdout or "").splitlines() if line.strip()]
+        for line in lines:
+            path_part = line[3:].strip()
+            if " -> " in path_part:
+                path_part = path_part.split(" -> ", 1)[1].strip()
+            if path_part and path_part not in files:
+                files.append(path_part)
+            if len(files) >= max_files:
+                break
+    except Exception:
+        files = []
+
+    summary_parts = [f"branch={branch}"]
+    if files:
+        summary_parts.append("files=" + ", ".join(files))
+    if commit_intent:
+        summary_parts.append(f"intent={commit_intent}")
+    elif project.active_work:
+        summary_parts.append(f"intent={project.active_work}")
+    summary = " | ".join(summary_parts)
+
+    return {
+        "branch": branch,
+        "files": files,
+        "commit_intent": commit_intent or project.active_work or "",
+        "summary": summary,
+    }
+
+
 def save_project(project: Project, state_file: str) -> None:
     """Save project metadata to disk."""
     projects_file = os.path.join(os.path.dirname(state_file), "projects.json")

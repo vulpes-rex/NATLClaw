@@ -4,5 +4,6 @@ Output:
 {result}
 
 Do NOT call any tools or functions. The system will store the note automatically.
-Just respond with a JSON object: {{"topic": "...", "content": "...", "tags": [...], "category": "resources"}}
+Just respond with a JSON object:
+{{"topic": "...", "content": "...", "tags": [...], "category": "resources", "evidence": ["commit:<sha> and/or file:path"], "confidence": 0-100}}
 Return ONLY the JSON object, no extra text.

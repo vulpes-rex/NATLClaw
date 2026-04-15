@@ -800,6 +800,92 @@ def _pick_supplementary(
     return supplementary[:2]  # at most 2 supplementary actions
 
 
+def collect_escalation_signals(ctx: DecisionContext) -> list[dict[str, Any]]:
+    """Deterministically derive escalation alerts from heartbeat context."""
+    escalations: list[dict[str, Any]] = []
+
+    # 1) Repeated bug-fix work pattern.
+    bug_tokens = ("bug", "fix", "hotfix", "regression", "incident")
+    bug_signal_count = 0
+    for _priority, event_type, payload in ctx.events:
+        haystack = f"{event_type} {payload}".lower()
+        if any(token in haystack for token in bug_tokens):
+            bug_signal_count += 1
+    for task in [ctx.active_task, *ctx.pending_tasks]:
+        if task is None:
+            continue
+        text = f"{getattr(task, 'title', '')} {getattr(task, 'description', '')}".lower()
+        if any(token in text for token in bug_tokens):
+            bug_signal_count += 1
+    if bug_signal_count >= 2:
+        escalations.append({
+            "type": "repeated_bug_work",
+            "severity": "high",
+            "title": "Repeated bug-fix pattern detected",
+            "body": (
+                "Recent activity is dominated by bug/fix work. Consider root-cause follow-up "
+                "before shipping additional changes."
+            ),
+            "payload": {"bug_signal_count": bug_signal_count},
+        })
+
+    # 2) TODO unchanged despite repeated touches.
+    touched_counts: dict[str, int] = {}
+    explicit_unchanged = False
+    for _priority, event_type, payload in ctx.events:
+        if event_type not in ("file_change", "file_modified"):
+            continue
+        path = str(payload.get("path", "")).strip()
+        if path:
+            touched_counts[path] = touched_counts.get(path, 0) + 1
+        if payload.get("todo_changed") is False or payload.get("todos_changed") == 0:
+            explicit_unchanged = True
+    noisy_todo_touch = any(
+        count >= 3 and "todo" in path.lower()
+        for path, count in touched_counts.items()
+    )
+    if explicit_unchanged or noisy_todo_touch:
+        escalations.append({
+            "type": "todo_stagnation",
+            "severity": "normal",
+            "title": "TODOs appear unchanged despite edits",
+            "body": (
+                "Files are being touched repeatedly without clear TODO progress. "
+                "Re-check task slicing and completion criteria."
+            ),
+            "payload": {
+                "explicit_unchanged": explicit_unchanged,
+                "touched_paths": touched_counts,
+            },
+        })
+
+    # 3) Long inactivity.
+    inactivity_hours: float | None = None
+    if ctx.last_heartbeat_iso:
+        try:
+            last = datetime.fromisoformat(ctx.last_heartbeat_iso)
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            inactivity_hours = (
+                datetime.now(timezone.utc) - last.astimezone(timezone.utc)
+            ).total_seconds() / 3600.0
+        except (TypeError, ValueError):
+            inactivity_hours = None
+    if inactivity_hours is not None and inactivity_hours >= 6:
+        escalations.append({
+            "type": "long_inactivity",
+            "severity": "high" if inactivity_hours >= 24 else "normal",
+            "title": "Extended inactivity detected",
+            "body": (
+                f"No heartbeat activity for approximately {inactivity_hours:.1f} hour(s). "
+                "Validate scheduler health and unblock next work item."
+            ),
+            "payload": {"inactivity_hours": round(inactivity_hours, 1)},
+        })
+
+    return escalations
+
+
 # =====================================================================
 # 5. Decision Recording (brain notes)
 # =====================================================================
@@ -1136,6 +1222,7 @@ def apply_decision(
     outbox: list,
     persona,
     config,
+    ctx: DecisionContext | None = None,
 ) -> dict:
     """Translate a HeartbeatDecision into scheduler-actionable directives.
 
@@ -1152,7 +1239,7 @@ def apply_decision(
             "outbox_messages": [Message],  # messages to append
         }
     """
-    from messaging import emit_alert
+    from messaging import emit_alert, emit_escalation_alert
 
     result = {
         "action": decision.chosen.action.value,
@@ -1214,6 +1301,20 @@ def apply_decision(
         result["extra_context"] += (
             f"\n\n[Decision engine supplementary: also consider {supp_text} if time permits]"
         )
+
+    if ctx is not None:
+        for escalation in collect_escalation_signals(ctx):
+            result["outbox_messages"].append(
+                emit_escalation_alert(
+                    escalation_type=escalation["type"],
+                    title=escalation["title"],
+                    body=escalation["body"],
+                    severity=escalation["severity"],
+                    persona=persona.name,
+                    heartbeat=state.execution_count,
+                    payload=escalation.get("payload", {}),
+                )
+            )
 
     return result
 

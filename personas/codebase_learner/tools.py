@@ -10,11 +10,13 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import asyncio
 from pathlib import Path
 from typing import Annotated
 
+import event_watcher
+
 WORKSPACE = os.environ.get("NATL_WORKSPACE", ".")
-EVENT_QUEUE_PATH = os.path.join("data", "event_queue.json")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -27,15 +29,27 @@ def drain_events() -> str:
     Events are newline-delimited JSON objects appended by file watchers
     and git hooks between heartbeats.
     """
-    if not os.path.exists(EVENT_QUEUE_PATH):
+    queue: asyncio.PriorityQueue[tuple[int, str, dict]] = asyncio.PriorityQueue()
+    drained = event_watcher.drain_pending_events(queue)
+    if drained <= 0:
         return "No pending events."
-    try:
-        with open(EVENT_QUEUE_PATH, "r", encoding="utf-8") as f:
-            content = f.read()
-        os.remove(EVENT_QUEUE_PATH)
-        return content[:6000] or "No pending events."
-    except OSError as e:
-        return f"Error reading event queue: {e}"
+    records: list[str] = []
+    while not queue.empty():
+        try:
+            priority, event_type, payload = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        records.append(
+            json.dumps(
+                {
+                    "priority": priority,
+                    "event_type": event_type,
+                    "payload": payload,
+                },
+                ensure_ascii=False,
+            )
+        )
+    return ("\n".join(records))[:6000] or "No pending events."
 
 
 # ──────────────────────────────────────────────────────────────────────

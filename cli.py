@@ -24,6 +24,8 @@ Usage
     python cli.py brain add "insight"    # Manually add a note
     python cli.py brain export           # Dump brain to markdown
     python cli.py brain lint             # Run health check
+    python cli.py brain dream --policy   # Show effective dream policy
+    python cli.py brain dream --apply    # Run sleep/dream maintenance cycle
     python cli.py inbox list                # Show unread messages
     python cli.py inbox list -a            # Show all messages
     python cli.py inbox show m1a2b3        # View message detail (marks read)
@@ -47,6 +49,8 @@ Usage
     python cli.py watch install-hook      # Install git post-commit hook
     python cli.py config show            # Print resolved config
     python cli.py config validate        # Check for missing/invalid settings
+    python cli.py telemetry profile --run-sample  # Exercise Sentry manual profiler
+    python cli.py telemetry test-error   # Send a synthetic exception to Sentry
     python cli.py api                    # Start HTTP API server
     python cli.py api --port 9000        # Custom port
 """
@@ -57,9 +61,16 @@ import asyncio
 import json
 import logging
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# Ensure sibling top-level modules remain importable when `natl` is launched
+# from an installed console script entrypoint.
+_CLI_DIR = Path(__file__).resolve().parent
+if str(_CLI_DIR) not in sys.path:
+    sys.path.insert(0, str(_CLI_DIR))
 
 from config import AppConfig, load_config, validate_config
 from execution_log import (
@@ -68,6 +79,7 @@ from execution_log import (
     set_db_path as _set_log_db_path,
 )
 from persona_loader import load_persona  # ADD THIS IMPORT
+from telemetry import init_sentry, send_test_exception, start_sentry_profiler, stop_sentry_profiler
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -158,6 +170,8 @@ def cmd_brain_stats(args: argparse.Namespace, config: AppConfig) -> None:
     print(f"Connection density: {stats['connection_density']:.2f}")
     print(f"Last review:       {stats['last_review']}")
     print(f"Last consolidation: {stats['last_consolidation']}")
+    print(f"Last dream:        {stats.get('last_dream', 'never')}")
+    print(f"Last dream heartbeat: {stats.get('last_dream_heartbeat', 0)}")
     if stats["categories"]:
         print(f"Categories:        {', '.join(f'{k}={v}' for k, v in sorted(stats['categories'].items()))}")
     if stats["note_types"]:
@@ -477,6 +491,79 @@ def cmd_brain_lint(args: argparse.Namespace, config: AppConfig) -> None:
         print(f"  [{prefix}] {issue['type']}: {issue['message']} ({nid})")
 
 
+def cmd_brain_dream(args: argparse.Namespace, config: AppConfig) -> None:
+    """Run deterministic sleep/dream maintenance over the brain."""
+    from second_brain import load_brain, run_dream_cycle, save_brain
+
+    if bool(getattr(args, "policy", False)):
+        persona = load_persona(config.persona)
+        policy = {
+            "persona": persona.name,
+            "dream": {
+                "enabled": bool(getattr(persona, "dream_enabled", True)),
+                "idle_streak_min": int(getattr(persona, "dream_idle_streak_min", 3)),
+                "max_age_days": int(getattr(persona, "dream_max_age_days", 30)),
+            },
+        }
+        if bool(getattr(args, "json", False)):
+            if bool(getattr(args, "compact", False)):
+                print(json.dumps(policy, separators=(",", ":"), sort_keys=True))
+            else:
+                print(json.dumps(policy, indent=2, sort_keys=True))
+        else:
+            dream_cfg = policy["dream"]
+            print(f"Dream policy ({policy['persona']}):")
+            print(f"  enabled={dream_cfg['enabled']}")
+            print(f"  idle_streak_min={dream_cfg['idle_streak_min']}")
+            print(f"  max_age_days={dream_cfg['max_age_days']}")
+        return
+
+    async def _dream():
+        brain = await load_brain(config.state_file)
+        report = run_dream_cycle(
+            brain,
+            heartbeat_number=args.heartbeat if args.heartbeat > 0 else None,
+            apply=bool(args.apply),
+            max_age_days=max(1, int(args.max_age_days)),
+            trigger="cli_apply" if args.apply else "cli_dry_run",
+        )
+        if args.apply:
+            await save_brain(brain, config.state_file)
+
+        if bool(getattr(args, "json", False)):
+            if bool(getattr(args, "compact", False)):
+                print(json.dumps(report, separators=(",", ":"), sort_keys=True))
+            else:
+                print(json.dumps(report, indent=2, sort_keys=True))
+            return
+
+        mode = "APPLY" if args.apply else "DRY-RUN"
+        print(f"Dream cycle ({mode}) at {report['timestamp']}")
+        print(
+            "  gather.unconsolidated="
+            f"{report['phases']['gather']['unconsolidated']}"
+        )
+        print(
+            "  consolidate.exact_duplicates_archived="
+            f"{report['phases']['consolidate']['exact_duplicates_archived']}"
+        )
+        print(
+            "  prune.stale_archived="
+            f"{report['phases']['prune']['stale_archived']}"
+        )
+        print(
+            "  prune.lint_issues="
+            f"{report['phases']['prune']['lint_issues']}"
+        )
+        print(
+            "  notes: "
+            f"{report['before']['notes']} -> {report['after']['notes']}, "
+            f"orphans: {report['before']['orphans']} -> {report['after']['orphans']}"
+        )
+
+    asyncio.run(_dream())
+
+
 def cmd_persona_list(args: argparse.Namespace, config: AppConfig) -> None:
     """Show available personas."""
     from persona_loader import list_personas, load_persona
@@ -541,16 +628,21 @@ def cmd_watch_stop(args: argparse.Namespace, config: AppConfig) -> None:
 
 def cmd_watch_status(args: argparse.Namespace, config: AppConfig) -> None:
     """Show whether the event watcher is running."""
-    from event_watcher import is_watcher_running, _read_pid, EVENT_QUEUE_PATH
+    from event_watcher import is_watcher_running, _read_pid, pending_events_status
     if is_watcher_running():
         print(f"Watcher is RUNNING (PID {_read_pid()}).")
     else:
         print("Watcher is NOT running.")
-    if EVENT_QUEUE_PATH.exists():
-        lines = EVENT_QUEUE_PATH.read_text(encoding="utf-8").strip().splitlines()
-        print(f"Event queue: {len(lines)} pending event(s).")
-    else:
+    queue = pending_events_status()
+    if not queue["exists"] or queue["total_lines"] == 0:
         print("Event queue: empty.")
+        return
+    print(f"Event queue: {queue['total_lines']} pending event(s).")
+    if queue["by_type"]:
+        parts = [f"{count} {event_type}" for event_type, count in sorted(queue["by_type"].items())]
+        print(f"  by type: {', '.join(parts)}")
+    if queue["malformed_lines"]:
+        print(f"  malformed: {queue['malformed_lines']}")
 
 
 def cmd_watch_install_hook(args: argparse.Namespace, config: AppConfig) -> None:
@@ -659,6 +751,7 @@ def cmd_brief(args: argparse.Namespace, config: AppConfig) -> None:
         brain,
         state.last_heartbeat,
         persona_name=persona.name,
+        active_work=state.context.get("active_work") if isinstance(state.context, dict) else None,
     )
     print(digest)
 
@@ -924,6 +1017,7 @@ def cmd_status(args: argparse.Namespace, config: AppConfig) -> None:
 
     sched = snap["scheduler"]
     hb = snap["heartbeat"]
+    active_work = snap.get("active_work") or {}
     tasks = snap["tasks"]
     inbox = snap["inbox"]
     errors = snap["errors"]
@@ -937,6 +1031,16 @@ def cmd_status(args: argparse.Namespace, config: AppConfig) -> None:
         f"Scheduler: {'RUNNING' if sched['running'] else 'STOPPED'} "
         f"(in-process={sched['in_process_task_running']})"
     )
+    try:
+        persona = load_persona(config.persona)
+        print(
+            "Dream policy: "
+            f"enabled={getattr(persona, 'dream_enabled', True)} | "
+            f"idle_streak_min={getattr(persona, 'dream_idle_streak_min', 3)} | "
+            f"max_age_days={getattr(persona, 'dream_max_age_days', 30)}"
+        )
+    except Exception as e:
+        print(f"Dream policy: unavailable ({e})")
     control = sched.get("control", {})
     if control:
         print(
@@ -960,6 +1064,15 @@ def cmd_status(args: argparse.Namespace, config: AppConfig) -> None:
         f"Heartbeat: {hb['status']} | count={hb['count']} | "
         f"last={hb['last'] or '-'} | seconds_ago={hb['seconds_ago']}"
     )
+    if active_work:
+        files = active_work.get("files") or []
+        files_preview = ", ".join(files[:3]) if files else "-"
+        print(
+            "Current active work: "
+            f"branch={active_work.get('branch', '-')}"
+            f" | files={files_preview}"
+            f" | intent={active_work.get('commit_intent', '-') or '-'}"
+        )
     if active:
         print(
             "Active task: "
@@ -1118,6 +1231,67 @@ def cmd_config_validate(args: argparse.Namespace, config: AppConfig) -> None:
         sys.exit(1)
     else:
         print("Configuration is valid.")
+
+
+def cmd_telemetry_profile(args: argparse.Namespace, config: AppConfig) -> None:
+    """Exercise Sentry manual profiler from the CLI."""
+    if not getattr(args, "run_sample", False):
+        print("No workload selected. Re-run with --run-sample.")
+        return
+
+    iterations = max(1, int(getattr(args, "iterations", 10)))
+    slow_sleep = max(0.0, float(getattr(args, "slow_ms", 100)) / 1000.0)
+    fast_sleep = max(0.0, float(getattr(args, "fast_ms", 50)) / 1000.0)
+
+    if not start_sentry_profiler():
+        print(
+            "Sentry profiler is unavailable. Ensure Sentry is enabled and the installed "
+            "SDK supports manual profiling."
+        )
+        return
+
+    print(
+        "Profiling sample workload "
+        f"({iterations} iterations, slow={slow_sleep:.3f}s, fast={fast_sleep:.3f}s)..."
+    )
+    started_at = time.perf_counter()
+    try:
+        for _ in range(iterations):
+            time.sleep(slow_sleep)
+            time.sleep(fast_sleep)
+    finally:
+        stop_sentry_profiler()
+
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    print(f"Completed {iterations} iteration(s) in {elapsed_ms:.1f}ms.")
+
+
+def cmd_telemetry_test_error(args: argparse.Namespace, config: AppConfig) -> None:
+    """Emit a synthetic exception to verify Sentry ingestion."""
+    if not (config.sentry_dsn or "").strip():
+        print(
+            "SENTRY_DSN is not set. NATLClaw reads it from your environment or .env file.\n"
+            "\n"
+            "Add to .env (recommended):\n"
+            "  SENTRY_DSN=https://<key>@<org>.ingest.us.sentry.io/<project_id>\n"
+            "\n"
+            "Or for one PowerShell session only:\n"
+            '  $env:SENTRY_DSN="https://..."\n'
+            "  natl telemetry test-error\n"
+            "\n"
+            "(Setting a variable named dsn= does not set SENTRY_DSN.)"
+        )
+        return
+
+    event_id = send_test_exception(config)
+    if event_id:
+        print(f"Sent Sentry test exception. event_id={event_id}")
+    else:
+        print(
+            "Failed to send Sentry test exception. "
+            "Try: natl -v telemetry test-error  (check for Sentry init errors), "
+            "and confirm sentry-sdk is installed in this venv."
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1756,6 +1930,13 @@ def build_parser() -> argparse.ArgumentParser:
     export_p.add_argument("-o", "--output", help="Output file path (default: stdout)")
 
     brain_sub.add_parser("lint", help="Run brain health check")
+    dream_p = brain_sub.add_parser("dream", help="Run sleep/dream brain maintenance")
+    dream_p.add_argument("--apply", action="store_true", help="Persist dream changes (default: dry-run)")
+    dream_p.add_argument("--heartbeat", type=int, default=0, help="Optional heartbeat number to stamp in metadata")
+    dream_p.add_argument("--max-age-days", type=int, default=30, help="Decay threshold in days (default: 30)")
+    dream_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON report")
+    dream_p.add_argument("--compact", action="store_true", help="When used with --json, emit single-line JSON")
+    dream_p.add_argument("--policy", action="store_true", help="Print effective dream policy for the active persona")
 
     # task
     task_p = sub.add_parser("task", help="Task queue management")
@@ -1827,6 +2008,40 @@ def build_parser() -> argparse.ArgumentParser:
     config_sub.add_parser("show", help="Print resolved config")
     config_sub.add_parser("validate", help="Check for config errors")
 
+    # telemetry
+    telemetry_p = sub.add_parser("telemetry", help="Telemetry and profiler tools")
+    telemetry_sub = telemetry_p.add_subparsers(dest="telemetry_command")
+    telemetry_profile_p = telemetry_sub.add_parser(
+        "profile", help="Run Sentry profiler around a sample workload"
+    )
+    telemetry_profile_p.add_argument(
+        "--run-sample",
+        action="store_true",
+        help="Run a built-in slow/fast workload while profiler is active",
+    )
+    telemetry_profile_p.add_argument(
+        "--iterations",
+        type=int,
+        default=10,
+        help="Number of sample loop iterations (default: 10)",
+    )
+    telemetry_profile_p.add_argument(
+        "--slow-ms",
+        type=float,
+        default=100.0,
+        help="Sleep duration for slow function in milliseconds (default: 100)",
+    )
+    telemetry_profile_p.add_argument(
+        "--fast-ms",
+        type=float,
+        default=50.0,
+        help="Sleep duration for fast function in milliseconds (default: 50)",
+    )
+    telemetry_sub.add_parser(
+        "test-error",
+        help="Send a synthetic exception to Sentry for ingestion verification",
+    )
+
     # api
     api_p = sub.add_parser("api", help="Start the HTTP API server")
     api_p.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
@@ -1845,6 +2060,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     _setup_logging(args.verbose)
     config = load_config(args.env)
+    init_sentry(config)
 
     # Point the execution log at the same data directory as the state file
     import os as _os
@@ -1883,6 +2099,7 @@ def main(argv: list[str] | None = None) -> None:
             "add": cmd_brain_add,
             "export": cmd_brain_export,
             "lint": cmd_brain_lint,
+            "dream": cmd_brain_dream,
         },
         "persona": {
             "list": cmd_persona_list,
@@ -1905,6 +2122,10 @@ def main(argv: list[str] | None = None) -> None:
         "config": {
             "show": cmd_config_show,
             "validate": cmd_config_validate,
+        },
+        "telemetry": {
+            "profile": cmd_telemetry_profile,
+            "test-error": cmd_telemetry_test_error,
         },
         "api": cmd_api,
     }

@@ -25,6 +25,7 @@ from second_brain import (
     decay_stale_notes,
     decay_stale_notes_from_store,
     load_brain,
+    run_dream_cycle,
     save_brain,
 )
 from state import AgentState, load_state, save_state
@@ -53,6 +54,7 @@ from workflow import run_heartbeat, run_task_heartbeat
 
 from project_context import (
     detect_and_save_project,
+    get_active_work_snapshot,
     load_projects,
     Project,
 )
@@ -106,6 +108,8 @@ logger = logging.getLogger(__name__)
 EVENT_WAKE_POLL_SEC = 0.5
 DEFAULT_MAX_EVENTS_PER_HEARTBEAT = 50
 DEFAULT_QUEUE_DEPTH_WARN_THRESHOLD = 200
+DEFAULT_DREAM_IDLE_STREAK_MIN = 3
+DEFAULT_DREAM_MAX_AGE_DAYS = 30
 
 _runtime_backpressure_stats: dict[str, int] = {
     "queue_depth_before_decision": 0,
@@ -273,6 +277,38 @@ def get_scheduler_runtime_backpressure_stats() -> dict[str, int]:
     return dict(_runtime_backpressure_stats)
 
 
+def _is_idle_dream_candidate(
+    *,
+    had_error: bool,
+    active_task: object | None,
+    queue_depth_before_decision: int,
+    decision_spillover: int,
+    queue_depth_now: int,
+) -> bool:
+    """Determine whether this cycle qualifies for idle dream work."""
+    return (
+        not had_error
+        and active_task is None
+        and queue_depth_before_decision == 0
+        and decision_spillover == 0
+        and queue_depth_now == 0
+    )
+
+
+def _resolve_dream_policy(persona: object) -> tuple[bool, int, int]:
+    """Resolve dream controls from persona settings with safe fallbacks."""
+    enabled = bool(getattr(persona, "dream_enabled", True))
+    try:
+        idle_streak_min = max(1, int(getattr(persona, "dream_idle_streak_min", DEFAULT_DREAM_IDLE_STREAK_MIN)))
+    except (TypeError, ValueError):
+        idle_streak_min = DEFAULT_DREAM_IDLE_STREAK_MIN
+    try:
+        max_age_days = max(1, int(getattr(persona, "dream_max_age_days", DEFAULT_DREAM_MAX_AGE_DAYS)))
+    except (TypeError, ValueError):
+        max_age_days = DEFAULT_DREAM_MAX_AGE_DAYS
+    return enabled, idle_streak_min, max_age_days
+
+
 async def _wait_for_event_or_timeout(
     event_queue: asyncio.PriorityQueue[tuple[int, str, dict]],
     *,
@@ -399,6 +435,7 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
 
     iteration_count = 0
     drain_shutdown_requested = False
+    dream_idle_streak = 0
     try:
         while True:
             iteration_count += 1
@@ -465,7 +502,12 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
             brain = await _load_brain(config.state_file)
             if is_first_run_today(state.last_heartbeat):
                 logger.info("First heartbeat of the day — generating daily digest")
-                digest = build_digest(brain, state.last_heartbeat, persona_name=persona.name)
+                digest = build_digest(
+                    brain,
+                    state.last_heartbeat,
+                    persona_name=persona.name,
+                    active_work=state.context.get("active_work") if isinstance(state.context, dict) else None,
+                )
                 logger.info("\n%s", digest)
                 try:
                     save_digest(digest)
@@ -487,6 +529,15 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
 
             # Project context block
             project_block = ""
+            active_work_snapshot = None
+            effective_project = current_project or (projects[0] if projects else None)
+            if effective_project:
+                try:
+                    active_work_snapshot = get_active_work_snapshot(effective_project)
+                    state.context["active_work"] = active_work_snapshot
+                except Exception:
+                    logger.debug("Failed to build active-work snapshot", exc_info=True)
+                    active_work_snapshot = None
             if current_project:
                 project_block = (
                     f"\nProject Context:\n"
@@ -495,6 +546,7 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                     f"- Framework: {current_project.framework}\n"
                     f"- Branch: {current_project.branch or 'unknown'}\n"
                     f"- Active work: {current_project.active_work or 'None'}\n"
+                    + (f"- Current active work: {active_work_snapshot['summary']}\n" if active_work_snapshot else "")
                 )
             elif projects:
                 p = projects[0]
@@ -505,6 +557,7 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                     f"- Framework: {p.framework}\n"
                     f"- Branch: {p.branch or 'unknown'}\n"
                     f"- Active work: {p.active_work or 'None'}\n"
+                    + (f"- Current active work: {active_work_snapshot['summary']}\n" if active_work_snapshot else "")
                 )
 
             # Governance schemas: HEARTBEAT.md (HOW) + BRAIN.md (WHAT)
@@ -559,7 +612,7 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
             )
             decision = evaluate_decision(decision_ctx, persona.decision_policy)
             directives = apply_decision(
-                decision, state, brain, tasks, outbox, persona, config,
+                decision, state, brain, tasks, outbox, persona, config, decision_ctx,
             )
             decision_note_id = record_decision(brain, decision, decision_ctx)
 
@@ -677,6 +730,43 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                     )
                 except Exception as rec_err:
                     logger.debug("Failed to record decision outcome: %s", rec_err)
+
+                dream_enabled, dream_idle_streak_min, dream_max_age_days = _resolve_dream_policy(persona)
+                idle_candidate = _is_idle_dream_candidate(
+                    had_error=had_error,
+                    active_task=active_task,
+                    queue_depth_before_decision=queue_depth_before_decision,
+                    decision_spillover=decision_spillover,
+                    queue_depth_now=event_queue.qsize(),
+                )
+                if not dream_enabled:
+                    dream_idle_streak = 0
+                else:
+                    dream_idle_streak = dream_idle_streak + 1 if idle_candidate else 0
+                if dream_enabled and dream_idle_streak >= dream_idle_streak_min:
+                    try:
+                        dream_report = run_dream_cycle(
+                            brain,
+                            heartbeat_number=state.execution_count,
+                            apply=True,
+                            max_age_days=dream_max_age_days,
+                            trigger="auto_idle",
+                        )
+                        if dream_report.get("changed"):
+                            logger.info(
+                                "Idle dream applied (streak=%d, max_age_days=%d): dedup=%d, stale=%d, lint_issues=%d",
+                                dream_idle_streak_min,
+                                dream_max_age_days,
+                                dream_report["phases"]["consolidate"]["exact_duplicates_archived"],
+                                dream_report["phases"]["prune"]["stale_archived"],
+                                dream_report["phases"]["prune"]["lint_issues"],
+                            )
+                        else:
+                            logger.info("Idle dream ran with no structural changes")
+                    except Exception as dream_err:
+                        logger.warning("Idle dream cycle failed: %s", dream_err)
+                    finally:
+                        dream_idle_streak = 0
 
                 try:
                     await _save_state(state, config.state_file, config.max_history)

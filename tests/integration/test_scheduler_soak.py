@@ -349,3 +349,98 @@ async def test_scheduler_burst_events_are_spilled_across_heartbeats(tmp_path):
         await run_scheduler(config, max_iterations=3, event_queue=q)
 
     assert decision_event_batch_sizes == [3, 3, 3]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_soak_observer_persona_bounded_under_event_storm(tmp_path):
+    """Observer persona should stay bounded under bursty event storms."""
+    state_file = str(tmp_path / "state.json")
+    config = AppConfig(
+        provider="openai",
+        model="test-model",
+        openai_api_key="test-key",
+        heartbeat_interval_sec=1,
+        max_events_per_heartbeat=4,
+        state_file=state_file,
+        max_history=50,
+        persona="workspace_observer",
+        watch_path=str(tmp_path),
+    )
+
+    persona = MagicMock(name="persona")
+    persona.name = "workspace_observer"
+    persona.instructions = "observer"
+    persona.tools = []
+    persona.mcp_servers = {}
+    persona.workflow = "steps"
+    persona.heartbeat_schema = ""
+    persona.brain_schema = ""
+    persona.decision_policy = {}
+
+    decision = MagicMock()
+    decision.chosen.action.value = "run_heartbeat"
+    decision.chosen.score = 55.0
+    decision.chosen.rationale = "observer work"
+    decision.supplementary_actions = []
+
+    watcher = MagicMock()
+    watcher.start = MagicMock()
+    watcher.stop = MagicMock()
+
+    class _FakeMetricsStore:
+        def __init__(self, *_args, **_kwargs):
+            self.records = 0
+
+        def record_heartbeat(self, **_kwargs):
+            self.records += 1
+
+        def close(self):
+            return None
+
+    decision_event_batch_sizes: list[int] = []
+
+    def _capture_decision_context(state, brain, tasks, outbox, pending_events, persona):
+        decision_event_batch_sizes.append(len(pending_events))
+        return MagicMock()
+
+    q = asyncio.PriorityQueue()
+    for i in range(20):
+        q.put_nowait((2, "file_modified", {"path": f"src/f{i}.py"}))
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("scheduler.load_persona", return_value=persona))
+        stack.enter_context(patch("scheduler.load_state", new_callable=AsyncMock, return_value=AgentState()))
+        stack.enter_context(patch("scheduler.load_brain", new_callable=AsyncMock, return_value=BrainState()))
+        stack.enter_context(patch("scheduler.save_state", new_callable=AsyncMock))
+        stack.enter_context(patch("scheduler.save_brain", new_callable=AsyncMock))
+        stack.enter_context(patch("scheduler.load_tasks", new_callable=AsyncMock, return_value=[]))
+        stack.enter_context(patch("scheduler.save_tasks", new_callable=AsyncMock))
+        stack.enter_context(patch("scheduler.load_outbox", new_callable=AsyncMock, return_value=[]))
+        stack.enter_context(patch("scheduler.save_outbox", new_callable=AsyncMock))
+        stack.enter_context(patch("scheduler.load_projects", new_callable=AsyncMock, return_value=[]))
+        stack.enter_context(patch("scheduler.detect_and_save_project", return_value=None))
+        stack.enter_context(patch("scheduler.create_agent", return_value=MagicMock()))
+        stack.enter_context(patch("scheduler.run_heartbeat", new_callable=AsyncMock))
+        stack.enter_context(patch("scheduler.decay_stale_notes_from_store", return_value=0))
+        stack.enter_context(
+            patch(
+                "scheduler._wait_for_event_or_timeout",
+                new_callable=AsyncMock,
+                return_value=None,
+            )
+        )
+        stack.enter_context(patch("daily_digest.is_first_run_today", return_value=False))
+        stack.enter_context(
+            patch("decision_engine.build_decision_context", side_effect=_capture_decision_context)
+        )
+        stack.enter_context(patch("decision_engine.evaluate_heartbeat", return_value=decision))
+        stack.enter_context(patch("decision_engine.apply_decision", return_value=_directives()))
+        stack.enter_context(patch("decision_engine.record_decision", return_value="note"))
+        stack.enter_context(patch("decision_engine.record_decision_outcome"))
+        stack.enter_context(patch("decision_engine.update_consecutive_empty"))
+        stack.enter_context(patch("event_watcher.EventWatcher", return_value=watcher))
+        stack.enter_context(patch("event_watcher.drain_pending_events", return_value=0))
+        stack.enter_context(patch("scheduler.MetricsStore", _FakeMetricsStore))
+        await run_scheduler(config, max_iterations=3, event_queue=q)
+
+    assert decision_event_batch_sizes == [4, 4, 4]

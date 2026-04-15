@@ -387,6 +387,43 @@ def test_brain_lint(client):
     assert isinstance(r.json(), list)
 
 
+def test_brain_dream_policy(client):
+    r = client.get("/api/brain/dream/policy")
+    assert r.status_code == 200
+    data = r.json()
+    assert "persona" in data
+    assert "dream" in data
+    assert "enabled" in data["dream"]
+    assert "idle_streak_min" in data["dream"]
+    assert "max_age_days" in data["dream"]
+
+
+def test_brain_dream_run_dry_run_does_not_persist(client):
+    r = client.post("/api/brain/dream/run", json={"apply": False})
+    assert r.status_code == 200
+    report = r.json()
+    assert report["applied"] is False
+    stats = client.get("/api/brain/stats")
+    assert stats.status_code == 200
+    assert stats.json().get("last_dream", "never") == "never"
+
+
+def test_brain_dream_run_apply_persists(client):
+    r = client.post("/api/brain/dream/run", json={"apply": True, "heartbeat": 11})
+    assert r.status_code == 200
+    report = r.json()
+    assert report["applied"] is True
+    assert report["heartbeat"] == 11
+    stats = client.get("/api/brain/stats")
+    assert stats.status_code == 200
+    stats_payload = stats.json()
+    assert stats_payload.get("last_dream", "never") != "never"
+    runs = stats_payload.get("dream_runs_recent", [])
+    assert isinstance(runs, list)
+    assert len(runs) >= 1
+    assert runs[0].get("trigger") == "api_apply"
+
+
 # ── Watcher ────────────────────────────────────────────────────────────
 
 

@@ -45,6 +45,7 @@ with patch.dict('sys.modules', {
         build_brain_summary,
         load_brain,
         record_contradiction,
+        run_dream_cycle,
         save_brain,
         find_duplicate,
         decay_stale_notes,
@@ -752,6 +753,20 @@ def test_find_duplicate_no_match():
     assert dup_id is None
 
 
+def test_find_duplicate_observer_style_same_files_touched():
+    """Observer-style repeated 'same files touched' notes should dedupe."""
+    brain = BrainState()
+    add_note(
+        brain,
+        content="Workspace observer: same files touched again in scheduler.py and event_watcher.py.",
+    )
+    dup_id = find_duplicate(
+        brain,
+        "Workspace observer reports repeated touches in event_watcher.py and scheduler.py this cycle.",
+    )
+    assert dup_id == "n0001"
+
+
 def test_decay_stale_notes():
     """Test that old orphan notes are archived."""
     brain = BrainState()
@@ -797,6 +812,40 @@ def test_decay_stale_notes_preserves_connected():
     assert archived == 0
     assert brain.notes["n0001"]["category"] == "resources"
     assert brain.notes["n0002"]["category"] == "resources"
+
+
+def test_run_dream_cycle_dry_run_does_not_mutate():
+    """Dry-run dream should report changes without mutating the source brain."""
+    brain = BrainState()
+    add_note(brain, content="Repeatable insight content for dedup")
+    add_note(brain, content="Repeatable insight content for dedup")
+    before_categories = [n.get("category") for n in brain.notes.values()]
+
+    report = run_dream_cycle(brain, apply=False)
+
+    after_categories = [n.get("category") for n in brain.notes.values()]
+    assert report["applied"] is False
+    assert report["phases"]["consolidate"]["exact_duplicates_archived"] >= 1
+    assert before_categories == after_categories
+    assert brain.last_dream is None
+
+
+def test_run_dream_cycle_apply_sets_metadata_and_archives_duplicates():
+    """Applied dream should archive exact duplicates and stamp metadata."""
+    brain = BrainState()
+    add_note(brain, content="Same canonical text here for archival")
+    add_note(brain, content="Same canonical text here for archival")
+
+    report = run_dream_cycle(brain, apply=True, heartbeat_number=42)
+
+    archived_count = sum(1 for n in brain.notes.values() if n.get("category") == "archive")
+    assert report["applied"] is True
+    assert archived_count >= 1
+    assert brain.last_dream
+    assert brain.last_dream_heartbeat == 42
+    assert report["after"]["last_dream_heartbeat"] == 42
+    assert len(brain.dream_log) == 1
+    assert brain.dream_log[0]["trigger"] == "manual"
 
 
 # ── Access-frequency ranking (Brain Phase 2) ─────────────────────────

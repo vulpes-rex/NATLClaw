@@ -15,6 +15,7 @@ from messaging import (
     create_message,
     dismiss_all_read,
     emit_alert,
+    emit_escalation_alert,
     emit_fyi,
     emit_task_blocked,
     emit_task_completed,
@@ -144,6 +145,22 @@ class TestEmitHelpers:
         assert m.urgency == "high"
         assert m.title == "Error spike"
         assert m.payload["severity"] == "high"
+
+    def test_emit_escalation_alert(self):
+        m = emit_escalation_alert(
+            "repeated_bug_work",
+            "Repeated bug-fix pattern detected",
+            "Bug work has repeated for multiple cycles.",
+            severity="high",
+            persona="workspace_observer",
+            heartbeat=22,
+            payload={"bug_signal_count": 3},
+        )
+        assert m.type == "alert"
+        assert m.urgency == "high"
+        assert m.payload["escalation_type"] == "repeated_bug_work"
+        assert m.payload["severity"] == "high"
+        assert m.payload["bug_signal_count"] == 3
 
     def test_emit_fyi(self):
         m = emit_fyi("Brain maintenance", "Archived 10 stale notes")

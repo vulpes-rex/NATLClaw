@@ -330,6 +330,23 @@ def test_state_file_atomicity_in_multi_process():
         assert loaded.execution_count == 1
 
 
+def test_execution_count_continues_across_restart_cycles():
+    """POC DoD: persisted execution_count continues after restart."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_file = os.path.join(tmpdir, "state.json")
+
+        first_run = AgentState(execution_count=2)
+        _run(save_state(first_run, state_file))
+
+        restarted = _run(load_state(state_file))
+        assert restarted.execution_count == 2
+        restarted.execution_count += 1
+        _run(save_state(restarted, state_file))
+
+        after_second_restart = _run(load_state(state_file))
+        assert after_second_restart.execution_count == 3
+
+
 def test_save_state_with_none_values():
     """Test that save_state handles None values correctly."""
     state = AgentState(
@@ -386,6 +403,27 @@ def test_save_state_with_empty_state():
         assert loaded.context == {}
         assert loaded.execution_history == []
         assert loaded.lessons_learned == []
+
+
+def test_state_persists_active_work_snapshot_in_context():
+    state = AgentState(
+        execution_count=5,
+        context={
+            "active_work": {
+                "branch": "feature/observer",
+                "files": ["cli.py", "scheduler.py"],
+                "commit_intent": "Improve status output",
+                "summary": "branch=feature/observer | files=cli.py, scheduler.py | intent=Improve status output",
+            }
+        },
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_file = os.path.join(tmpdir, "state.json")
+        _run(save_state(state, state_file))
+        loaded = _run(load_state(state_file))
+        assert loaded.context["active_work"]["branch"] == "feature/observer"
+        assert loaded.context["active_work"]["files"] == ["cli.py", "scheduler.py"]
+        assert loaded.context["active_work"]["commit_intent"] == "Improve status output"
 
 
 def test_state_file_permissions():

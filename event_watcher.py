@@ -218,6 +218,55 @@ class EventWatcher:
 _PENDING_EVENTS_FILE = Path("data") / "pending_events.ndjson"
 
 
+def pending_events_file() -> Path:
+    """Return the canonical cross-process pending events file path."""
+    return _PENDING_EVENTS_FILE
+
+
+def pending_events_status() -> dict[str, Any]:
+    """Return non-destructive pending-events queue status.
+
+    Keys:
+        exists: Whether the backing file currently exists.
+        total_lines: Number of non-empty lines in the file.
+        valid_events: Number of parseable event records.
+        malformed_lines: Number of malformed records.
+        by_type: Mapping of event_type -> count for parseable records.
+    """
+    status: dict[str, Any] = {
+        "exists": _PENDING_EVENTS_FILE.exists(),
+        "total_lines": 0,
+        "valid_events": 0,
+        "malformed_lines": 0,
+        "by_type": {},
+    }
+    if not status["exists"]:
+        return status
+
+    try:
+        lines = _PENDING_EVENTS_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError as e:
+        logger.warning("Failed to read pending events status: %s", e)
+        status["malformed_lines"] = 1
+        return status
+
+    counts: dict[str, int] = {}
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        status["total_lines"] += 1
+        try:
+            record = json.loads(line)
+            event_type = str(record.get("event_type", "unknown"))
+            counts[event_type] = counts.get(event_type, 0) + 1
+            status["valid_events"] += 1
+        except (json.JSONDecodeError, TypeError, ValueError):
+            status["malformed_lines"] += 1
+    status["by_type"] = counts
+    return status
+
+
 def enqueue_event(event_type: str, payload: dict | None = None) -> None:
     """Write an event to the pending-events file for the scheduler to pick up.
 
@@ -237,7 +286,7 @@ def enqueue_event(event_type: str, payload: dict | None = None) -> None:
 
 
 def drain_pending_events(
-    event_queue: asyncio.PriorityQueue[tuple[int, str, dict]],
+    event_queue: Any,
 ) -> int:
     """Read and clear pending events from the file, pushing them to the queue.
 
@@ -257,9 +306,24 @@ def drain_pending_events(
                 continue
             try:
                 record = json.loads(line)
-                priority = int(record["priority"])
-                event_type = str(record["event_type"])
-                payload = record.get("payload", {})
+                if not isinstance(record, dict):
+                    raise TypeError("pending event record must be an object")
+
+                # New format: {"priority", "event_type", "payload", "ts"}.
+                # Backward-compatible with legacy records that used "type"
+                # and embedded payload keys directly.
+                event_type = str(record.get("event_type") or record.get("type") or "")
+                if not event_type:
+                    raise KeyError("event_type")
+
+                priority = int(record.get("priority", EVENT_PRIORITY.get(event_type, 3)))
+                payload = record.get("payload")
+                if payload is None:
+                    payload = {
+                        k: v
+                        for k, v in record.items()
+                        if k not in {"priority", "event_type", "type", "ts"}
+                    }
                 if not isinstance(payload, dict):
                     payload = {}
 

@@ -33,7 +33,7 @@ from scheduler import retry, run_scheduler
 
 from config import AppConfig
 from prompts import _SafeDict, _read_template, clear_cache, load_prompt
-from second_brain import BrainState, load_brain, save_brain
+from second_brain import BrainState, add_note, lint_brain, load_brain, save_brain
 from state import AgentState, load_state, save_state
 
 logging.basicConfig(level=logging.DEBUG)
@@ -357,3 +357,33 @@ class TestAsyncConsistency:
         result = asyncio.run(load_brain(state_file))
         assert result.capture_count == 0
         assert len(result.notes) == 0
+
+
+# ══════════════════════════════════════════════════════════════════════
+# D. Observer lint quality gates
+# ══════════════════════════════════════════════════════════════════════
+
+class TestObserverLintQualityGates:
+    def test_missing_citation_detected_for_workspace_observer_note(self):
+        brain = BrainState()
+        add_note(
+            brain,
+            content="Observer note without evidence should be flagged.",
+            source={"type": "heartbeat", "persona": "workspace_observer"},
+            tags=["observer"],
+            category="resources",
+        )
+        issues = lint_brain(brain)
+        assert any(issue["type"] == "missing_citation" for issue in issues)
+
+    def test_low_quality_tags_detected(self):
+        brain = BrainState()
+        add_note(
+            brain,
+            content="A note with generic tags only.",
+            source={"type": "heartbeat", "persona": "researcher"},
+            tags=["general"],
+            category="resources",
+        )
+        issues = lint_brain(brain)
+        assert any(issue["type"] == "tag_quality" for issue in issues)

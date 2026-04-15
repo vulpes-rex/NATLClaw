@@ -156,7 +156,7 @@
         },
         {
           "name":   "analyse",
-          "prompt": "Based on what you just gathered:\n{prev}\n\nAnd the current brain knowledge:\n{brain}\n\nDig deeper into the most interesting signal:\n- If files changed, use read_git_diff to see the actual changes.\n- If there are TODOs, use scan_todos to find action items.\n\nIdentify ONE concrete, specific insight about the user's current work. This must reference specific files, commits, or code.\n\nReturn as JSON:\n{\"content\": \"1-3 sentence insight about what the user is doing and why\", \"tags\": [\"tag1\", \"tag2\"], \"category\": \"resources\"}",
+          "prompt": "Based on what you just gathered:\n{prev}\n\nAnd the current brain knowledge:\n{brain}\n\nDig deeper into the most interesting signal:\n- If files changed, use read_git_diff to see the actual changes.\n- If there are TODOs, use scan_todos to find action items.\n\nIdentify ONE concrete, specific insight about the user's current work. This must reference specific files, commits, or code.\n\nReturn as JSON:\n{\"content\": \"1-3 sentence insight about what the user is doing and why\", \"tags\": [\"tag1\", \"tag2\"], \"category\": \"resources\", \"evidence\": [\"commit:<sha> and/or file:path\"], \"confidence\": 0-100}",
           "storeToBrain": true
         },
         {

@@ -3,6 +3,8 @@ tests/unit/test_scheduler.py::test_scheduler_pause_control_skips_heartbeat_execu
 tests/unit/test_scheduler.py::test_scheduler_maintenance_control_skips_heartbeat_execution
 tests/unit/test_scheduler.py::test_scheduler_drain_control_exits_loop_without_running_heartbeat
 tests/unit/test_scheduler.py::test_scheduler_event_wakes_from_sleep
+tests/unit/test_scheduler.py::test_run_scheduler_runs_three_cycles_without_errors
+tests/unit/test_scheduler.py::test_run_scheduler_handles_keyboard_interrupt
 tests/unit/test_tasks.py::TestLifecycle::test_answer_task
 tests/unit/test_tasks.py::TestLifecycle::test_retry_failed_task
 tests/unit/test_tasks.py::TestSchedulerIntegration::test_task_priority_ordering
@@ -13,3 +15,7 @@ tests/integration/test_api_server.py::test_operator_status_snapshot
 tests/integration/test_api_server.py::test_scheduler_pause_resume_endpoints
 tests/integration/test_api_server.py::test_scheduler_maintenance_enable_disable_endpoints
 tests/integration/test_api_server.py::test_scheduler_drain_endpoint_sets_flag
+tests/unit/test_state.py::test_execution_count_continues_across_restart_cycles
+tests/unit/test_learning_calibration.py::TestContextBlockCalibration::test_previous_lessons_appear_in_new_context_block
+tests/unit/test_copilot_auth.py::TestConfigIntegration::test_provider_switch_uses_env_only_for_openai
+tests/unit/test_copilot_auth.py::TestConfigIntegration::test_provider_switch_uses_env_only_for_ollama

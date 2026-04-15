@@ -60,6 +60,7 @@ from second_brain import (
     lint_brain,
     load_brain,
     record_contradiction,
+    run_dream_cycle,
     save_brain,
     search_notes_from_store,
     trace_topic_from_store,
@@ -89,6 +90,7 @@ from tasks import (
 )
 from operator_status import build_operator_status
 from scheduler_control import load_scheduler_control, update_scheduler_control
+from telemetry import init_sentry
 from surface_ingress import (
     SurfaceAdapterNotAllowedError,
     SurfaceIdempotencyConflictError,
@@ -155,6 +157,12 @@ class BrainContradictionRequest(BaseModel):
     supersede: bool | None = None
 
 
+class BrainDreamRunRequest(BaseModel):
+    apply: bool = False
+    heartbeat: int | None = Field(default=None, ge=1)
+    max_age_days: int | None = Field(default=None, ge=1)
+
+
 class SchedulerControlRequest(BaseModel):
     reason: str = ""
 
@@ -171,6 +179,9 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     if config is None:
         config = _default_config or load_config()
     _default_config = config
+
+    # Telemetry initialization is optional and no-ops without SENTRY_DSN.
+    init_sentry(config)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -676,6 +687,33 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         count = await loop.run_in_executor(None, rebuild_index, brain.notes)
         return {"status": "ok", "indexed": count}
 
+    @app.get("/api/brain/dream/policy")
+    async def api_brain_dream_policy():
+        persona = load_persona(config.persona)
+        return {
+            "persona": persona.name,
+            "dream": {
+                "enabled": bool(getattr(persona, "dream_enabled", True)),
+                "idle_streak_min": int(getattr(persona, "dream_idle_streak_min", 3)),
+                "max_age_days": int(getattr(persona, "dream_max_age_days", 30)),
+            },
+        }
+
+    @app.post("/api/brain/dream/run")
+    async def api_brain_dream_run(req: BrainDreamRunRequest):
+        persona = load_persona(config.persona)
+        brain = await load_brain(config.state_file)
+        report = run_dream_cycle(
+            brain,
+            heartbeat_number=req.heartbeat,
+            apply=req.apply,
+            max_age_days=req.max_age_days or int(getattr(persona, "dream_max_age_days", 30)),
+            trigger="api_apply" if req.apply else "api_dry_run",
+        )
+        if req.apply:
+            await save_brain(brain, config.state_file)
+        return report
+
     # ── Inbox (outbox messages) ─────────────────────────────────
 
     @app.get("/api/inbox")
@@ -814,32 +852,24 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
     @app.get("/api/heartbeat/status")
     async def api_heartbeat_status():
-        """Check whether heartbeats are running (recent vs stale)."""
-        state = await load_state(config.state_file)
-        last = state.last_heartbeat
-        status = "unknown"
-        seconds_ago = None
-        if last:
-            try:
-                last_dt = datetime.fromisoformat(last)
-                now = datetime.now(timezone.utc)
-                seconds_ago = (now - last_dt).total_seconds()
-                status = "active" if seconds_ago < STALE_THRESHOLD_SEC else "stale"
-            except (ValueError, TypeError):
-                status = "unknown"
-        else:
-            status = "never_run"
-
+        """Check heartbeat freshness and scheduler state for the dashboard."""
         task = getattr(app.state, "scheduler_task", None)
-        scheduler_running = task is not None and not task.done()
-
+        snap = await build_operator_status(config, scheduler_task=task)
+        hb = snap.get("heartbeat", {})
+        sched = snap.get("scheduler", {})
         return {
-            "status": status,
-            "last_heartbeat": last,
-            "seconds_ago": round(seconds_ago, 1) if seconds_ago is not None else None,
-            "heartbeat_count": state.execution_count,
-            "scheduler_running": scheduler_running,
+            "status": hb.get("status", "unknown"),
+            "last_heartbeat": hb.get("last"),
+            "seconds_ago": hb.get("seconds_ago"),
+            "heartbeat_count": hb.get("count", 0),
+            "scheduler_running": bool(sched.get("running", False)),
             "stale_threshold_sec": STALE_THRESHOLD_SEC,
+            # Extra scheduler fields for richer web client rendering.
+            "scheduler": {
+                "in_process_task_running": bool(sched.get("in_process_task_running", False)),
+                "control": sched.get("control", {}),
+                "backpressure": sched.get("backpressure", {}),
+            },
         }
 
     @app.get("/api/heartbeat/log")
@@ -1200,12 +1230,34 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         <button class="btn-sm btn-primary" onclick="searchBrain()">Search</button>
       </div>
       <div id="brainResults" style="max-height:300px;overflow-y:auto;"></div>
+      <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border);">
+        <h2 style="margin-bottom:8px;">Dreaming</h2>
+        <div style="font-size:12px;color:var(--text-dim);margin-bottom:6px;" id="dreamPolicyLine">Policy: loading...</div>
+        <div style="font-size:12px;color:var(--text-dim);margin-bottom:8px;" id="dreamLastRunLine">Last run: -</div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button class="btn-sm btn-ghost" id="dreamDryBtn" onclick="runDream(false)">Run Dry</button>
+          <button class="btn-sm btn-primary" id="dreamApplyBtn" onclick="runDream(true)">Run Apply</button>
+        </div>
+        <div id="dreamResult" style="font-size:12px;color:var(--text-dim);margin-top:8px;"></div>
+        <div id="dreamToast" style="display:none;font-size:12px;margin-top:6px;color:var(--green);"></div>
+        <div style="display:flex;align-items:center;gap:8px;margin-top:8px;">
+          <label for="dreamHistoryFilter" style="font-size:12px;color:var(--text-dim);">History filter:</label>
+          <select id="dreamHistoryFilter" class="persona-select" style="font-size:12px;padding:4px 8px;" onchange="renderDreamHistory()">
+            <option value="all">all</option>
+            <option value="auto_idle">auto idle</option>
+            <option value="api">api</option>
+            <option value="cli">cli</option>
+          </select>
+        </div>
+        <div id="dreamHistory" style="font-size:12px;color:var(--text-dim);margin-top:8px;max-height:130px;overflow-y:auto;"></div>
+      </div>
     </div>
   </div>
 </div>
 
 <script>
 const API = '';
+let dreamRunsCache = [];
 
 async function fetchHealth() {
   try {
@@ -1280,6 +1332,95 @@ async function fetchBrainStats() {
     document.getElementById('statNotes').textContent = d.notes || 0;
     document.getElementById('statConnections').textContent = d.connections || 0;
   } catch(e) {}
+}
+
+async function fetchDreamPanel() {
+  try {
+    const [policyResp, statsResp] = await Promise.all([
+      fetch(API + '/api/brain/dream/policy'),
+      fetch(API + '/api/brain/stats'),
+    ]);
+    const policy = await policyResp.json();
+    const stats = await statsResp.json();
+    const d = policy.dream || {};
+    document.getElementById('dreamPolicyLine').textContent =
+      `Policy: enabled=${d.enabled} | idle_streak_min=${d.idle_streak_min} | max_age_days=${d.max_age_days}`;
+    const lastDream = stats.last_dream || 'never';
+    const lastHb = stats.last_dream_heartbeat || 0;
+    document.getElementById('dreamLastRunLine').textContent =
+      `Last run: ${lastDream} (heartbeat ${lastHb})`;
+    dreamRunsCache = Array.isArray(stats.dream_runs_recent) ? stats.dream_runs_recent.slice(0, 20) : [];
+    renderDreamHistory();
+  } catch (e) {
+    document.getElementById('dreamPolicyLine').textContent = 'Policy: unavailable';
+    const hist = document.getElementById('dreamHistory');
+    if (hist) hist.textContent = 'Recent runs: unavailable';
+  }
+}
+
+function renderDreamHistory() {
+  const hist = document.getElementById('dreamHistory');
+  const filter = (document.getElementById('dreamHistoryFilter')?.value || 'all').toLowerCase();
+  const runs = (dreamRunsCache || []).filter(run => {
+    const trigger = String(run?.trigger || '').toLowerCase();
+    if (filter === 'all') return true;
+    if (filter === 'auto_idle') return trigger === 'auto_idle';
+    if (filter === 'api') return trigger.startsWith('api_');
+    if (filter === 'cli') return trigger.startsWith('cli_');
+    return true;
+  });
+  if (!runs.length) {
+    hist.textContent = 'Recent runs: none';
+    return;
+  }
+  hist.innerHTML = runs.slice(0, 8).map(run => {
+    const ts = run.timestamp ? new Date(run.timestamp).toLocaleString() : '-';
+    const trig = run.trigger || 'unknown';
+    const ded = run.deduped || 0;
+    const stale = run.stale_archived || 0;
+    const lint = run.lint_issues || 0;
+    const cacheIndex = (dreamRunsCache || []).indexOf(run);
+    return `<div class="activity-item">` +
+      `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">` +
+      `<div><span class="activity-time">${escHtml(ts)}</span> <span style="color:var(--accent);">${escHtml(trig)}</span> <span>dedup=${ded}, stale=${stale}, lint=${lint}</span></div>` +
+      `<button class="btn-sm btn-ghost" style="padding:2px 8px;font-size:11px;" onclick="copyDreamRun(${cacheIndex})">Copy JSON</button>` +
+      `</div>` +
+      `</div>`;
+  }).join('');
+}
+
+async function copyDreamRun(index) {
+  const run = (dreamRunsCache || [])[index];
+  if (!run) {
+    showDreamToast('Copy failed: run not found', true);
+    return;
+  }
+  const payload = JSON.stringify(run);
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(payload);
+      showDreamToast('Copied run JSON');
+    } else {
+      throw new Error('clipboard unavailable');
+    }
+  } catch (_e) {
+    showDreamToast('Clipboard unavailable, showing JSON below', true);
+    const resultEl = document.getElementById('dreamResult');
+    resultEl.textContent = `Run JSON: ${payload}`;
+  }
+}
+
+let dreamToastTimer = null;
+function showDreamToast(message, isError = false) {
+  const toast = document.getElementById('dreamToast');
+  if (!toast) return;
+  toast.textContent = message;
+  toast.style.display = 'block';
+  toast.style.color = isError ? 'var(--yellow)' : 'var(--green)';
+  if (dreamToastTimer) clearTimeout(dreamToastTimer);
+  dreamToastTimer = setTimeout(() => {
+    toast.style.display = 'none';
+  }, 1800);
 }
 
 async function fetchTasks() {
@@ -1367,6 +1508,35 @@ async function searchBrain() { const query = document.getElementById('brainQuery
       return `<div class="note-item"><strong>[${n.id}]</strong> ${escHtml(summary)}${tags?`<div class="note-tags">${escHtml(tags)}</div>`:''}</div>`; }).join('');
   } catch(e) { el.innerHTML = '<p style="color:var(--red);">Search failed.</p>'; } }
 
+async function runDream(apply) {
+  const dryBtn = document.getElementById('dreamDryBtn');
+  const applyBtn = document.getElementById('dreamApplyBtn');
+  const resultEl = document.getElementById('dreamResult');
+  dryBtn.disabled = true;
+  applyBtn.disabled = true;
+  resultEl.textContent = apply ? 'Running apply dream...' : 'Running dry dream...';
+  try {
+    const r = await fetch(API + '/api/brain/dream/run', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({apply: !!apply}),
+    });
+    const d = await r.json();
+    const p = d.phases || {};
+    const dedup = p.consolidate?.exact_duplicates_archived || 0;
+    const stale = p.prune?.stale_archived || 0;
+    const lint = p.prune?.lint_issues || 0;
+    resultEl.textContent = `Dream ${apply ? 'apply' : 'dry'} done: dedup=${dedup}, stale=${stale}, lint=${lint}`;
+    await fetchDreamPanel();
+    if (apply) await fetchBrainStats();
+  } catch (e) {
+    resultEl.textContent = `Dream failed: ${e.message || 'unknown error'}`;
+  } finally {
+    dryBtn.disabled = false;
+    applyBtn.disabled = false;
+  }
+}
+
 async function startScheduler() { const btn = document.getElementById('schedStartBtn'); btn.disabled=true; btn.textContent='Starting...';
   try { const r = await fetch(API+'/api/scheduler/start',{method:'POST'}); const d = await r.json(); btn.textContent = d.status==='started'?'Started!':'Already running';
   } catch(e) { btn.textContent='Error'; } setTimeout(()=>{btn.disabled=false;btn.textContent='Start';fetchHeartbeatStatus();},2000); }
@@ -1378,9 +1548,9 @@ function switchPersona(name) { console.log('Switched to persona:', name); }
 function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
 async function init() {
-  await Promise.all([fetchHealth(), fetchBrainStats(), fetchTasks(), fetchPersonas(), fetchHeartbeatStatus(), fetchHeartbeatLog(), fetchActivity(), fetchReports()]);
+  await Promise.all([fetchHealth(), fetchBrainStats(), fetchDreamPanel(), fetchTasks(), fetchPersonas(), fetchHeartbeatStatus(), fetchHeartbeatLog(), fetchActivity(), fetchReports()]);
   setInterval(() => { fetchHeartbeatStatus(); }, 15000);
-  setInterval(() => { fetchHealth(); fetchBrainStats(); fetchTasks(); fetchHeartbeatLog(); fetchActivity(); fetchReports(); }, 30000);
+  setInterval(() => { fetchHealth(); fetchBrainStats(); fetchDreamPanel(); fetchTasks(); fetchHeartbeatLog(); fetchActivity(); fetchReports(); }, 30000);
 }
 init();
 </script>

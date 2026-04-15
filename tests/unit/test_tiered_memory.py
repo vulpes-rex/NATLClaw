@@ -684,6 +684,9 @@ class TestPersonaConsolidationConfig:
         assert p.consolidation_interval == 5
         assert p.consolidation_threshold == 10
         assert p.lint_wiki_interval == 20
+        assert p.dream_enabled is True
+        assert p.dream_idle_streak_min == 3
+        assert p.dream_max_age_days == 30
 
     def test_custom_values(self):
         p = Persona(
@@ -691,10 +694,16 @@ class TestPersonaConsolidationConfig:
             consolidation_interval=3,
             consolidation_threshold=5,
             lint_wiki_interval=10,
+            dream_enabled=False,
+            dream_idle_streak_min=7,
+            dream_max_age_days=45,
         )
         assert p.consolidation_interval == 3
         assert p.consolidation_threshold == 5
         assert p.lint_wiki_interval == 10
+        assert p.dream_enabled is False
+        assert p.dream_idle_streak_min == 7
+        assert p.dream_max_age_days == 45
 
 
 # ══════════════════════════════════════════════════════════════════════

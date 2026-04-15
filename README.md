@@ -87,6 +87,8 @@ Key configuration options include:
 - `PERSONA` - Default persona to use
 - `STATE_FILE` - Path to state file (default: `./state.json`)
 - `MAX_HISTORY` - Maximum execution history to keep
+- `SENTRY_DSN` - Enable Sentry error/performance telemetry when set
+- `SENTRY_ENABLE_LOGS` - Forward Python logs to Sentry
 
 ## Project Structure
 

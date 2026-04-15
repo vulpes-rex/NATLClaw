@@ -13,6 +13,7 @@ from project_context import (
     Project,
     detect_project,
     detect_and_save_project,
+    get_active_work_snapshot,
     infer_active_work,
     save_project,
     load_projects,
@@ -144,6 +145,33 @@ class TestInferActiveWork:
         with patch("subprocess.run", side_effect=Exception("git error")):
             result = infer_active_work(proj)
         assert "dev" in result
+
+
+class TestActiveWorkSnapshot:
+    def test_snapshot_includes_branch_files_and_intent(self):
+        proj = Project(path=".", name="test", language="python", branch="feature/observer")
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                type("R", (), {"stdout": "Implement observer active work summary\n"})(),
+                type("R", (), {"stdout": " M cli.py\n M scheduler.py\n"})(),
+            ]
+            snap = get_active_work_snapshot(proj)
+        assert snap["branch"] == "feature/observer"
+        assert "cli.py" in snap["files"]
+        assert "scheduler.py" in snap["files"]
+        assert "Implement observer active work summary" in snap["commit_intent"]
+
+    def test_snapshot_falls_back_to_project_active_work(self):
+        proj = Project(
+            path=".",
+            name="test",
+            language="python",
+            branch="main",
+            active_work="Working on status output",
+        )
+        with patch("subprocess.run", side_effect=Exception("git unavailable")):
+            snap = get_active_work_snapshot(proj)
+        assert snap["commit_intent"] == "Working on status output"
 
 
 # ── Persistence ────────────────────────────────────────────────────────

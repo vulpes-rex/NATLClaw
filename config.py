@@ -53,6 +53,15 @@ class AppConfig:
     surface_ingress_enabled: bool = False
     surface_channels_enabled: tuple[str, ...] = field(default_factory=tuple)
 
+    # Telemetry (optional)
+    sentry_dsn: str = ""
+    sentry_environment: str = "development"
+    sentry_release: str = ""
+    sentry_enable_logs: bool = False
+    sentry_traces_sample_rate: float = 0.0
+    sentry_profiles_sample_rate: float = 0.0
+    sentry_profile_session_sample_rate: float = 0.0
+
 
 VALID_PROVIDERS = ("copilot", "foundry", "openai", "openrouter", "azure_openai", "ollama")
 
@@ -87,6 +96,18 @@ def validate_config(config: AppConfig) -> list[str]:
         errors.append(
             f"queue_depth_warn_threshold={config.queue_depth_warn_threshold} must be >= 1"
         )
+    if not 0.0 <= config.sentry_traces_sample_rate <= 1.0:
+        errors.append(
+            "SENTRY_TRACES_SAMPLE_RATE must be between 0.0 and 1.0"
+        )
+    if not 0.0 <= config.sentry_profiles_sample_rate <= 1.0:
+        errors.append(
+            "SENTRY_PROFILES_SAMPLE_RATE must be between 0.0 and 1.0"
+        )
+    if not 0.0 <= config.sentry_profile_session_sample_rate <= 1.0:
+        errors.append(
+            "SENTRY_PROFILE_SESSION_SAMPLE_RATE must be between 0.0 and 1.0"
+        )
     return errors
 
 
@@ -98,6 +119,14 @@ def load_config(env_path: str = ".env") -> AppConfig:
         if value is None:
             return default
         return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _parse_float(value: str | None, default: float) -> float:
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except ValueError:
+            return default
 
     channels_raw = os.getenv("SURFACE_CHANNELS_ENABLED", "")
     channels = tuple(
@@ -135,4 +164,13 @@ def load_config(env_path: str = ".env") -> AppConfig:
         api_key=os.getenv("NATL_API_KEY", ""),
         surface_ingress_enabled=_parse_bool(os.getenv("SURFACE_INGRESS_ENABLED"), default=False),
         surface_channels_enabled=channels,
+        sentry_dsn=os.getenv("SENTRY_DSN", ""),
+        sentry_environment=os.getenv("SENTRY_ENVIRONMENT", "development"),
+        sentry_release=os.getenv("SENTRY_RELEASE", ""),
+        sentry_enable_logs=_parse_bool(os.getenv("SENTRY_ENABLE_LOGS"), default=False),
+        sentry_traces_sample_rate=_parse_float(os.getenv("SENTRY_TRACES_SAMPLE_RATE"), 0.0),
+        sentry_profiles_sample_rate=_parse_float(os.getenv("SENTRY_PROFILES_SAMPLE_RATE"), 0.0),
+        sentry_profile_session_sample_rate=_parse_float(
+            os.getenv("SENTRY_PROFILE_SESSION_SAMPLE_RATE"), 0.0
+        ),
     )

@@ -327,6 +327,33 @@ def emit_alert(
     )
 
 
+def emit_escalation_alert(
+    escalation_type: str,
+    title: str,
+    body: str = "",
+    *,
+    severity: str = "normal",
+    persona: str = "",
+    heartbeat: int = 0,
+    payload: dict | None = None,
+) -> Message:
+    """Create a deterministic escalation alert from observer/engine signals."""
+    urgency = "high" if severity == "high" else "normal"
+    return create_message(
+        "alert",
+        title=title,
+        body=body,
+        urgency=urgency,
+        persona=persona,
+        heartbeat=heartbeat,
+        payload={
+            **(payload or {}),
+            "escalation_type": escalation_type,
+            "severity": severity,
+        },
+    )
+
+
 def emit_fyi(
     title: str,
     body: str = "",

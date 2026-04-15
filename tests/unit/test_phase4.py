@@ -225,6 +225,11 @@ class TestCLIStatusCommand:
                 "last": "2026-01-01T00:00:00+00:00",
                 "seconds_ago": 2.5,
             },
+            "active_work": {
+                "branch": "feature/observer",
+                "files": ["cli.py", "scheduler.py"],
+                "commit_intent": "Improve observer status output",
+            },
             "tasks": {
                 "total": 3,
                 "blocked_count": 1,
@@ -268,6 +273,7 @@ class TestCLIStatusCommand:
         assert "Operator Status" in out
         assert "Scheduler: RUNNING" in out
         assert "Heartbeat: active" in out
+        assert "Current active work: branch=feature/observer" in out
         assert "Active task:" in out
         assert "Blocked tasks: 1" in out
         assert "SLA risk: at_risk=1 | breached=0" in out

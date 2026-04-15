@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import time
+from types import SimpleNamespace
 import pytest
 import sys
 from unittest.mock import MagicMock, patch, AsyncMock
@@ -21,6 +22,8 @@ sys.modules['azure.identity'] = MagicMock()
 from scheduler import (
     retry,
     run_scheduler,
+    _is_idle_dream_candidate,
+    _resolve_dream_policy,
     _wait_for_event_or_timeout,
     _drain_event_queue_bounded,
     acquire_scheduler_lock,
@@ -81,6 +84,62 @@ def test_retry_decorator_success():
     
     result = asyncio.run(successful_func())
     assert result == "success"
+
+
+def test_is_idle_dream_candidate_true_only_when_idle():
+    """Dream candidate should be true only for clean idle cycles."""
+    assert _is_idle_dream_candidate(
+        had_error=False,
+        active_task=None,
+        queue_depth_before_decision=0,
+        decision_spillover=0,
+        queue_depth_now=0,
+    ) is True
+
+
+def test_is_idle_dream_candidate_false_when_busy():
+    """Any active work/error/backpressure should disable idle dream."""
+    assert _is_idle_dream_candidate(
+        had_error=True,
+        active_task=None,
+        queue_depth_before_decision=0,
+        decision_spillover=0,
+        queue_depth_now=0,
+    ) is False
+    assert _is_idle_dream_candidate(
+        had_error=False,
+        active_task=object(),
+        queue_depth_before_decision=0,
+        decision_spillover=0,
+        queue_depth_now=0,
+    ) is False
+    assert _is_idle_dream_candidate(
+        had_error=False,
+        active_task=None,
+        queue_depth_before_decision=1,
+        decision_spillover=0,
+        queue_depth_now=0,
+    ) is False
+
+
+def test_resolve_dream_policy_defaults():
+    persona = SimpleNamespace()
+    enabled, streak, max_age = _resolve_dream_policy(persona)
+    assert enabled is True
+    assert streak == 3
+    assert max_age == 30
+
+
+def test_resolve_dream_policy_custom_values():
+    persona = SimpleNamespace(
+        dream_enabled=False,
+        dream_idle_streak_min=5,
+        dream_max_age_days=45,
+    )
+    enabled, streak, max_age = _resolve_dream_policy(persona)
+    assert enabled is False
+    assert streak == 5
+    assert max_age == 45
 
 def test_retry_decorator_transient_failures():
     """Test that retry decorator retries transient failures."""
@@ -305,20 +364,30 @@ def _scheduler_patches(mock_heartbeat, mock_persona=None):
     mock_decision.chosen.rationale = "test"
     mock_decision.supplementary_actions = []
 
+    mock_load_state = AsyncMock(return_value=AgentState())
+    mock_load_brain = AsyncMock(return_value=BrainState())
+    mock_save_state = AsyncMock()
+    mock_save_brain = AsyncMock()
+    mock_load_tasks = AsyncMock(return_value=[])
+    mock_save_tasks = AsyncMock()
+    mock_load_outbox = AsyncMock(return_value=[])
+    mock_save_outbox = AsyncMock()
+    mock_load_projects = AsyncMock(return_value=[])
+
     @contextmanager
     def ctx():
         from contextlib import ExitStack
         patches = [
             patch("scheduler.load_persona", return_value=mock_persona),
-            patch("scheduler.load_state", new_callable=AsyncMock, return_value=AgentState()),
-            patch("scheduler.load_brain", new_callable=AsyncMock, return_value=BrainState()),
-            patch("scheduler.save_state", new_callable=AsyncMock),
-            patch("scheduler.save_brain", new_callable=AsyncMock),
-            patch("scheduler.load_tasks", new_callable=AsyncMock, return_value=[]),
-            patch("scheduler.save_tasks", new_callable=AsyncMock),
-            patch("scheduler.load_outbox", new_callable=AsyncMock, return_value=[]),
-            patch("scheduler.save_outbox", new_callable=AsyncMock),
-            patch("scheduler.load_projects", new_callable=AsyncMock, return_value=[]),
+            patch("scheduler.load_state", new=mock_load_state),
+            patch("scheduler.load_brain", new=mock_load_brain),
+            patch("scheduler.save_state", new=mock_save_state),
+            patch("scheduler.save_brain", new=mock_save_brain),
+            patch("scheduler.load_tasks", new=mock_load_tasks),
+            patch("scheduler.save_tasks", new=mock_save_tasks),
+            patch("scheduler.load_outbox", new=mock_load_outbox),
+            patch("scheduler.save_outbox", new=mock_save_outbox),
+            patch("scheduler.load_projects", new=mock_load_projects),
             patch("scheduler.detect_and_save_project", return_value=None),
             patch("scheduler.create_agent", return_value=MagicMock()),
             patch("scheduler.run_heartbeat", mock_heartbeat),
@@ -336,7 +405,11 @@ def _scheduler_patches(mock_heartbeat, mock_persona=None):
         with ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
-            yield
+            yield {
+                "save_state": mock_save_state,
+                "load_state": mock_load_state,
+                "save_brain": mock_save_brain,
+            }
     return ctx()
 
 
@@ -353,9 +426,24 @@ def test_run_scheduler_handles_keyboard_interrupt():
     mock_heartbeat = AsyncMock(side_effect=KeyboardInterrupt)
     q = _make_event_queue()
 
-    with _scheduler_patches(mock_heartbeat):
+    with _scheduler_patches(mock_heartbeat) as handles, \
+         patch("scheduler._wait_for_event_or_timeout", new_callable=AsyncMock, return_value=None):
         with pytest.raises(KeyboardInterrupt):
             asyncio.run(run_scheduler(config, max_iterations=1, event_queue=q))
+    assert handles["save_state"].await_count >= 1
+
+
+def test_run_scheduler_runs_three_cycles_without_errors():
+    """POC DoD: scheduler can execute three cycles cleanly."""
+    config = _make_scheduler_config(provider="foundry")
+    mock_heartbeat = AsyncMock()
+    q = _make_event_queue()
+
+    with _scheduler_patches(mock_heartbeat), \
+         patch("scheduler._wait_for_event_or_timeout", new_callable=AsyncMock, return_value=None):
+        asyncio.run(run_scheduler(config, max_iterations=3, event_queue=q))
+
+    assert mock_heartbeat.await_count == 3
 
 
 def test_run_scheduler_handles_async_timeout():
@@ -561,6 +649,12 @@ def test_scheduler_injects_project_branch_and_active_work_into_agent_instruction
 
     with _scheduler_patches(mock_heartbeat), \
          patch("scheduler.detect_and_save_project", return_value=current_project), \
+         patch("scheduler.get_active_work_snapshot", return_value={
+             "branch": "feature/s11-context",
+             "files": ["scheduler.py", "cli.py"],
+             "commit_intent": "Improve context accuracy",
+             "summary": "branch=feature/s11-context | files=scheduler.py, cli.py | intent=Improve context accuracy",
+         }), \
          patch("scheduler.create_agent", return_value=MagicMock()) as mock_create_agent:
         asyncio.run(run_scheduler(config, max_iterations=1, event_queue=q))
 
@@ -569,6 +663,7 @@ def test_scheduler_injects_project_branch_and_active_work_into_agent_instruction
     assert "Project Context:" in enriched_instructions
     assert "- Branch: feature/s11-context" in enriched_instructions
     assert "Working on scheduler context accuracy" in enriched_instructions
+    assert "- Current active work: branch=feature/s11-context" in enriched_instructions
 
 
 def test_wait_for_event_or_timeout_returns_none_when_timeout():

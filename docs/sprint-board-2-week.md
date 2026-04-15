@@ -1,4 +1,4 @@
-# NATLClaw 2-Week Sprint Board (v3)
+# NATLClaw 2-Week Sprint Board (v4 - Core POC DoD)
 
 ## Backlog
 
@@ -11,6 +11,18 @@
 
 ## Done
 
+- [x] **C1: 3-cycle heartbeat proof**  
+  Evidence: `tests/unit/test_scheduler.py::test_run_scheduler_runs_three_cycles_without_errors`, `poc_smoke.py`
+- [x] **C2: Restart persistence proof**  
+  Evidence: `tests/unit/test_state.py::test_execution_count_continues_across_restart_cycles`
+- [x] **C3: Lessons carry-forward proof**  
+  Evidence: `tests/unit/test_learning_calibration.py::TestContextBlockCalibration::test_previous_lessons_appear_in_new_context_block`
+- [x] **C4: Provider switch by config-only**  
+  Evidence: `tests/unit/test_copilot_auth.py::TestConfigIntegration::test_provider_switch_uses_env_only_for_openai`, `tests/unit/test_copilot_auth.py::TestConfigIntegration::test_provider_switch_uses_env_only_for_ollama`
+- [x] **C5: Clean shutdown persistence**  
+  Evidence: `tests/unit/test_scheduler.py::test_run_scheduler_handles_keyboard_interrupt`
+- [x] **C6: POC evidence pack + board closeout**  
+  Evidence: `docs/core-poc-dod-evidence.md`, `core_suite_tests.txt`
 - [x] **S1: Scheduler reliability baseline**
 - [x] **S2: Event wake-up correctness**
 - [x] **S3: Task lifecycle determinism**
@@ -32,15 +44,15 @@
 - [x] **S13: Persistence integrity + crash consistency**
 - [x] **S16: Regression gate for core flows (CI-grade)**
 
-## Suggested Execution Order (2 Weeks)
+## Suggested Execution Order (2 Weeks, Solo Core POC)
 
-- **Week 1:** `S13 -> S14`
-- **Week 2:** `S15 -> S16`
+- **Week 1:** `C1 -> C2 -> C3`
+- **Week 2:** `C4 -> C5 -> C6`
 
-## Suggested Execution Order (Surface Track)
-
-- **Surface Week 1:** `S17 -> S18`
-- **Surface Week 2:** `S19 -> S20`
+## Current Sprint Tracking Notes
+- Keep WIP at 1 card whenever possible.
+- Each completed card must link to test evidence and/or runnable artifacts.
+- C6 cannot move to Done until C1-C5 are done and core regression gate is green.
 
 ## Daily Standup Template
 

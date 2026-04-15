@@ -4,6 +4,7 @@ import sys
 
 from config import load_config, validate_config
 from scheduler import run_scheduler
+from telemetry import init_sentry
 
 
 def main() -> None:
@@ -14,6 +15,7 @@ def main() -> None:
     )
 
     config = load_config()
+    init_sentry(config)
 
     errors = validate_config(config)
     if errors:

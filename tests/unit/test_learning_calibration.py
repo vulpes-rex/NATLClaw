@@ -349,6 +349,25 @@ class TestContextBlockCalibration:
         context = build_context_block(state)
         assert "(conf=75)" in context
 
+    def test_previous_lessons_appear_in_new_context_block(self):
+        """POC DoD: lessons from prior heartbeats are present in subsequent context."""
+        state = AgentState(
+            execution_count=6,
+            last_heartbeat="2026-04-10T10:00:00Z",
+            lessons_learned=[
+                {
+                    "type": "success_achieved",
+                    "step": "status_check",
+                    "description": "Status check completed successfully in heartbeat #5",
+                    "confidence": 80,
+                    "timestamp": "2026-04-10T09:58:00Z",
+                }
+            ],
+        )
+        context = build_context_block(state)
+        assert "Recent lessons:" in context
+        assert "Status check completed successfully" in context
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 8. Backwards compatibility

@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+import copy
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +188,9 @@ class BrainState:
     last_review: str | None = None
     last_consolidation: str | None = None
     last_lint: str | None = None
+    last_dream: str | None = None
+    last_dream_heartbeat: int = 0
+    dream_log: list[dict] = field(default_factory=list)
 
 
 def _brain_path(state_file: str) -> str:
@@ -500,6 +504,9 @@ def _read_brain_sqlite(db_path: str) -> dict:
         "last_review": meta.get("last_review"),
         "last_consolidation": meta.get("last_consolidation"),
         "last_lint": meta.get("last_lint"),
+        "last_dream": meta.get("last_dream"),
+        "last_dream_heartbeat": _normalize_counter(meta.get("last_dream_heartbeat")),
+        "dream_log": _normalize_event_log(meta.get("dream_log"), limit=50),
     }
 
 
@@ -604,6 +611,9 @@ def _write_brain_sqlite(brain_dict: dict, db_path: str) -> None:
                     ("last_review", json.dumps(brain_dict.get("last_review"))),
                     ("last_consolidation", json.dumps(brain_dict.get("last_consolidation"))),
                     ("last_lint", json.dumps(brain_dict.get("last_lint"))),
+                    ("last_dream", json.dumps(brain_dict.get("last_dream"))),
+                    ("last_dream_heartbeat", json.dumps(_normalize_counter(brain_dict.get("last_dream_heartbeat")))),
+                    ("dream_log", json.dumps(_normalize_event_log(brain_dict.get("dream_log"), limit=50))),
                 ],
             )
 
@@ -873,6 +883,9 @@ def _write_brain_incremental(brain_dict: dict, db_path: str) -> None:
                 ("last_review", json.dumps(brain_dict.get("last_review"))),
                 ("last_consolidation", json.dumps(brain_dict.get("last_consolidation"))),
                 ("last_lint", json.dumps(brain_dict.get("last_lint"))),
+                ("last_dream", json.dumps(brain_dict.get("last_dream"))),
+                ("last_dream_heartbeat", json.dumps(_normalize_counter(brain_dict.get("last_dream_heartbeat")))),
+                ("dream_log", json.dumps(_normalize_event_log(brain_dict.get("dream_log"), limit=50))),
             ]
             conn.executemany(
                 "INSERT OR REPLACE INTO brain_meta (key, value_json) VALUES (?, ?)",
@@ -1575,6 +1588,111 @@ def decay_stale_notes(brain: BrainState, max_age_days: int = 30) -> int:
     return archived
 
 
+def _dream_normalized_content(note: dict) -> str:
+    """Return canonicalized note content for deterministic dedup checks."""
+    return " ".join(str(note.get("content", "")).strip().lower().split())
+
+
+def _dream_archive_exact_duplicates(brain: BrainState, *, min_chars: int = 24) -> int:
+    """Archive exact duplicate notes while keeping the newest copy."""
+    note_items = sorted(
+        brain.notes.items(),
+        key=lambda item: (item[1].get("created_at", ""), item[0]),
+        reverse=True,
+    )
+    canonical_to_primary: dict[str, str] = {}
+    archived = 0
+    now = datetime.now(timezone.utc).isoformat()
+    for note_id, note in note_items:
+        _normalize_note_dict(note, note_id)
+        if note.get("category") == "archive":
+            continue
+        canonical = _dream_normalized_content(note)
+        if len(canonical) < min_chars:
+            continue
+
+        primary_id = canonical_to_primary.get(canonical)
+        if primary_id is None:
+            canonical_to_primary[canonical] = note_id
+            continue
+
+        note["category"] = "archive"
+        if note.get("status", "active") in {"active", "confirmed", "tentative"}:
+            note["status"] = "superseded"
+        note["updated_at"] = now
+        marker = f"dream deduped: duplicate of {primary_id}"
+        evidence = _normalize_evidence(note.get("evidence"))
+        if marker not in evidence:
+            evidence.append(marker)
+        note["evidence"] = evidence
+        archived += 1
+    return archived
+
+
+def run_dream_cycle(
+    brain: BrainState,
+    *,
+    heartbeat_number: int | None = None,
+    apply: bool = True,
+    max_age_days: int = 30,
+    trigger: str = "manual",
+) -> dict[str, Any]:
+    """Run a deterministic sleep/dream maintenance cycle.
+
+    Phases:
+    - orient: capture baseline brain stats
+    - gather: count unconsolidated candidate notes
+    - consolidate: exact duplicate compaction
+    - prune: stale orphan decay + lint snapshot
+    """
+    target = brain if apply else copy.deepcopy(brain)
+    before = build_brain_stats(target)
+    gathered = len(get_unconsolidated_notes(target))
+    deduped = _dream_archive_exact_duplicates(target)
+    decayed = decay_stale_notes(target, max_age_days=max_age_days)
+    issues = lint_brain(target)
+    now = datetime.now(timezone.utc).isoformat()
+    target.last_dream = now
+    if heartbeat_number is not None:
+        target.last_dream_heartbeat = _normalize_counter(heartbeat_number)
+    changed = deduped > 0 or decayed > 0
+    if apply:
+        target.dream_log.append(
+            {
+                "timestamp": now,
+                "trigger": trigger,
+                "heartbeat": target.last_dream_heartbeat,
+                "changed": changed,
+                "deduped": deduped,
+                "stale_archived": decayed,
+                "lint_issues": len(issues),
+            }
+        )
+        target.dream_log = _normalize_event_log(target.dream_log, limit=50)
+        target.lint_log.append(
+            {
+                "timestamp": now,
+                "source": "dream",
+                "issues": issues[:25],
+            }
+        )
+    after = build_brain_stats(target)
+    return {
+        "applied": bool(apply),
+        "changed": changed,
+        "timestamp": now,
+        "heartbeat": target.last_dream_heartbeat,
+        "phases": {
+            "orient": {"before_notes": before["notes"], "before_orphans": before["orphans"]},
+            "gather": {"unconsolidated": gathered},
+            "consolidate": {"exact_duplicates_archived": deduped},
+            "prune": {"stale_archived": decayed, "lint_issues": len(issues)},
+        },
+        "before": before,
+        "after": after,
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Topic graph
 # ──────────────────────────────────────────────────────────────────────
@@ -1740,6 +1858,9 @@ def build_brain_stats(brain: BrainState, *, topic_limit: int = 8) -> dict[str, A
         "connection_density": connection_density,
         "last_review": brain.last_review or "never",
         "last_consolidation": brain.last_consolidation or "never",
+        "last_dream": brain.last_dream or "never",
+        "last_dream_heartbeat": _normalize_counter(brain.last_dream_heartbeat),
+        "dream_runs_recent": list(reversed(_normalize_event_log(brain.dream_log, limit=10))),
         "categories": categories,
         "note_types": note_types,
         "statuses": statuses,
@@ -2057,6 +2178,9 @@ def build_brain_stats_from_store(state_file: str, *, topic_limit: int = 8) -> di
         "connection_density": (connections_count / notes_count) if notes_count else 0.0,
         "last_review": meta.get("last_review") or "never",
         "last_consolidation": meta.get("last_consolidation") or "never",
+        "last_dream": meta.get("last_dream") or "never",
+        "last_dream_heartbeat": _normalize_counter(meta.get("last_dream_heartbeat")),
+        "dream_runs_recent": list(reversed(_normalize_event_log(meta.get("dream_log"), limit=10))),
         "categories": categories,
         "note_types": note_types,
         "statuses": statuses,
@@ -2729,6 +2853,7 @@ def build_brain_summary_from_store(
             lines.append(f"Total topics: {topics_total}")
             lines.append(f"Last review: {meta.get('last_review') or 'never'}")
             lines.append(f"Last consolidation: {meta.get('last_consolidation') or 'never'}")
+            lines.append(f"Last dream: {meta.get('last_dream') or 'never'}")
 
             # Category breakdown — direct SQL aggregation
             categories = dict(conn.execute(
@@ -2991,6 +3116,7 @@ def build_brain_summary(
         lines.append(f"Total topics: {len(brain.topics)}")
         lines.append(f"Last review: {brain.last_review or 'never'}")
         lines.append(f"Last consolidation: {brain.last_consolidation or 'never'}")
+        lines.append(f"Last dream: {brain.last_dream or 'never'}")
 
         # Category breakdown
         categories: dict[str, int] = {}
@@ -3066,6 +3192,7 @@ def lint_brain(brain: BrainState) -> list[dict]:
     "message": str}``.
     """
     issues: list[dict] = []
+    low_signal_tags = {"general", "note", "misc", "temp", "todo"}
 
     connected_ids = (
         {c["from"] for c in brain.connections} | {c["to"] for c in brain.connections}
@@ -3122,6 +3249,46 @@ def lint_brain(brain: BrainState) -> list[dict]:
                 "severity": "warning" if negative_feedback > positive_feedback else "info",
                 "note_id": nid,
                 "message": f"Note {nid} is weakly supported and may need review",
+            })
+
+        source = note.get("source", {})
+        persona = source.get("persona") if isinstance(source, dict) else ""
+        evidence = _normalize_evidence(note.get("evidence"))
+        tags = _normalize_string_list(note.get("tags"))
+
+        # Observer notes must cite concrete workspace evidence.
+        if persona == "workspace_observer" and note.get("status") != "archive" and not evidence:
+            issues.append({
+                "type": "missing_citation",
+                "severity": "warning",
+                "note_id": nid,
+                "message": f"Workspace observer note {nid} is missing evidence/citation entries",
+            })
+
+        # Tag hygiene: ensure useful non-generic tags for active notes.
+        meaningful_tags = [t for t in tags if t.lower() not in low_signal_tags]
+        if note.get("category") != "archive" and len(meaningful_tags) < 1:
+            issues.append({
+                "type": "tag_quality",
+                "severity": "info",
+                "note_id": nid,
+                "message": f"Note {nid} has low-quality tags; add at least one specific tag",
+            })
+
+        # Stale repeated observer pattern notes should be consolidated.
+        created_at = note.get("created_at", "")
+        if (
+            persona == "workspace_observer"
+            and isinstance(created_at, str)
+            and created_at < (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            and "same files touched" in note.get("content", "").lower()
+            and note.get("category") != "archive"
+        ):
+            issues.append({
+                "type": "stale_pattern",
+                "severity": "info",
+                "note_id": nid,
+                "message": f"Observer note {nid} repeats stale 'same files touched' pattern",
             })
 
     # Low connection density (global metric)

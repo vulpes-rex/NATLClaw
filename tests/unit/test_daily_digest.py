@@ -96,22 +96,49 @@ class TestBrainSummary:
 
 
 class TestEventQueueSummary:
-    def test_no_queue_file(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("daily_digest.Path", lambda *a: tmp_path / "nonexistent" if a == ("data",) else Path(*a))
-        # The default path data/event_queue.json won't exist in fresh tmp
-        with patch("daily_digest.Path") as mock_path:
-            mock_path.return_value.exists.return_value = False
-            # Just test that we handle missing file gracefully
-            result = _event_queue_summary()
-            assert "empty" in result.lower() or "Event queue" in result
+    def test_no_queue_file(self, monkeypatch):
+        monkeypatch.setattr(
+            "daily_digest.pending_events_status",
+            lambda: {
+                "exists": False,
+                "total_lines": 0,
+                "valid_events": 0,
+                "malformed_lines": 0,
+                "by_type": {},
+            },
+        )
+        result = _event_queue_summary()
+        assert result == "Event queue: empty."
 
-    def test_empty_queue(self, tmp_path, monkeypatch):
-        eq = tmp_path / "event_queue.json"
-        eq.write_text("", encoding="utf-8")
-        import daily_digest
-        monkeypatch.setattr(daily_digest, "_event_queue_summary",
-            lambda: "Event queue: empty." if not eq.read_text().strip() else "has events")
-        assert daily_digest._event_queue_summary() == "Event queue: empty."
+    def test_empty_queue(self, monkeypatch):
+        monkeypatch.setattr(
+            "daily_digest.pending_events_status",
+            lambda: {
+                "exists": True,
+                "total_lines": 0,
+                "valid_events": 0,
+                "malformed_lines": 0,
+                "by_type": {},
+            },
+        )
+        assert _event_queue_summary() == "Event queue: empty."
+
+    def test_queue_with_types_and_malformed_lines(self, monkeypatch):
+        monkeypatch.setattr(
+            "daily_digest.pending_events_status",
+            lambda: {
+                "exists": True,
+                "total_lines": 3,
+                "valid_events": 2,
+                "malformed_lines": 1,
+                "by_type": {"file_change": 1, "task_created": 1},
+            },
+        )
+        result = _event_queue_summary()
+        assert "Event queue: 3 events" in result
+        assert "1 file_change" in result
+        assert "1 task_created" in result
+        assert "malformed=1" in result
 
 
 # ── _load_tasks ────────────────────────────────────────────────────────
@@ -177,6 +204,21 @@ class TestBuildDigest:
             digest = build_digest(brain)
         assert "## Recent Changes" in digest
         assert "Fix bug" in digest
+
+    def test_includes_active_work_section(self):
+        brain = _make_brain()
+        with patch("daily_digest._git_log_since", return_value="(no commits)"):
+            digest = build_digest(
+                brain,
+                active_work={
+                    "branch": "feature/observer",
+                    "files": ["cli.py", "scheduler.py"],
+                    "commit_intent": "Improve status output",
+                },
+            )
+        assert "## Current Active Work" in digest
+        assert "feature/observer" in digest
+        assert "cli.py" in digest
 
 
 # ── save_digest ────────────────────────────────────────────────────────

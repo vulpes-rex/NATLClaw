@@ -25,6 +25,7 @@ from event_watcher import (
     append_git_commit_event,
     enqueue_event,
     drain_pending_events,
+    pending_events_status,
 )
 import event_watcher
 
@@ -349,3 +350,35 @@ class TestCrossProcessEvents:
             assert event == (1, "git_commit", {"hash": "abc123"})
         finally:
             event_watcher._event_queue = None
+
+    def test_drain_supports_legacy_event_records(self, tmp_path, monkeypatch):
+        ndjson = tmp_path / "pending_events.ndjson"
+        monkeypatch.setattr(event_watcher, "_PENDING_EVENTS_FILE", ndjson)
+        ndjson.write_text('{"type":"file_change","path":"src/main.py","ts":"2026-01-01T00:00:00Z"}\n',
+                          encoding="utf-8")
+
+        q = asyncio.PriorityQueue()
+        count = drain_pending_events(q)
+        assert count == 1
+        assert q.qsize() == 1
+        priority, event_type, payload = q.get_nowait()
+        assert priority == 2
+        assert event_type == "file_change"
+        assert payload["path"] == "src/main.py"
+
+    def test_pending_events_status_counts_types_and_malformed(self, tmp_path, monkeypatch):
+        ndjson = tmp_path / "pending_events.ndjson"
+        monkeypatch.setattr(event_watcher, "_PENDING_EVENTS_FILE", ndjson)
+        ndjson.write_text(
+            '{"priority":1,"event_type":"task_created","payload":{"task_id":"t1"}}\n'
+            '{"priority":2,"event_type":"file_change","payload":{"path":"x.py"}}\n'
+            'not-json\n',
+            encoding="utf-8",
+        )
+        status = pending_events_status()
+        assert status["exists"] is True
+        assert status["total_lines"] == 3
+        assert status["valid_events"] == 2
+        assert status["malformed_lines"] == 1
+        assert status["by_type"]["task_created"] == 1
+        assert status["by_type"]["file_change"] == 1

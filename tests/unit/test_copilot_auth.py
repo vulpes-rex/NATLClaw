@@ -151,6 +151,22 @@ class TestConstants:
 
 
 class TestConfigIntegration:
+    _PROVIDER_ENV_KEYS = (
+        "PROVIDER",
+        "OPENAI_API_KEY",
+        "OPENAI_MODEL",
+        "OPENROUTER_API_KEY",
+        "OLLAMA_HOST",
+        "OLLAMA_MODEL",
+        "GITHUB_COPILOT_MODEL",
+        "AZURE_AI_MODEL_DEPLOYMENT_NAME",
+    )
+
+    @staticmethod
+    def _clear_provider_env(monkeypatch):
+        for key in TestConfigIntegration._PROVIDER_ENV_KEYS:
+            monkeypatch.delenv(key, raising=False)
+
     def test_config_has_github_pat_field(self):
         from config import AppConfig
         cfg = AppConfig()
@@ -163,3 +179,32 @@ class TestConfigIntegration:
         from config import load_config
         cfg = load_config(str(env_file))
         assert cfg.github_pat == "ghp_from_env"
+
+    def test_provider_switch_uses_env_only_for_openai(self, tmp_path, monkeypatch):
+        self._clear_provider_env(monkeypatch)
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "PROVIDER=openai\n"
+            "OPENAI_API_KEY=test-key\n"
+            "OPENAI_MODEL=gpt-4o-mini\n"
+        )
+        from config import load_config, validate_config
+        cfg = load_config(str(env_file))
+        assert cfg.provider == "openai"
+        assert cfg.openai_api_key == "test-key"
+        assert validate_config(cfg) == []
+
+    def test_provider_switch_uses_env_only_for_ollama(self, tmp_path, monkeypatch):
+        self._clear_provider_env(monkeypatch)
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "PROVIDER=ollama\n"
+            "OLLAMA_HOST=http://localhost:11434\n"
+            "OLLAMA_MODEL=llama3\n"
+        )
+        from config import load_config, validate_config
+        cfg = load_config(str(env_file))
+        assert cfg.provider == "ollama"
+        assert cfg.ollama_host == "http://localhost:11434"
+        assert cfg.model == "llama3"
+        assert validate_config(cfg) == []

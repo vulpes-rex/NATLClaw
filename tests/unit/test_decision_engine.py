@@ -19,9 +19,11 @@ from decision_engine import (
     DEFAULT_DECISION_POLICY,
     EventRoute,
     HeartbeatDecision,
+    apply_decision,
     build_decision_context,
     evaluate_heartbeat,
     has_preempting_event,
+    collect_escalation_signals,
     record_decision,
     record_decision_outcome,
     route_event,
@@ -274,6 +276,40 @@ class TestScoreInitiative:
         candidates = _score_initiative(ctx, all_initiatives)
         actions = [c.action for c in candidates]
         assert ActionType.INITIATIVE_SECURITY_SCAN in actions
+
+
+# =====================================================================
+# Deterministic escalation signals
+# =====================================================================
+
+
+class TestEscalationSignals:
+    def test_repeated_bug_work_triggers_escalation(self):
+        task = FakeTask(title="Fix regression in auth", description="bugfix hotfix")
+        ctx = _ctx(
+            active_task=task,
+            events=[(1, "git_commit", {"message": "fix bug in auth flow"})],
+        )
+        escalations = collect_escalation_signals(ctx)
+        kinds = {entry["type"] for entry in escalations}
+        assert "repeated_bug_work" in kinds
+
+    def test_todo_stagnation_triggers_escalation(self):
+        ctx = _ctx(events=[
+            (2, "file_modified", {"path": "src/todo_manager.py"}),
+            (2, "file_modified", {"path": "src/todo_manager.py"}),
+            (2, "file_modified", {"path": "src/todo_manager.py", "todo_changed": False}),
+        ])
+        escalations = collect_escalation_signals(ctx)
+        kinds = {entry["type"] for entry in escalations}
+        assert "todo_stagnation" in kinds
+
+    def test_long_inactivity_triggers_escalation(self):
+        old = (datetime.now(timezone.utc) - timedelta(hours=9)).isoformat()
+        ctx = _ctx(last_heartbeat_iso=old)
+        escalations = collect_escalation_signals(ctx)
+        kinds = {entry["type"] for entry in escalations}
+        assert "long_inactivity" in kinds
 
 
 # =====================================================================
@@ -556,6 +592,42 @@ class TestRecordDecision:
         ctx = _ctx()
         note_id = record_decision(brain, decision, ctx, add_note_fn=lambda *a, **kw: "n0001")
         assert note_id is None
+
+
+class TestApplyDecisionEscalations:
+    def test_apply_decision_emits_escalation_messages(self):
+        class _State:
+            execution_count = 12
+
+        class _Persona:
+            name = "workspace_observer"
+
+        decision = HeartbeatDecision(
+            chosen=ActionCandidate(
+                action=ActionType.RUN_HEARTBEAT,
+                score=12.0,
+                confidence=0.85,
+                rationale="Default heartbeat",
+            )
+        )
+        old = (datetime.now(timezone.utc) - timedelta(hours=8)).isoformat()
+        ctx = _ctx(last_heartbeat_iso=old)
+        result = apply_decision(
+            decision,
+            _State(),
+            FakeBrain(),
+            [],
+            [],
+            _Persona(),
+            config=None,
+            ctx=ctx,
+        )
+        messages = result["outbox_messages"]
+        assert messages, "Expected at least one escalation alert"
+        assert any(
+            m.payload.get("escalation_type") == "long_inactivity"
+            for m in messages
+        )
 
 
 # =====================================================================

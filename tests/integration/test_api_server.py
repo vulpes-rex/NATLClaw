@@ -108,6 +108,9 @@ def test_dashboard_returns_html(client):
     assert r.status_code == 200
     assert "text/html" in r.headers["content-type"]
     assert "NATLClaw Dashboard" in r.text
+    assert "Dreaming" in r.text
+    assert "History filter" in r.text
+    assert "Copy JSON" in r.text
 
 
 # ── OpenAI-compatible /v1/models ───────────────────────────────────────
@@ -153,6 +156,32 @@ def test_heartbeat_status_active(client, state_file):
     assert data["heartbeat_count"] == 5
 
 
+def test_heartbeat_status_uses_operator_scheduler_state(client):
+    async def _snap(*_a, **_kw):
+        return {
+            "heartbeat": {
+                "status": "active",
+                "last": "2026-01-01T00:00:00+00:00",
+                "seconds_ago": 1.2,
+                "count": 9,
+            },
+            "scheduler": {
+                "running": True,
+                "in_process_task_running": False,
+                "control": {"paused": False},
+                "backpressure": {"queue_depth_before_decision": 0},
+            },
+        }
+
+    with patch("api_server.build_operator_status", side_effect=_snap):
+        r = client.get("/api/heartbeat/status")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["scheduler_running"] is True
+    assert data["scheduler"]["in_process_task_running"] is False
+    assert "control" in data["scheduler"]
+
+
 def test_operator_status_snapshot(client, state_file):
     from state import AgentState, save_state
     from datetime import datetime, timezone
@@ -190,6 +219,10 @@ def test_operator_status_snapshot(client, state_file):
     assert "breached_count" in data["tasks"]["sla"]
     assert data["inbox"]["unread_count"] == 1
     assert data["inbox"]["requires_response_count"] == 1
+    assert "dream" in data
+    assert "enabled" in data["dream"]
+    assert "idle_streak_min" in data["dream"]
+    assert "max_age_days" in data["dream"]
     assert data["errors"]["recent_error_count"] >= 1
     assert data["errors"]["last_error"]["type"] == "network"
     assert data["errors"]["top_error_types"]

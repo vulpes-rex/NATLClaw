@@ -62,6 +62,9 @@ class Persona:
     consolidation_interval: int = 5    # every N heartbeats (0 = threshold only)
     consolidation_threshold: int = 10  # max unconsolidated notes before forced
     lint_wiki_interval: int = 20       # every N heartbeats (0 = disabled)
+    dream_enabled: bool = True
+    dream_idle_streak_min: int = 3
+    dream_max_age_days: int = 30
 
     # Agentic task mode (used by cmd_code / cmd_task)
     prompt_dir: str = ""               # prompt template subdirectory (e.g. "coding_agent")
@@ -550,6 +553,9 @@ def _build_inline_persona(
         consolidation_interval=int(entry.get("consolidation", {}).get("interval", 5)),
         consolidation_threshold=int(entry.get("consolidation", {}).get("threshold", 10)),
         lint_wiki_interval=int(entry.get("lint", {}).get("interval", 20)),
+        dream_enabled=bool(entry.get("dream", {}).get("enabled", True)),
+        dream_idle_streak_min=int(entry.get("dream", {}).get("idleStreakMin", 3)),
+        dream_max_age_days=int(entry.get("dream", {}).get("maxAgeDays", 30)),
         prompt_dir=entry.get("promptDir", ""),
         done_marker=entry.get("doneMarker", "[TASK_COMPLETE]"),
         blocked_marker=entry.get("blockedMarker", "[TASK_BLOCKED]"),
@@ -623,6 +629,9 @@ def _build_external_persona(
         consolidation_interval=int(manifest.get("consolidation", {}).get("interval", 5)),
         consolidation_threshold=int(manifest.get("consolidation", {}).get("threshold", 10)),
         lint_wiki_interval=int(manifest.get("lint", {}).get("interval", 20)),
+        dream_enabled=bool(manifest.get("dream", {}).get("enabled", True)),
+        dream_idle_streak_min=int(manifest.get("dream", {}).get("idleStreakMin", 3)),
+        dream_max_age_days=int(manifest.get("dream", {}).get("maxAgeDays", 30)),
         prompt_dir=manifest.get("promptDir", ""),
         done_marker=manifest.get("doneMarker", "[TASK_COMPLETE]"),
         blocked_marker=manifest.get("blockedMarker", "[TASK_BLOCKED]"),

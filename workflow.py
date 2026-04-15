@@ -863,7 +863,8 @@ async def _distil_to_brain(
                 f"Distil ONE key insight from this output into the second brain.\n\n"
                 f"Output:\n{result[:400]}\n\n"
                 f"Return JSON: {{\"topic\": \"...\", \"content\": \"...\", "
-                f"\"tags\": [...], \"category\": \"resources\"}}\n"
+                f"\"tags\": [...], \"category\": \"resources\", "
+                f"\"evidence\": [\"commit:<sha> or file:path\"], \"confidence\": 0-100}}\n"
                 f"Return ONLY the JSON object."
             )
         distil_result = await _run_step(agent, f"{step_name}_capture", distil_prompt, state)
@@ -998,6 +999,81 @@ def _extract_json(raw: str, required_key: str = "content") -> dict | None:
     return None
 
 
+def _coerce_confidence(value: object) -> int | None:
+    """Normalize confidence to an integer between 0 and 100."""
+    try:
+        if value in (None, ""):
+            return None
+        score = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(100, score))
+
+
+def _has_required_observer_evidence(evidence: list[str]) -> bool:
+    """Workspace observer evidence must include commit hash or file path."""
+    for item in evidence:
+        text = item.strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        # Commit-style evidence: explicit keyword or sha-like token.
+        if "commit" in lowered:
+            return True
+        compact = text.replace(" ", "")
+        if len(compact) >= 7 and all(c in "0123456789abcdefABCDEF" for c in compact[:12]):
+            return True
+        # File-style evidence: path separator or known source/doc suffix.
+        if "/" in text or "\\" in text:
+            return True
+        if lowered.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".md", ".json", ".yml", ".yaml")):
+            return True
+    return False
+
+
+def _parse_iso_utc(value: object) -> datetime | None:
+    """Parse an ISO timestamp to timezone-aware UTC datetime."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _find_recent_observer_note_by_evidence(
+    brain: BrainState,
+    evidence: list[str],
+    *,
+    window_minutes: int = 20,
+) -> str | None:
+    """Find a recent workspace_observer note that overlaps evidence paths."""
+    if not evidence:
+        return None
+    now = datetime.now(timezone.utc)
+    evidence_set = {item.lower() for item in evidence}
+    for note_id, note in reversed(list(brain.notes.items())):
+        source = note.get("source")
+        if not isinstance(source, dict) or source.get("persona") != "workspace_observer":
+            continue
+        created_at = _parse_iso_utc(note.get("created_at"))
+        if created_at is None:
+            continue
+        age_min = (now - created_at).total_seconds() / 60.0
+        if age_min > window_minutes:
+            continue
+        existing_evidence = note.get("evidence", [])
+        if not isinstance(existing_evidence, list):
+            existing_evidence = []
+        existing_set = {str(item).lower() for item in existing_evidence}
+        if evidence_set & existing_set:
+            return note_id
+    return None
+
+
 def _store_capture(
     brain: BrainState,
     raw: str,
@@ -1015,10 +1091,69 @@ def _store_capture(
         data = _extract_json(raw, required_key="content")
         if data is None:
             logger.warning("_store_capture: no JSON object with 'content' key found")
+            if persona_name == "workspace_observer":
+                logger.warning("_store_capture: dropping workspace_observer note without JSON capture")
+                return None
             return add_note(brain, content=raw[:300], source="heartbeat")
         content = data.get("content", raw[:300])
 
         tags = data.get("tags", [])
+        evidence = data.get("evidence")
+        if isinstance(evidence, list):
+            evidence_list = [str(item).strip() for item in evidence if str(item).strip()]
+        elif evidence in (None, ""):
+            evidence_list = []
+        else:
+            text = str(evidence).strip()
+            evidence_list = [text] if text else []
+
+        confidence = _coerce_confidence(data.get("confidence"))
+        is_workspace_observer = persona_name == "workspace_observer"
+        has_required_evidence = _has_required_observer_evidence(evidence_list)
+        low_quality = not has_required_evidence
+        if is_workspace_observer and low_quality:
+            logger.warning(
+                "_store_capture: dropping workspace_observer note missing required evidence"
+            )
+            return None
+        if low_quality and "low_quality" not in tags:
+            tags = [*tags, "low_quality"]
+        if low_quality and "missing_evidence" not in tags:
+            tags = [*tags, "missing_evidence"]
+        status = data.get("status", "active")
+        if low_quality:
+            status = "invalid"
+            if confidence is None:
+                confidence = 20
+        elif confidence is None:
+            confidence = 70
+
+        if is_workspace_observer and evidence_list:
+            recent_dup_id = _find_recent_observer_note_by_evidence(brain, evidence_list)
+            if recent_dup_id:
+                existing = brain.notes[recent_dup_id]
+                existing["content"] = content
+                existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+                merged_evidence = existing.get("evidence", [])
+                if not isinstance(merged_evidence, list):
+                    merged_evidence = []
+                for item in evidence_list:
+                    if item not in merged_evidence:
+                        merged_evidence.append(item)
+                existing["evidence"] = merged_evidence
+                for tag in tags:
+                    if tag not in existing.get("tags", []):
+                        existing.setdefault("tags", []).append(tag)
+                existing["status"] = status
+                existing["confidence"] = confidence
+                for tag in tags:
+                    assign_note_to_topic(brain, recent_dup_id, tag)
+                _relate_cooccurring_tags(brain, tags)
+                logger.info(
+                    "[capture] merged observer burst note into %s (evidence overlap)",
+                    recent_dup_id,
+                )
+                return recent_dup_id
 
         # Dedup check — merge into existing note if near-duplicate
         dup_id = find_duplicate(brain, content)
@@ -1029,6 +1164,16 @@ def _store_capture(
             for tag in tags:
                 if tag not in existing.get("tags", []):
                     existing.setdefault("tags", []).append(tag)
+            if evidence_list:
+                merged_evidence = existing.get("evidence", [])
+                if not isinstance(merged_evidence, list):
+                    merged_evidence = []
+                for item in evidence_list:
+                    if item not in merged_evidence:
+                        merged_evidence.append(item)
+                existing["evidence"] = merged_evidence
+            existing["status"] = status or existing.get("status", "active")
+            existing["confidence"] = confidence
             # Still assign topics so graph stays current
             for tag in tags:
                 assign_note_to_topic(brain, dup_id, tag)
@@ -1058,9 +1203,9 @@ def _store_capture(
             category=data.get("category", "resources"),
             source=source_meta,
             note_type=data.get("note_type", "general"),
-            status=data.get("status", "active"),
-            confidence=data.get("confidence"),
-            evidence=data.get("evidence"),
+            status=status,
+            confidence=confidence,
+            evidence=evidence_list,
         )
 
         # Wire note into the topic graph
@@ -1073,6 +1218,9 @@ def _store_capture(
     except (json.JSONDecodeError, AttributeError, UnicodeDecodeError) as e:
         logger.warning("_store_capture failed to parse JSON: %s", str(e))
         logger.debug("JSON parsing error details:", exc_info=True)
+        if persona_name == "workspace_observer":
+            logger.warning("_store_capture: dropping workspace_observer note on parse failure")
+            return None
         try:
             return add_note(brain, content=raw[:300], source="heartbeat")
         except Exception as add_note_error:

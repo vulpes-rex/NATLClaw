@@ -11,16 +11,19 @@ import json
 import os
 import re
 import subprocess
+import asyncio
 from pathlib import Path
 from typing import Annotated
 
+import event_watcher
+
 WORKSPACE = os.environ.get("NATL_WORKSPACE", ".")
-EVENT_QUEUE_PATH = os.path.join("data", "event_queue.json")
 
 # Markers we look for when scanning for action items
 _TODO_PATTERN = re.compile(
     r"\b(TODO|FIXME|HACK|XXX|WARN|NOTE)\b[:\s]*(.*)", re.IGNORECASE
 )
+_MAX_SCAN_FILES = 2000
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -33,15 +36,27 @@ def drain_events() -> str:
     Events are newline-delimited JSON objects appended by file watchers
     and git hooks between heartbeats.
     """
-    if not os.path.exists(EVENT_QUEUE_PATH):
+    queue: asyncio.PriorityQueue[tuple[int, str, dict]] = asyncio.PriorityQueue()
+    drained = event_watcher.drain_pending_events(queue)
+    if drained <= 0:
         return "No pending events."
-    try:
-        with open(EVENT_QUEUE_PATH, "r", encoding="utf-8") as f:
-            content = f.read()
-        os.remove(EVENT_QUEUE_PATH)
-        return content[:6000] or "No pending events."
-    except OSError as e:
-        return f"Error reading event queue: {e}"
+    records: list[str] = []
+    while not queue.empty():
+        try:
+            priority, event_type, payload = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        records.append(
+            json.dumps(
+                {
+                    "priority": priority,
+                    "event_type": event_type,
+                    "payload": payload,
+                },
+                ensure_ascii=False,
+            )
+        )
+    return ("\n".join(records))[:6000] or "No pending events."
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -129,6 +144,7 @@ def scan_todos(
 
     exts = {f".{e.strip()}" for e in extensions.split(",")}
     hits: list[str] = []
+    scanned_files = 0
 
     for root, dirs, files in os.walk(ws):
         # Skip common non-source directories
@@ -137,9 +153,12 @@ def scan_todos(
             if d not in {"node_modules", ".git", "__pycache__", "venv", ".venv", "dist", "build"}
         ]
         for fname in files:
+            if scanned_files >= _MAX_SCAN_FILES:
+                break
             if Path(fname).suffix not in exts:
                 continue
             fpath = Path(root) / fname
+            scanned_files += 1
             try:
                 for lineno, line in enumerate(
                     fpath.read_text(encoding="utf-8", errors="ignore").splitlines(),
@@ -160,6 +179,8 @@ def scan_todos(
 
     if not hits:
         return "No TODO/FIXME/HACK items found."
+    if scanned_files >= _MAX_SCAN_FILES:
+        hits.append(f"... scan capped at {_MAX_SCAN_FILES} files")
     return "\n".join(hits)
 
 
@@ -172,17 +193,23 @@ def list_recently_modified(
         return f"Workspace directory not found: {WORKSPACE}"
 
     files: list[tuple[float, Path]] = []
+    scanned_files = 0
     for root, dirs, fnames in os.walk(ws):
         dirs[:] = [
             d for d in dirs
             if d not in {"node_modules", ".git", "__pycache__", "venv", ".venv", "dist", "build"}
         ]
         for fname in fnames:
+            if scanned_files >= _MAX_SCAN_FILES:
+                break
             fp = Path(root) / fname
+            scanned_files += 1
             try:
                 files.append((fp.stat().st_mtime, fp))
             except OSError:
                 continue
+        if scanned_files >= _MAX_SCAN_FILES:
+            break
 
     files.sort(reverse=True)
     lines = []
@@ -191,6 +218,8 @@ def list_recently_modified(
         ts = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
         rel = fp.relative_to(ws)
         lines.append(f"{ts}  {rel}")
+    if scanned_files >= _MAX_SCAN_FILES:
+        lines.append(f"... scan capped at {_MAX_SCAN_FILES} files")
     return "\n".join(lines) or "(empty workspace)"
 
 

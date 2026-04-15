@@ -9,6 +9,8 @@ from config import AppConfig
 from error_classification import classify_error_text, top_error_types
 from execution_log import recent_entries
 from messaging import load_outbox
+from persona_loader import load_persona
+from project_context import get_active_work_snapshot, load_projects
 from scheduler import get_scheduler_lock_info, get_scheduler_runtime_backpressure_stats
 from scheduler_control import load_scheduler_control
 from state import load_state
@@ -131,6 +133,7 @@ async def build_operator_status(
     state = await load_state(config.state_file)
     tasks = await load_tasks(config.state_file)
     outbox = await load_outbox(config.state_file)
+    projects = load_projects(config.state_file)
 
     lock = get_scheduler_lock_info(config.state_file)
     control = await load_scheduler_control(config.state_file)
@@ -148,6 +151,30 @@ async def build_operator_status(
         recent_error_count=int(errors.get("recent_error_count", 0)),
         lock_info=lock,
     )
+    dream_policy = {
+        "enabled": True,
+        "idle_streak_min": 3,
+        "max_age_days": 30,
+        "source_persona": config.persona,
+    }
+    try:
+        persona = load_persona(config.persona)
+        dream_policy = {
+            "enabled": bool(getattr(persona, "dream_enabled", True)),
+            "idle_streak_min": max(1, int(getattr(persona, "dream_idle_streak_min", 3))),
+            "max_age_days": max(1, int(getattr(persona, "dream_max_age_days", 30))),
+            "source_persona": persona.name,
+        }
+    except Exception:
+        # Keep status endpoint resilient even if persona config is malformed.
+        pass
+
+    active_work = state.context.get("active_work") if isinstance(state.context, dict) else None
+    if not isinstance(active_work, dict) and projects:
+        try:
+            active_work = get_active_work_snapshot(projects[0])
+        except Exception:
+            active_work = None
 
     return {
         "agent": {
@@ -175,6 +202,7 @@ async def build_operator_status(
             "last": state.last_heartbeat,
             **heartbeat,
         },
+        "active_work": active_work,
         "tasks": {
             "total": len(tasks),
             "active": {
@@ -192,6 +220,7 @@ async def build_operator_status(
             "unread_count": len(unread),
             "requires_response_count": sum(1 for m in unread if getattr(m, "requires_response", False)),
         },
+        "dream": dream_policy,
         "errors": errors,
         "reliability": reliability,
     }

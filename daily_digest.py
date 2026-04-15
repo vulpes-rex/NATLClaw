@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from event_watcher import pending_events_status
+
 logger = logging.getLogger(__name__)
 
 TASKS_PATH = Path("data") / "tasks.json"
@@ -107,27 +109,16 @@ def _brain_summary_for_digest(brain: Any) -> str:
 
 def _event_queue_summary() -> str:
     """Summarise pending events without draining them."""
-    eq = Path("data") / "event_queue.json"
-    if not eq.exists():
+    queue = pending_events_status()
+    if not queue["exists"] or queue["total_lines"] == 0:
         return "Event queue: empty."
-    try:
-        content = eq.read_text(encoding="utf-8").strip()
-        events = [l for l in content.splitlines() if l.strip()]
-        if not events:
-            return "Event queue: empty."
-        # Count by type
-        types: dict[str, int] = {}
-        for line in events:
-            try:
-                evt = json.loads(line)
-                t = evt.get("type", "unknown")
-                types[t] = types.get(t, 0) + 1
-            except json.JSONDecodeError:
-                pass
-        parts = [f"{v} {k}" for k, v in sorted(types.items())]
-        return f"Event queue: {len(events)} events ({', '.join(parts)})."
-    except OSError:
-        return "Event queue: unreadable."
+    parts = [
+        f"{count} {event_type}"
+        for event_type, count in sorted(queue["by_type"].items())
+    ]
+    malformed = queue["malformed_lines"]
+    malformed_suffix = f", malformed={malformed}" if malformed else ""
+    return f"Event queue: {queue['total_lines']} events ({', '.join(parts)}){malformed_suffix}."
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -139,6 +130,7 @@ def build_digest(
     last_heartbeat: str | None = None,
     *,
     persona_name: str = "",
+    active_work: dict[str, Any] | None = None,
 ) -> str:
     """Build a daily digest string.
 
@@ -146,6 +138,7 @@ def build_digest(
         brain: BrainState object.
         last_heartbeat: ISO-8601 timestamp of the last heartbeat (for git log).
         persona_name: Active persona name (for header).
+        active_work: Optional active-work snapshot for concise status.
 
     Returns:
         Formatted digest string for console output.
@@ -179,6 +172,18 @@ def build_digest(
     # 3. Event queue
     sections.append(_event_queue_summary())
     sections.append("")
+
+    # 3b. Current active work
+    if active_work:
+        branch = active_work.get("branch", "-")
+        files = active_work.get("files") or []
+        intent = active_work.get("commit_intent") or "-"
+        files_preview = ", ".join(files[:3]) if files else "-"
+        sections.append("## Current Active Work")
+        sections.append(f"Branch: {branch}")
+        sections.append(f"Touched files: {files_preview}")
+        sections.append(f"Commit intent: {intent}")
+        sections.append("")
 
     # 4. Brain state
     sections.append("## Brain")
