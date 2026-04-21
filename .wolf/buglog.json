@@ -1,0 +1,406 @@
+{
+  "version": 1,
+  "bugs": [
+    {
+      "id": "bug-001",
+      "timestamp": "2026-04-16T00:17:51.205Z",
+      "error_message": "Missing await",
+      "file": "cli.py",
+      "root_cause": "Async call without await — returned Promise instead of value",
+      "fix": "Added await to async call",
+      "tags": [
+        "auto-detected",
+        "async-fix",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T00:17:51.205Z"
+    },
+    {
+      "id": "bug-002",
+      "timestamp": "2026-04-16T00:18:20.372Z",
+      "error_message": "Significant refactor of ",
+      "file": "cli.py",
+      "root_cause": "3 lines replaced/restructured",
+      "fix": "Rewrote 20→32 lines (3 removed)",
+      "tags": [
+        "auto-detected",
+        "refactor",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T00:18:20.372Z"
+    },
+    {
+      "id": "bug-003",
+      "timestamp": "2026-04-16T00:20:49.549Z",
+      "error_message": "Function not marked async",
+      "file": "workflow.py",
+      "root_cause": "Function uses await but wasn't declared async",
+      "fix": "Added async modifier",
+      "tags": [
+        "auto-detected",
+        "async-fix",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T00:20:49.549Z"
+    },
+    {
+      "id": "bug-004",
+      "timestamp": "2026-04-16T00:26:18.540Z",
+      "error_message": "Incorrect value in code",
+      "file": "workflow.py",
+      "root_cause": "Had \", pname)\n                await run_heartbeat(agen",
+      "fix": "Changed to \", pname)\n                await run_heartbeat(agen",
+      "tags": [
+        "auto-detected",
+        "wrong-value",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T00:26:18.540Z"
+    },
+    {
+      "id": "bug-005",
+      "timestamp": "2026-04-16T00:28:05.014Z",
+      "error_message": "Significant refactor of ",
+      "file": "messaging.py",
+      "root_cause": "2 lines replaced/restructured",
+      "fix": "Rewrote 14→19 lines (2 removed)",
+      "tags": [
+        "auto-detected",
+        "refactor",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T00:28:05.014Z"
+    },
+    {
+      "id": "bug-006",
+      "timestamp": "2026-04-16T01:04:35.717Z",
+      "error_message": "Incorrect value in code",
+      "file": "workflow.py",
+      "root_cause": "Had \", pname)\n                await run_heartbeat(agen",
+      "fix": "Changed to \", pname)\n                await run_heartbeat(agen",
+      "tags": [
+        "auto-detected",
+        "wrong-value",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T01:04:35.717Z"
+    },
+    {
+      "id": "bug-007",
+      "timestamp": "2026-04-16T12:41:19.716Z",
+      "error_message": "Incorrect value in code",
+      "file": "docs/coworker-roadmap.md",
+      "root_cause": "Had `natl inbox`",
+      "fix": "Changed to `notification_dispatch.py`",
+      "tags": [
+        "auto-detected",
+        "wrong-value",
+        "md"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T12:41:19.716Z"
+    },
+    {
+      "id": "bug-008",
+      "timestamp": "2026-04-16T15:21:57.949Z",
+      "error_message": "Incorrect value in code",
+      "file": "config.py",
+      "root_cause": "Had \"SURFACE_INGRESS_ENABLED\"",
+      "fix": "Changed to \"TASK_NEGOTIATION_ENABLED\"",
+      "tags": [
+        "auto-detected",
+        "wrong-value",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T15:21:57.949Z"
+    },
+    {
+      "id": "bug-009",
+      "timestamp": "2026-04-16T15:22:11.177Z",
+      "error_message": "Missing await",
+      "file": "workflow.py",
+      "root_cause": "Async call without await — returned Promise instead of value",
+      "fix": "Added await to async call | Also: # Task negotiation helper (Move B); async def _run_negotiation_step(",
+      "tags": [
+        "auto-detected",
+        "async-fix",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 2,
+      "last_seen": "2026-04-16T15:22:32.114Z"
+    },
+    {
+      "id": "bug-010",
+      "timestamp": "2026-04-16T15:26:00.417Z",
+      "error_message": "Incorrect value in code",
+      "file": "handoff.py",
+      "root_cause": "Had \"context\"",
+      "fix": "Changed to \"summary\"",
+      "tags": [
+        "auto-detected",
+        "wrong-value",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T15:26:00.417Z"
+    },
+    {
+      "id": "bug-011",
+      "timestamp": "2026-04-16T00:00:00.000Z",
+      "error_message": "MagicMock(spec=AppConfig) returns truthy mock for new bool fields, causing task_negotiation_enabled to evaluate True and trigger negotiation step unexpectedly",
+      "file": "tests/unit/test_workflow_modes.py",
+      "root_cause": "When a new bool attribute is added to AppConfig, MagicMock(spec=AppConfig) serves a truthy MagicMock for that attribute instead of the default False. Any code guarded by getattr(config, 'new_bool_field', False) will be bypassed because the mock attribute is truthy.",
+      "fix": "Added `cfg.task_negotiation_enabled = False` to the config fixture in test_workflow_modes.py. Rule: every new bool field added to AppConfig must also be explicitly set to its default in any MagicMock(spec=AppConfig) fixture that exercises code guarded by that field.",
+      "tags": [
+        "test",
+        "mock",
+        "appconfig",
+        "boolean-default"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T00:00:00.000Z"
+    },
+    {
+      "id": "bug-012",
+      "timestamp": "2026-04-16T17:41:55.849Z",
+      "error_message": "Significant refactor of ",
+      "file": "notification_dispatch.py",
+      "root_cause": "2 lines replaced/restructured",
+      "fix": "Rewrote 14→24 lines (2 removed)",
+      "tags": [
+        "auto-detected",
+        "refactor",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T17:41:55.849Z"
+    },
+    {
+      "id": "bug-013",
+      "timestamp": "2026-04-16T18:03:30.670Z",
+      "error_message": "Missing error handling in switchPersona",
+      "file": "api_server.py",
+      "root_cause": "Code path had no error handling — exceptions would propagate uncaught",
+      "fix": "Added try/catch block",
+      "tags": [
+        "auto-detected",
+        "error-handling",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T18:03:30.670Z"
+    },
+    {
+      "id": "bug-014",
+      "timestamp": "2026-04-16T19:05:35.891Z",
+      "error_message": "Missing await",
+      "file": "notification_dispatch.py",
+      "root_cause": "Async call without await — returned Promise instead of value",
+      "fix": "Added await to async call",
+      "tags": [
+        "auto-detected",
+        "async-fix",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T19:05:35.891Z"
+    },
+    {
+      "id": "bug-015",
+      "timestamp": "2026-04-16T19:10:30.487Z",
+      "error_message": "Incorrect value in code",
+      "file": "connectors/teams.py",
+      "root_cause": "Had \"%A, %B %-d\"",
+      "fix": "Changed to \"%A, %B\"",
+      "tags": [
+        "auto-detected",
+        "wrong-value",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 2,
+      "last_seen": "2026-04-16T19:10:35.078Z"
+    },
+    {
+      "id": "bug-016",
+      "timestamp": "2026-04-16T19:10:39.524Z",
+      "error_message": "Incorrect value in code",
+      "file": "connectors/outlook.py",
+      "root_cause": "Had \"%A, %B %-d, %Y\"",
+      "fix": "Changed to \"%A, %B\"",
+      "tags": [
+        "auto-detected",
+        "wrong-value",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 2,
+      "last_seen": "2026-04-16T19:10:43.979Z"
+    },
+    {
+      "id": "bug-017",
+      "timestamp": "2026-04-16T20:30:27.268Z",
+      "error_message": "Missing await",
+      "file": "api_server.py",
+      "root_cause": "Async call without await — returned Promise instead of value",
+      "fix": "Added await to async call",
+      "tags": [
+        "auto-detected",
+        "async-fix",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T20:30:27.268Z"
+    },
+    {
+      "id": "bug-018",
+      "timestamp": "2026-04-16T20:31:27.957Z",
+      "error_message": "Incorrect value in code",
+      "file": "cli.py",
+      "root_cause": "Had \"brief\"",
+      "fix": "Changed to \"standup\"",
+      "tags": [
+        "auto-detected",
+        "wrong-value",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T20:31:27.957Z"
+    },
+    {
+      "id": "bug-019",
+      "timestamp": "2026-04-16T20:31:46.547Z",
+      "error_message": "Missing await",
+      "file": "scheduler.py",
+      "root_cause": "Async call without await — returned Promise instead of value",
+      "fix": "Added await to async call",
+      "tags": [
+        "auto-detected",
+        "async-fix",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T20:31:46.547Z"
+    },
+    {
+      "id": "bug-020",
+      "timestamp": "2026-04-16T20:36:20.282Z",
+      "error_message": "Incorrect value in code",
+      "file": "standup.py",
+      "root_cause": "Had ':11}  → {question}\"",
+      "fix": "Changed to ':11}  -> {question}\"",
+      "tags": [
+        "auto-detected",
+        "wrong-value",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T20:36:20.282Z"
+    },
+    {
+      "id": "bug-021",
+      "timestamp": "2026-04-16T20:52:54.891Z",
+      "error_message": "Incorrect value in code",
+      "file": "standup.py",
+      "root_cause": "Had \"{ref} — {task.title}\"",
+      "fix": "Changed to \"{ref} - {task.title}\"",
+      "tags": [
+        "auto-detected",
+        "wrong-value",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T20:52:54.891Z"
+    },
+    {
+      "id": "bug-022",
+      "timestamp": "2026-04-16T21:45:05.368Z",
+      "error_message": "Missing await",
+      "file": "cli.py",
+      "root_cause": "Async call without await — returned Promise instead of value",
+      "fix": "Added await to async call",
+      "tags": [
+        "auto-detected",
+        "async-fix",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T21:45:05.368Z"
+    },
+    {
+      "id": "bug-023",
+      "timestamp": "2026-04-16T21:45:16.465Z",
+      "error_message": "Incorrect value in code",
+      "file": "cli.py",
+      "root_cause": "Had \"brief\"",
+      "fix": "Changed to \"reply\"",
+      "tags": [
+        "auto-detected",
+        "wrong-value",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T21:45:16.465Z"
+    },
+    {
+      "id": "bug-024",
+      "timestamp": "2026-04-16T23:26:37.189Z",
+      "error_message": "Significant refactor of ",
+      "file": "personas/qa_engineer/tools.py",
+      "root_cause": "5 lines replaced/restructured",
+      "fix": "Rewrote 8→14 lines (5 removed)",
+      "tags": [
+        "auto-detected",
+        "refactor",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-16T23:26:37.189Z"
+    },
+    {
+      "id": "bug-025",
+      "timestamp": "2026-04-17T00:14:10.446Z",
+      "error_message": "Missing await",
+      "file": "cli.py",
+      "root_cause": "Async call without await — returned Promise instead of value",
+      "fix": "Added await to async call",
+      "tags": [
+        "auto-detected",
+        "async-fix",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-04-17T00:14:10.446Z"
+    }
+  ]
+}

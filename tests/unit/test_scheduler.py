@@ -416,7 +416,7 @@ def _scheduler_patches(mock_heartbeat, mock_persona=None):
 def _make_event_queue():
     """Create an event queue pre-loaded with a dummy event so wait_for returns immediately."""
     q = asyncio.PriorityQueue()
-    q.put_nowait((3, "test_tick", {}))
+    q.put_nowait((3, 0, "test_tick", {}))
     return q
 
 
@@ -624,7 +624,7 @@ def test_scheduler_event_wakes_from_sleep():
 
     # Pre-load a task_created event — scheduler should wake immediately
     q = asyncio.PriorityQueue()
-    q.put_nowait((1, "task_created", {"task_id": "t001"}))
+    q.put_nowait((1, 0, "task_created", {"task_id": "t001"}))
 
     with _scheduler_patches(mock_heartbeat):
         asyncio.run(run_scheduler(config, max_iterations=2, event_queue=q))
@@ -708,7 +708,7 @@ def test_wait_for_event_or_timeout_drains_pending_events_file(tmp_path, monkeypa
 
     event, elapsed = asyncio.run(_run())
     assert event is not None
-    assert event[1] == "task_created"
+    assert event[2] == "task_created"
     assert elapsed < 0.5, f"event wake-up took too long: {elapsed:.3f}s"
 
 
@@ -716,7 +716,7 @@ def test_drain_event_queue_bounded_caps_and_reports_remaining():
     """Bounded queue drain should leave spillover queued for next heartbeat."""
     q = asyncio.PriorityQueue()
     for i in range(6):
-        q.put_nowait((3, f"event_{i}", {"i": i}))
+        q.put_nowait((3, i, f"event_{i}", {"i": i}))
 
     drained, remaining = _drain_event_queue_bounded(q, max_items=3)
 
@@ -732,7 +732,7 @@ def test_scheduler_records_backpressure_stats():
     q = asyncio.PriorityQueue()
     # Enough events to force decision spillover with cap=2.
     for i in range(5):
-        q.put_nowait((3, f"queued_{i}", {"i": i}))
+        q.put_nowait((3, i, f"queued_{i}", {"i": i}))
 
     with _scheduler_patches(mock_heartbeat), \
          patch("scheduler._wait_for_event_or_timeout", new_callable=AsyncMock, return_value=None):

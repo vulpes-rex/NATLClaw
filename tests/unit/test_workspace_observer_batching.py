@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import json
 
+from capture_policy import CapturePolicy
 from second_brain import BrainState
 from workflow import _store_capture
+
+_WS_CAPTURE = CapturePolicy(
+    reject_if_missing_evidence=True,
+    evidence_burst_merge_window_minutes=20,
+)
 
 
 def test_workspace_observer_batches_burst_notes_by_evidence_overlap():
@@ -18,7 +24,12 @@ def test_workspace_observer_batches_burst_notes_by_evidence_overlap():
             "confidence": 82,
         }
     )
-    first_id = _store_capture(brain, raw_first, persona_name="workspace_observer")
+    first_id = _store_capture(
+        brain,
+        raw_first,
+        persona_name="workspace_observer",
+        capture_policy=_WS_CAPTURE,
+    )
     assert first_id is not None
 
     raw_second = json.dumps(
@@ -31,7 +42,12 @@ def test_workspace_observer_batches_burst_notes_by_evidence_overlap():
             "confidence": 84,
         }
     )
-    second_id = _store_capture(brain, raw_second, persona_name="workspace_observer")
+    second_id = _store_capture(
+        brain,
+        raw_second,
+        persona_name="workspace_observer",
+        capture_policy=_WS_CAPTURE,
+    )
     assert second_id == first_id
     note = brain.notes[first_id]
     assert "event_watcher.py" in note["evidence"]
@@ -52,6 +68,7 @@ def test_workspace_observer_creates_new_note_when_evidence_does_not_overlap():
             }
         ),
         persona_name="workspace_observer",
+        capture_policy=_WS_CAPTURE,
     )
     second = _store_capture(
         brain,
@@ -65,6 +82,7 @@ def test_workspace_observer_creates_new_note_when_evidence_does_not_overlap():
             }
         ),
         persona_name="workspace_observer",
+        capture_policy=_WS_CAPTURE,
     )
     assert first is not None and second is not None
     assert first != second

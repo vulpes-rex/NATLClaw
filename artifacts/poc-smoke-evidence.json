@@ -1,0 +1,12 @@
+{
+  "cycles_target": 3,
+  "execution_count": 3,
+  "checks": {
+    "three_cycles_completed": true,
+    "state_persisted": true,
+    "lessons_present_in_context": true,
+    "context_injected_across_cycles": true
+  },
+  "lessons_count": 3,
+  "state_file": "artifacts\\poc-smoke-state.json"
+}

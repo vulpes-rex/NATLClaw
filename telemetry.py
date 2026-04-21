@@ -7,6 +7,8 @@ from config import AppConfig
 logger = logging.getLogger(__name__)
 
 _SENTRY_INITIALIZED = False
+# Set when import of sentry_sdk fails so repeated init_sentry calls do not log tracebacks.
+_SENTRY_SDK_MISSING = False
 
 
 def init_sentry(config: AppConfig) -> bool:
@@ -16,7 +18,7 @@ def init_sentry(config: AppConfig) -> bool:
     The function is intentionally fail-safe: telemetry issues never crash the app.
     """
 
-    global _SENTRY_INITIALIZED
+    global _SENTRY_INITIALIZED, _SENTRY_SDK_MISSING
 
     if _SENTRY_INITIALIZED:
         return True
@@ -26,8 +28,21 @@ def init_sentry(config: AppConfig) -> bool:
         logger.debug("Sentry disabled: SENTRY_DSN not configured.")
         return False
 
+    if _SENTRY_SDK_MISSING:
+        return False
+
     try:
         import sentry_sdk
+    except ModuleNotFoundError:
+        _SENTRY_SDK_MISSING = True
+        logger.warning(
+            "Sentry disabled: package sentry-sdk is not installed. "
+            "Install project dependencies (e.g. pip install -e .) or: pip install 'sentry-sdk[fastapi]>=2'. "
+            "Continuing without telemetry.",
+        )
+        return False
+
+    try:
         from sentry_sdk.integrations.fastapi import FastApiIntegration
         from sentry_sdk.integrations.logging import LoggingIntegration
 

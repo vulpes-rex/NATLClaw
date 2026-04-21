@@ -16,9 +16,10 @@ Usage::
     from persona_loader import load_persona, list_personas
 
     persona = load_persona("devops_engineer")
-    # persona.instructions  — str (markdown content)
-    # persona.tools         — list[Callable]
-    # persona.mcp_servers   — dict[str, dict] | None
+    # persona.instructions   — str (markdown content)
+    # persona.extension_tools — callables from the persona manifest only
+    # persona.tools          — merged base + extension (see inheritBaseTools)
+    # persona.mcp_servers    — dict[str, dict] | None
 """
 from __future__ import annotations
 
@@ -31,6 +32,13 @@ import os
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+from capture_policy import (
+    DEFAULT_CAPTURE_POLICY,
+    CapturePolicy,
+    capture_policy_from_dict,
+)
+from core_agent_tools import get_base_tools, merge_base_and_extension_tools
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +58,10 @@ class Persona:
     description: str
     instructions: str
     heartbeat_task: str = ""
+    # Tools from the persona manifest only (before merging with core base tools).
+    extension_tools: list[Callable[..., Any]] = field(default_factory=list)
+    # When True (default), :attr:`tools` is base + extension with extension winning name clashes.
+    inherit_base_tools: bool = True
     tools: list[Callable[..., Any]] = field(default_factory=list)
     mcp_servers: dict[str, dict] | None = None
     workflow: str = "second_brain"
@@ -80,10 +92,41 @@ class Persona:
     # Decision engine policy (loaded from "decisions" manifest key)
     decision_policy: Any = None        # DecisionPolicy or None
 
+    capture_policy: CapturePolicy = field(default_factory=lambda: DEFAULT_CAPTURE_POLICY)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ──────────────────────────────────────────────────────────────────────
+
+
+def _resolve_capture_policy(entry: dict) -> CapturePolicy:
+    """Load capture rules from ``capturePolicy`` (preferred) or legacy ``capture``."""
+    modern = entry.get("capturePolicy")
+    if isinstance(modern, dict) and modern:
+        return capture_policy_from_dict(modern)
+    leg = entry.get("capture")
+    if isinstance(leg, dict) and leg:
+        strict = bool(leg.get("strictJson", leg.get("strict_json", False)))
+        reco = bool(
+            leg.get("reconcileEvidenceContradictions", leg.get("reconcile_evidence_contradictions", False))
+        )
+        return capture_policy_from_dict(
+            {
+                "reject_if_no_json": strict,
+                "reject_if_missing_evidence": bool(
+                    leg.get("requireEvidence", leg.get("require_evidence", False))
+                ),
+                "reject_on_parse_failure": strict,
+                "evidence_burst_merge_window_minutes": max(
+                    0, int(leg.get("burstMergeWindowMinutes", leg.get("burst_merge_window_minutes", 0)))
+                ),
+                "after_capture": (
+                    "personas.workspace_observer.capture:after_note" if reco else None
+                ),
+            }
+        )
+    return DEFAULT_CAPTURE_POLICY
 
 
 def _resolve_decision_policy(raw: dict | None) -> Any:
@@ -439,6 +482,11 @@ _BUILTIN_DEFAULT = Persona(
         "DO NOT repeat topics already covered. Check the brain summary carefully.\n"
         "Prefer concrete, specific insights over abstract/theoretical ones."
     ),
+    extension_tools=[],
+    inherit_base_tools=True,
+    tools=merge_base_and_extension_tools(
+        get_base_tools(), [], inherit_base=True,
+    ),
 )
 
 
@@ -517,13 +565,23 @@ def _build_inline_persona(
         )
         persona_dir = os.path.dirname(full)
 
-    tools: list[Callable] = []
+    extension: list[Callable] = []
     tools_cfg = entry.get("tools")
     if tools_cfg and isinstance(tools_cfg, dict):
         module = tools_cfg.get("module", "")
         if module:
-            tools = _load_tools_from_module(module, tools_cfg.get("functions"))
-            logger.info("Persona '%s': loaded %d tools from module %s", name, len(tools), module)
+            extension = _load_tools_from_module(module, tools_cfg.get("functions"))
+            logger.info("Persona '%s': loaded %d extension tools from module %s", name, len(extension), module)
+
+    inherit = bool(entry.get("inheritBaseTools", entry.get("inherit_base_tools", True)))
+    base_n = len(get_base_tools())
+    merged = merge_base_and_extension_tools(
+        get_base_tools(), extension, inherit_base=inherit,
+    )
+    logger.info(
+        "Persona '%s': tools base=%d extension=%d merged=%d inherit_base_tools=%s",
+        name, base_n, len(extension), len(merged), inherit,
+    )
 
     mcp_servers = _resolve_servers(entry, server_pool, name)
 
@@ -543,7 +601,9 @@ def _build_inline_persona(
         description=entry.get("description", ""),
         instructions=instructions,
         heartbeat_task=entry.get("heartbeatTask", "").strip(),
-        tools=tools,
+        extension_tools=list(extension),
+        inherit_base_tools=inherit,
+        tools=merged,
         mcp_servers=mcp_servers,
         workflow=entry.get("workflow", "second_brain"),
         steps=entry.get("steps") or None,
@@ -564,6 +624,7 @@ def _build_inline_persona(
         heartbeat_schema=heartbeat_schema,
         decisions_schema=_load_schema_file(persona_dir, "DECISIONS.md", ""),
         decision_policy=_resolve_decision_policy(entry.get("decisions")),
+        capture_policy=_resolve_capture_policy(entry),
     )
 
 
@@ -583,7 +644,7 @@ def _build_external_persona(
     if not instructions:
         instructions = manifest.get("description", "")
 
-    tools: list[Callable] = []
+    extension: list[Callable] = []
     tools_cfg = manifest.get("tools")
     if tools_cfg and isinstance(tools_cfg, dict):
         functions = tools_cfg.get("functions")
@@ -595,11 +656,26 @@ def _build_external_persona(
                 if os.path.isabs(file_rel)
                 else os.path.normpath(os.path.join(persona_dir, file_rel))
             )
-            tools = _load_tools_from_file(abs_file, functions)
-            logger.info("Persona '%s': loaded %d tools from file %s", name, len(tools), abs_file)
+            extension = _load_tools_from_file(abs_file, functions)
+            logger.info(
+                "Persona '%s': loaded %d extension tools from file %s", name, len(extension), abs_file,
+            )
         elif module_path:
-            tools = _load_tools_from_module(module_path, functions)
-            logger.info("Persona '%s': loaded %d tools from module %s", name, len(tools), module_path)
+            extension = _load_tools_from_module(module_path, functions)
+            logger.info(
+                "Persona '%s': loaded %d extension tools from module %s",
+                name, len(extension), module_path,
+            )
+
+    inherit = bool(manifest.get("inheritBaseTools", manifest.get("inherit_base_tools", True)))
+    base_n = len(get_base_tools())
+    merged = merge_base_and_extension_tools(
+        get_base_tools(), extension, inherit_base=inherit,
+    )
+    logger.info(
+        "Persona '%s': tools base=%d extension=%d merged=%d inherit_base_tools=%s",
+        name, base_n, len(extension), len(merged), inherit,
+    )
 
     mcp_servers = _resolve_servers(manifest, server_pool, name)
 
@@ -619,7 +695,9 @@ def _build_external_persona(
         description=manifest.get("description", ""),
         instructions=instructions,
         heartbeat_task=manifest.get("heartbeatTask", "").strip(),
-        tools=tools,
+        extension_tools=list(extension),
+        inherit_base_tools=inherit,
+        tools=merged,
         mcp_servers=mcp_servers,
         workflow=manifest.get("workflow", "second_brain"),
         steps=manifest.get("steps") or None,
@@ -640,6 +718,7 @@ def _build_external_persona(
         heartbeat_schema=heartbeat_schema,
         decisions_schema=_load_schema_file(persona_dir, "DECISIONS.md", ""),
         decision_policy=_resolve_decision_policy(manifest.get("decisions")),
+        capture_policy=_resolve_capture_policy(manifest),
     )
 
 

@@ -1,0 +1,44 @@
+{
+  "session_id": "session-2026-04-17-2013",
+  "started": "2026-04-17T00:13:38.725Z",
+  "files_read": {
+    "c:/Users/kvwul/source/repos/NATLClaw/.wolf/anatomy.md": {
+      "count": 1,
+      "tokens": 0,
+      "first_read": "2026-04-17T00:13:43.590Z"
+    },
+    "c:/Users/kvwul/source/repos/NATLClaw/cli.py": {
+      "count": 5,
+      "tokens": 30199,
+      "first_read": "2026-04-17T00:13:49.623Z"
+    }
+  },
+  "files_written": [
+    {
+      "file": "c:/Users/kvwul/source/repos/NATLClaw/cli.py",
+      "action": "edit",
+      "tokens": 267,
+      "at": "2026-04-17T00:14:10.439Z"
+    },
+    {
+      "file": "c:/Users/kvwul/source/repos/NATLClaw/cli.py",
+      "action": "edit",
+      "tokens": 290,
+      "at": "2026-04-17T00:14:17.367Z"
+    },
+    {
+      "file": "c:/Users/kvwul/source/repos/NATLClaw/cli.py",
+      "action": "edit",
+      "tokens": 25,
+      "at": "2026-04-17T00:14:21.137Z"
+    }
+  ],
+  "edit_counts": {
+    "cli.py": 3
+  },
+  "anatomy_hits": 1,
+  "anatomy_misses": 1,
+  "repeated_reads_warned": 4,
+  "cerebrum_warnings": 0,
+  "stop_count": 1
+}

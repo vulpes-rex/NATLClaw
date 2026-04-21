@@ -145,8 +145,8 @@ class TestScoreTask:
 class TestScoreEvents:
     def test_task_events_score_higher_than_file_events(self):
         ctx = _ctx(events=[
-            (1, "task_created", {"task_id": "t99"}),
-            (2, "file_change", {"path": "foo.py"}),
+            (1, 0, "task_created", {"task_id": "t99"}),
+            (2, 0, "file_change", {"path": "foo.py"}),
         ])
         candidates = _score_events(ctx, _policy)
         assert len(candidates) == 2
@@ -155,8 +155,8 @@ class TestScoreEvents:
         assert task_event.score > file_event.score
 
     def test_git_commit_scales_with_files(self):
-        ctx_small = _ctx(events=[(1, "git_commit", {"files": ["a.py"]})])
-        ctx_big = _ctx(events=[(1, "git_commit", {"files": [f"f{i}.py" for i in range(10)]})])
+        ctx_small = _ctx(events=[(1, 0, "git_commit", {"files": ["a.py"]})])
+        ctx_big = _ctx(events=[(1, 0, "git_commit", {"files": [f"f{i}.py" for i in range(10)]})])
         small = _score_events(ctx_small, _policy)[0]
         big = _score_events(ctx_big, _policy)[0]
         assert big.score > small.score
@@ -288,7 +288,7 @@ class TestEscalationSignals:
         task = FakeTask(title="Fix regression in auth", description="bugfix hotfix")
         ctx = _ctx(
             active_task=task,
-            events=[(1, "git_commit", {"message": "fix bug in auth flow"})],
+            events=[(1, 0, "git_commit", {"message": "fix bug in auth flow"})],
         )
         escalations = collect_escalation_signals(ctx)
         kinds = {entry["type"] for entry in escalations}
@@ -296,9 +296,9 @@ class TestEscalationSignals:
 
     def test_todo_stagnation_triggers_escalation(self):
         ctx = _ctx(events=[
-            (2, "file_modified", {"path": "src/todo_manager.py"}),
-            (2, "file_modified", {"path": "src/todo_manager.py"}),
-            (2, "file_modified", {"path": "src/todo_manager.py", "todo_changed": False}),
+            (2, 0, "file_modified", {"path": "src/todo_manager.py"}),
+            (2, 1, "file_modified", {"path": "src/todo_manager.py"}),
+            (2, 2, "file_modified", {"path": "src/todo_manager.py", "todo_changed": False}),
         ])
         escalations = collect_escalation_signals(ctx)
         kinds = {entry["type"] for entry in escalations}
@@ -440,7 +440,7 @@ class TestEvaluateHeartbeat:
         ctx = _ctx(
             active_task=None,
             pending_tasks=[],
-            events=[(1, "task_created", {"task_id": "t99"})],
+            events=[(1, 0, "task_created", {"task_id": "t99"})],
         )
         decision = evaluate_heartbeat(ctx)
         # task_created event with priority 1 → score ~100
@@ -526,15 +526,15 @@ class TestEventRouting:
 
     def test_has_preempting_event_detects_task_events(self):
         events = [
-            (2, "file_change", {"path": "foo.py"}),
-            (1, "task_answered", {"task_id": "t1"}),
+            (2, 0, "file_change", {"path": "foo.py"}),
+            (1, 0, "task_answered", {"task_id": "t1"}),
         ]
         assert has_preempting_event(events) is True
 
     def test_has_preempting_event_false_for_files_only(self):
         events = [
-            (2, "file_change", {"path": "foo.py"}),
-            (2, "file_modified", {"path": "bar.py"}),
+            (2, 0, "file_change", {"path": "foo.py"}),
+            (2, 0, "file_modified", {"path": "bar.py"}),
         ]
         assert has_preempting_event(events) is False
 
@@ -810,6 +810,6 @@ class TestDecisionPolicy:
         policy = DecisionPolicy(event_routing={
             "file_modified": EventRoute(ActionType.RUN_HEARTBEAT, preempt=True, boost=15.0),
         })
-        events = [(2, "file_modified", {"path": "foo.py"})]
+        events = [(2, 0, "file_modified", {"path": "foo.py"})]
         assert has_preempting_event(events) is False           # default: no preempt
         assert has_preempting_event(events, policy) is True    # custom: preempt

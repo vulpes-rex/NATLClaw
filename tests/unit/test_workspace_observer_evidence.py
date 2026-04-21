@@ -3,8 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 
+from capture_policy import CapturePolicy
 from second_brain import BrainState, load_brain, save_brain
 from workflow import _store_capture
+
+_WS_CAPTURE = CapturePolicy(
+    reject_if_no_json=True,
+    reject_if_missing_evidence=True,
+    reject_on_parse_failure=True,
+    evidence_burst_merge_window_minutes=20,
+    after_capture="personas.workspace_observer.capture:after_note",
+)
 
 
 def test_accepts_workspace_observer_note_with_evidence():
@@ -22,6 +31,7 @@ def test_accepts_workspace_observer_note_with_evidence():
         brain,
         raw,
         persona_name="workspace_observer",
+        capture_policy=_WS_CAPTURE,
         heartbeat_number=1,
         step="analyse",
     )
@@ -46,6 +56,7 @@ def test_rejects_workspace_observer_but_flags_other_persona_without_evidence():
         observer_brain,
         missing_evidence_raw,
         persona_name="workspace_observer",
+        capture_policy=_WS_CAPTURE,
     )
     assert observer_note_id is None
     assert observer_brain.notes == {}
@@ -81,6 +92,7 @@ def test_evidence_persists_through_save_and_load(tmp_path):
         brain,
         raw,
         persona_name="workspace_observer",
+        capture_policy=_WS_CAPTURE,
     )
     assert note_id is not None
 

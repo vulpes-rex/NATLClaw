@@ -310,7 +310,7 @@ async def test_scheduler_burst_events_are_spilled_across_heartbeats(tmp_path):
 
     q = asyncio.PriorityQueue()
     for i in range(9):
-        q.put_nowait((3, f"burst_event_{i}", {"i": i}))
+        q.put_nowait((3, i, f"burst_event_{i}", {"i": i}))
 
     with ExitStack() as stack:
         stack.enter_context(patch("scheduler.load_persona", return_value=persona))
@@ -405,7 +405,7 @@ async def test_scheduler_soak_observer_persona_bounded_under_event_storm(tmp_pat
 
     q = asyncio.PriorityQueue()
     for i in range(20):
-        q.put_nowait((2, "file_modified", {"path": f"src/f{i}.py"}))
+        q.put_nowait((2, i, "file_modified", {"path": f"src/f{i}.py"}))
 
     with ExitStack() as stack:
         stack.enter_context(patch("scheduler.load_persona", return_value=persona))

@@ -1,19 +1,40 @@
 from __future__ import annotations
 
+import builtins
 import types
 
 from config import AppConfig
 import telemetry
 
 
+def test_init_sentry_missing_sentry_sdk_sets_flag(monkeypatch):
+    monkeypatch.setattr(telemetry, "_SENTRY_INITIALIZED", False)
+    monkeypatch.setattr(telemetry, "_SENTRY_SDK_MISSING", False)
+
+    real_import = builtins.__import__
+
+    def failing_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "sentry_sdk":
+            raise ModuleNotFoundError("No module named 'sentry_sdk'")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", failing_import)
+    cfg = AppConfig(sentry_dsn="https://example@sentry.invalid/1")
+    assert telemetry.init_sentry(cfg) is False
+    assert telemetry._SENTRY_SDK_MISSING is True
+    assert telemetry.init_sentry(cfg) is False
+
+
 def test_init_sentry_no_dsn_returns_false(monkeypatch):
     monkeypatch.setattr(telemetry, "_SENTRY_INITIALIZED", False)
+    monkeypatch.setattr(telemetry, "_SENTRY_SDK_MISSING", False)
     cfg = AppConfig(sentry_dsn="")
     assert telemetry.init_sentry(cfg) is False
 
 
 def test_init_sentry_with_dsn_initializes_once(monkeypatch):
     monkeypatch.setattr(telemetry, "_SENTRY_INITIALIZED", False)
+    monkeypatch.setattr(telemetry, "_SENTRY_SDK_MISSING", False)
 
     call_count = {"init": 0}
 

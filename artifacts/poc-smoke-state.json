@@ -1,0 +1,33 @@
+{
+  "last_heartbeat": "2026-04-14T19:48:10.377244+00:00",
+  "execution_count": 3,
+  "memory": {},
+  "context": {
+    "active_goals": []
+  },
+  "execution_history": [],
+  "lessons_learned": [
+    {
+      "type": "success_achieved",
+      "step": "smoke",
+      "description": "Smoke lesson from heartbeat #1",
+      "confidence": 80,
+      "timestamp": "2026-04-14T19:48:10.340765+00:00"
+    },
+    {
+      "type": "success_achieved",
+      "step": "smoke",
+      "description": "Smoke lesson from heartbeat #2",
+      "confidence": 80,
+      "timestamp": "2026-04-14T19:48:10.361053+00:00"
+    },
+    {
+      "type": "success_achieved",
+      "step": "smoke",
+      "description": "Smoke lesson from heartbeat #3",
+      "confidence": 80,
+      "timestamp": "2026-04-14T19:48:10.377244+00:00"
+    }
+  ],
+  "lesson_calibration": {}
+}

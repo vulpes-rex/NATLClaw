@@ -17,6 +17,7 @@ sys.modules.setdefault("agent_framework.openai", MagicMock())
 sys.modules.setdefault("agent_framework.ollama", MagicMock())
 sys.modules.setdefault("azure.identity", MagicMock())
 
+from capture_policy import capture_policy_from_dict
 from config import AppConfig
 from decision_engine import ActionCandidate, ActionType, DecisionContext, HeartbeatDecision
 from messaging import load_outbox
@@ -49,6 +50,15 @@ async def test_workspace_observer_pipeline_event_to_evidence_and_alert(tmp_path)
     persona.heartbeat_schema = ""
     persona.brain_schema = ""
     persona.decision_policy = {}
+    persona.capture_policy = capture_policy_from_dict(
+        {
+            "reject_if_no_json": True,
+            "reject_if_missing_evidence": True,
+            "reject_on_parse_failure": True,
+            "evidence_burst_merge_window_minutes": 20,
+            "after_capture": "personas.workspace_observer.capture:after_note",
+        }
+    )
 
     decision = HeartbeatDecision(
         chosen=ActionCandidate(
@@ -61,8 +71,8 @@ async def test_workspace_observer_pipeline_event_to_evidence_and_alert(tmp_path)
     )
 
     bug_events = [
-        (1, "git_commit", {"message": "fix bug in scheduler", "files": ["scheduler.py"]}),
-        (2, "file_modified", {"path": "scheduler.py", "reason": "bugfix"}),
+        (1, 0, "git_commit", {"message": "fix bug in scheduler", "files": ["scheduler.py"]}),
+        (2, 1, "file_modified", {"path": "scheduler.py", "reason": "bugfix"}),
     ]
     decision_ctx = DecisionContext(
         events=bug_events,
@@ -87,6 +97,7 @@ async def test_workspace_observer_pipeline_event_to_evidence_and_alert(tmp_path)
             brain,
             raw,
             persona_name="workspace_observer",
+            capture_policy=persona.capture_policy,
             heartbeat_number=state.execution_count,
             step="analyse",
         )

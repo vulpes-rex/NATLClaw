@@ -1190,6 +1190,22 @@ class TestBuildBrainSummaryFromStore:
         summary = build_brain_summary_from_store(state_file, max_notes=5)
         assert "SECOND BRAIN" in summary
 
+    def test_relevance_query_section_label(self, tmp_path):
+        state_file = _make_brain_db(
+            tmp_path,
+            notes=[
+                ("Python asyncio patterns for networking", ["async"]),
+                ("Unrelated cooking tips for pasta", ["food"]),
+            ],
+        )
+        summary = build_brain_summary_from_store(
+            state_file,
+            max_notes=3,
+            relevance_query="asyncio networking Python",
+            semantic_relevance=False,
+        )
+        assert "Notes relevant to current focus" in summary
+
 
 class TestIncrementalSave:
     def test_save_brain_preserves_data(self, tmp_path):

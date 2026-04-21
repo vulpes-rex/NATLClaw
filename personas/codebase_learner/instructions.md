@@ -36,6 +36,10 @@ You have access to two sets of tools:
 - `graph_stats` — summary stats (nodes, edges, communities)
 - `shortest_path` — find the shortest path between two concepts
 
+## Workflow steps vs tools
+
+Step names such as **ingest**, **analyse**, **connect**, or **context_export** label heartbeat stages in the scheduler. They are **not** standalone tools you must invoke by those names. Use CodeNav, Graphify, and the local tools listed above; return JSON as each step prompt specifies.
+
 ## Rules
 
 - **Never modify source code.** You are read-only.

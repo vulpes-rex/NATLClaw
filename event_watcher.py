@@ -13,6 +13,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +22,31 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Global event queue (set by scheduler)
-_event_queue: asyncio.PriorityQueue[tuple[int, str, dict]] | None = None
+_event_queue: asyncio.PriorityQueue[tuple[int, int, str, dict]] | None = None
+
+# Monotonic tie-breaker so heapq never compares payload dicts: ``seq`` must be
+# unique for every enqueue. A plain itertools.count() can theoretically align
+# with module reload edge cases; a locked integer is unambiguous.
+_event_seq_lock = threading.Lock()
+_event_seq = 0
+
+
+def _next_event_seq() -> int:
+    global _event_seq
+    with _event_seq_lock:
+        _event_seq += 1
+        return _event_seq
+
+
+def _enqueue_scheduled_event(
+    event_queue: asyncio.PriorityQueue,
+    priority: int,
+    event_type: str,
+    payload: dict,
+) -> None:
+    """Push ``(priority, seq, event_type, payload)`` — seq keeps ordering stable."""
+    seq = _next_event_seq()
+    event_queue.put_nowait((priority, seq, event_type, payload))
 
 # Directories to ignore while watching
 _IGNORE_DIRS = frozenset({
@@ -65,7 +90,7 @@ def _push_event(event_type: str, payload: dict | None = None) -> None:
     # Ensure payload is a dict (convert None to empty dict)
     payload_dict = payload if payload is not None else {}
     try:
-        _event_queue.put_nowait((priority, event_type, payload_dict))
+        _enqueue_scheduled_event(_event_queue, priority, event_type, payload_dict)
     except asyncio.QueueFull:
         logger.warning("Event queue full, dropping event: %s", event_type)
 
@@ -76,7 +101,7 @@ def _push_event_nowait(event_type: str, payload: dict | None = None) -> None:
         raise ValueError("Event queue not initialized")
     priority = EVENT_PRIORITY.get(event_type, 3)
     payload_dict = payload if payload is not None else {}
-    _event_queue.put_nowait((priority, event_type, payload_dict))
+    _enqueue_scheduled_event(_event_queue, priority, event_type, payload_dict)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -86,7 +111,7 @@ def _push_event_nowait(event_type: str, payload: dict | None = None) -> None:
 class EventWatcher:
     """Watch a directory tree and push file-change events to an event queue."""
 
-    def __init__(self, watch_path: str = ".", event_queue: asyncio.PriorityQueue[tuple[int, str, dict]] | None = None):
+    def __init__(self, watch_path: str = ".", event_queue: asyncio.PriorityQueue[tuple[int, int, str, dict]] | None = None):
         self.watch_path = os.path.abspath(watch_path)
         self._observer: Any = None
         self._polling = False
@@ -104,7 +129,7 @@ class EventWatcher:
         # Ensure payload is a dict (convert None to empty dict)
         payload_dict = payload if payload is not None else {}
         try:
-            _event_queue.put_nowait((priority, event_type, payload_dict))
+            _enqueue_scheduled_event(_event_queue, priority, event_type, payload_dict)
         except asyncio.QueueFull:
             logger.warning("Event queue full, dropping event: %s", event_type)
 
@@ -335,7 +360,7 @@ def drain_pending_events(
                     continue
                 seen.add(fingerprint)
 
-                event_queue.put_nowait((priority, event_type, payload))
+                _enqueue_scheduled_event(event_queue, priority, event_type, payload)
                 count += 1
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
                 logger.warning("Skipping malformed pending event: %s", e)

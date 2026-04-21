@@ -37,13 +37,18 @@ from scheduler_control import (
 from messaging import (
     append_message,
     build_inbox_summary,
+    build_inbound_message_block,
     emit_alert,
     emit_task_timed_out,
     extend_messages,
     load_outbox,
+    load_inbox,
+    save_inbox,
+    merge_brain_note_ids,
     prune_old_messages,
     save_outbox,
 )
+from notification_dispatch import dispatch_new_messages as _dispatch_notifications
 from tasks import (
     auto_timeout_tasks,
     find_task,
@@ -54,10 +59,14 @@ from workflow import run_heartbeat, run_task_heartbeat
 
 from project_context import (
     detect_and_save_project,
+    format_active_work_search_query,
     get_active_work_snapshot,
     load_projects,
     Project,
 )
+
+# One-time full embedding rebuild so hybrid retrieval has vectors after a cold start
+_semantic_index_warmed = False
 
 T = TypeVar('T')
 R = TypeVar('R')
@@ -254,14 +263,14 @@ def release_scheduler_lock() -> None:
 
 
 def _drain_event_queue_bounded(
-    event_queue: asyncio.PriorityQueue[tuple[int, str, dict]],
+    event_queue: asyncio.PriorityQueue[tuple[int, int, str, dict]],
     *,
     max_items: int,
-) -> tuple[list[tuple[int, str, dict]], int]:
+) -> tuple[list[tuple[int, int, str, dict]], int]:
     """Drain at most ``max_items`` events and report remaining queue depth."""
     if max_items <= 0:
         return [], event_queue.qsize()
-    drained: list[tuple[int, str, dict]] = []
+    drained: list[tuple[int, int, str, dict]] = []
     for _ in range(max_items):
         if event_queue.empty():
             break
@@ -310,12 +319,12 @@ def _resolve_dream_policy(persona: object) -> tuple[bool, int, int]:
 
 
 async def _wait_for_event_or_timeout(
-    event_queue: asyncio.PriorityQueue[tuple[int, str, dict]],
+    event_queue: asyncio.PriorityQueue[tuple[int, int, str, dict]],
     *,
     timeout_sec: float,
     poll_interval_sec: float,
-    drain_pending_events_fn: Callable[[asyncio.PriorityQueue[tuple[int, str, dict]]], int],
-) -> tuple[int, str, dict] | None:
+    drain_pending_events_fn: Callable[[asyncio.PriorityQueue[tuple[int, int, str, dict]]], int],
+) -> tuple[int, int, str, dict] | None:
     """Wait for an event while periodically draining cross-process pending events.
 
     Returns:
@@ -343,7 +352,7 @@ async def _wait_for_event_or_timeout(
             continue
 
 
-async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_queue: asyncio.PriorityQueue[tuple[int, str, dict]] | None = None) -> None:
+async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_queue: asyncio.PriorityQueue[tuple[int, int, str, dict]] | None = None) -> None:
     """Run the heartbeat loop until interrupted.
 
     Args:
@@ -366,6 +375,8 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
     _save_tasks = retry()(save_tasks)
     _load_outbox = retry()(load_outbox)
     _save_outbox = retry()(save_outbox)
+    _load_inbox = retry()(load_inbox)
+    _save_inbox = retry()(save_inbox)
     _load_projects = retry()(load_projects)
     _load_scheduler_control = retry()(load_scheduler_control)
     _save_scheduler_control = retry()(save_scheduler_control)
@@ -391,10 +402,11 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
     )
 
     # Event queue for event-driven scheduling
-    # Priority queue: (priority, event_type, payload)
+    # Priority queue: (priority, seq, event_type, payload). ``seq`` breaks ties
+    # so heapq never compares payload dicts when priority and event_type match.
     # Higher priority (lower number) events are processed first.
     if event_queue is None:
-        event_queue = asyncio.PriorityQueue[tuple[int, str, dict]]()
+        event_queue = asyncio.PriorityQueue[tuple[int, int, str, dict]]()
 
     # Point execution log DB next to the state file
     import os as _os
@@ -480,6 +492,7 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
 
             # ── Outbox + task queue management ───────────────────
             outbox = await _load_outbox(config.state_file)
+            inbox = await _load_inbox(config.state_file)
             prune_old_messages(outbox)
 
             tasks = await _load_tasks(config.state_file)
@@ -514,6 +527,38 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                 except OSError as e:
                     logger.warning("Failed to save daily digest: %s", e)
 
+            # ── Daily standup: fire at standup_hour (default 9am local) ─
+            from standup import is_standup_time, run_team_standup
+            _last_standup = state.context.get("last_standup_at") if isinstance(state.context, dict) else None
+            try:
+                _standup_hour = int(getattr(config, "standup_hour", 9))
+            except (TypeError, ValueError):
+                _standup_hour = 9
+            if is_standup_time(_last_standup, standup_hour=_standup_hour):
+                logger.info("Standup time — generating team standup report")
+                try:
+                    _standup_tasks = await _load_tasks(config.state_file)
+                    _standup_report = run_team_standup(
+                        [persona.name], _standup_tasks, brain
+                    )
+                    if isinstance(state.context, dict):
+                        state.context["last_standup_at"] = _standup_report.generated_at
+                    # Post to inbox so developer can read it
+                    from messaging import create_message as _create_message
+                    _standup_msg = _create_message(
+                        "fyi",
+                        title=f"Standup — {_standup_report.date}",
+                        body=_standup_report.formatted,
+                        urgency="normal",
+                        persona=persona.name,
+                    )
+                    _standup_outbox = await _load_outbox(config.state_file)
+                    _standup_outbox.append(_standup_msg)
+                    await asyncio.to_thread(save_outbox, _standup_outbox, config.state_file)  # noqa: save_outbox is module-level
+                    logger.info("[standup] Report posted to inbox")
+                except Exception as _se:
+                    logger.warning("[standup] Failed to generate standup: %s", _se)
+
             state.execution_count += 1
             state.last_heartbeat = datetime.now(timezone.utc).isoformat()
             cycle_start = time.monotonic()
@@ -521,13 +566,7 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
 
             logger.info("=== Heartbeat #%d starting ===", state.execution_count)
 
-            # Phase 3: build brain summary from store (avoids in-memory rebuild)
-            base_instructions = config.agent_instructions or persona.instructions
-            context_block = build_context_block(state)
-            brain_block = build_brain_summary_from_store(config.state_file, max_notes=5)
-            goals_block = build_goals_block(state)
-
-            # Project context block
+            # Project + active work (before brain summary — drives relevance query)
             project_block = ""
             active_work_snapshot = None
             effective_project = current_project or (projects[0] if projects else None)
@@ -560,6 +599,38 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                     + (f"- Current active work: {active_work_snapshot['summary']}\n" if active_work_snapshot else "")
                 )
 
+            relevance_query = ""
+            if config.brain_summary_relevance_from_active_work:
+                relevance_query = format_active_work_search_query(active_work_snapshot)
+
+            global _semantic_index_warmed
+            if (
+                config.brain_summary_semantic
+                and relevance_query
+                and not _semantic_index_warmed
+                and brain.notes
+            ):
+                try:
+                    from brain_index import rebuild_index
+
+                    n = rebuild_index(brain.notes)
+                    if n:
+                        logger.info("Warmed semantic brain index (%d notes)", n)
+                except Exception:
+                    logger.debug("Semantic index warm skipped", exc_info=True)
+                _semantic_index_warmed = True
+
+            # Phase 3: build brain summary from store (hybrid relevance when configured)
+            base_instructions = config.agent_instructions or persona.instructions
+            context_block = build_context_block(state)
+            brain_block = build_brain_summary_from_store(
+                config.state_file,
+                max_notes=5,
+                relevance_query=relevance_query,
+                semantic_relevance=config.brain_summary_semantic,
+            )
+            goals_block = build_goals_block(state)
+
             # Governance schemas: HEARTBEAT.md (HOW) + BRAIN.md (WHAT)
             schema_blocks = ""
             if persona.heartbeat_schema:
@@ -567,10 +638,33 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
             if persona.brain_schema:
                 schema_blocks += f"\n\n== KNOWLEDGE SCHEMA ==\n{persona.brain_schema}"
 
+            inbound_block = build_inbound_message_block(inbox, persona_name=persona.name)
+
+            # ── Sprint context (Feature F) ────────────────────────────
+            sprint_block = ""
+            _sprint_enabled = False
+            try:
+                _sprint_enabled = bool(getattr(config, "sprint_context_enabled", False))
+            except Exception:
+                pass
+            if _sprint_enabled:
+                try:
+                    from sprint_context import get_sprint_block
+                    _sprint_cache = state.context.get("sprint_context_cache") if isinstance(state.context, dict) else None
+                    sprint_block, _new_sprint_cache = get_sprint_block(
+                        config, tasks, cached=_sprint_cache
+                    )
+                    if isinstance(state.context, dict):
+                        state.context["sprint_context_cache"] = _new_sprint_cache
+                except Exception as _spe:
+                    logger.debug("[sprint_context] failed to build block: %s", _spe)
+
             enriched_instructions = (
                 f"{base_instructions}{schema_blocks}\n\n{context_block}\n\n{brain_block}"
                 + (f"\n\n{goals_block}" if goals_block else "")
                 + (f"\n\n{project_block}" if project_block else "")
+                + (f"\n\n{sprint_block}" if sprint_block else "")
+                + (f"\n\n{inbound_block}" if inbound_block else "")
             )
 
             # ── Decision engine ─────────────────────────────────────
@@ -623,6 +717,10 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                 decision.chosen.rationale,
             )
 
+            if decision_note_id and directives.get("outbox_messages"):
+                for msg in directives["outbox_messages"]:
+                    msg.payload = merge_brain_note_ids(msg.payload, [decision_note_id])
+
             active_task = directives.get("active_task")
             skip_agent = directives.get("skip_agent", False)
             if control.paused or control.maintenance_mode:
@@ -638,7 +736,11 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
             if directives.get("extra_context"):
                 enriched_instructions += directives["extra_context"]
             if directives.get("outbox_messages"):
+                _n = len(outbox)
                 extend_messages(outbox, directives["outbox_messages"])
+                asyncio.create_task(
+                    _dispatch_notifications(outbox[_n:], config)
+                )
 
             if skip_agent:
                 update_consecutive_empty(state)
@@ -675,12 +777,16 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                             agent, state, brain, config, persona, active_task,
                         )
                     if task_msgs:
+                        _n = len(outbox)
                         extend_messages(outbox, task_msgs)
+                        asyncio.create_task(
+                            _dispatch_notifications(outbox[_n:], config)
+                        )
                 elif config.provider == "copilot":
                     async with agent:
-                        await run_heartbeat(agent, state, brain, config, persona)
+                        await run_heartbeat(agent, state, brain, config, persona, inbox=inbox, outbox=outbox)
                 else:
-                    await run_heartbeat(agent, state, brain, config, persona)
+                    await run_heartbeat(agent, state, brain, config, persona, inbox=inbox, outbox=outbox)
 
                 elapsed = time.monotonic() - cycle_start
                 logger.info(
@@ -784,6 +890,10 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                     await _save_outbox(outbox, config.state_file)
                 except Exception as e:
                     logger.error("Failed to save outbox after retries: %s", str(e))
+                try:
+                    await _save_inbox(inbox, config.state_file)
+                except Exception as e:
+                    logger.error("Failed to save inbox after retries: %s", str(e))
 
             # Log inbox summary if there are unread messages
             inbox_line = build_inbox_summary(outbox)
@@ -838,7 +948,7 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                 )
                 if event is None:
                     continue
-                priority, event_type, payload = event
+                priority, _seq, event_type, payload = event
                 logger.info(
                     "Woke on event: %s (priority=%d, payload_keys=%s)",
                     event_type, priority, list(payload.keys()),
@@ -862,7 +972,7 @@ async def run_scheduler(config: AppConfig, *, max_iterations: int = 0, event_que
                     )
                 # Task events → next heartbeat runs immediately
                 has_task_event = any(
-                    ev[1] in ("task_created", "task_answered", "task_retried")
+                    ev[2] in ("task_created", "task_answered", "task_retried")
                     for ev in batch
                 )
                 if has_task_event:

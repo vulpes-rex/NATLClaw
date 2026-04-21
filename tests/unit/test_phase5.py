@@ -192,11 +192,13 @@ class TestRetryConsolidation:
         # Create a mock event queue that returns immediately with a dummy event
         class MockQueue:
             async def get(self):
-                return (0, "test_event", {})
+                return (0, 0, "test_event", {})
             def put_nowait(self, item):
                 pass  # noop
             def empty(self):
                 return True
+            def qsize(self):
+                return 0
             def get_nowait(self):
                 raise asyncio.QueueEmpty
 

@@ -38,10 +38,10 @@ natl = "cli:main"
 
 [tool.setuptools]
 py-modules = [
-    "agent_setup", "api_server", "brain_index", "cli", "config",
+    "agent_setup", "api_server", "brain_index", "capture_policy", "cli", "config",
     "copilot_auth", "daily_digest", "decision_engine", "dump_brain",
     "event_config", "event_watcher", "execution_log", "goals",
-    "ingest", "learning", "messaging", "metrics", "persona_loader",
+    "ingest", "learning", "messaging", "metrics", "persona_loader", "preference_feedback",
     "project_context", "prompts", "scheduler", "scheduler_control", "second_brain",
     "state", "tasks", "workflow", "operator_status", "error_classification", "poc_smoke",
     "telemetry",

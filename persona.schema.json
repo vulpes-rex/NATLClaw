@@ -61,6 +61,12 @@
       "items": { "type": "string" },
       "uniqueItems": true
     },
+
+    "inheritBaseTools": {
+      "description": "When true (default), core agent base tools (see core_agent_tools.get_base_tools) are merged with tools from this manifest. Extension tools override base tools when they share the same function name. Set to false to expose only this persona's extension tools.",
+      "type": "boolean",
+      "default": true
+    },
     "dream": {
       "description": "Idle dream-cycle policy for background memory maintenance.",
       "type": "object",

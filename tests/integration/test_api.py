@@ -15,10 +15,10 @@ from fastapi.testclient import TestClient
 
 from api_server import create_app
 from config import AppConfig
-from messaging import Message, save_outbox
+from messaging import BRAIN_NOTE_IDS_KEY, Message, save_outbox
 from tasks import Task, load_tasks, save_tasks
 from workflow import run_task_heartbeat
-from second_brain import BrainState
+from second_brain import BrainState, add_note, load_brain, save_brain
 from state import AgentState
 
 _SECRET_FIELDS = frozenset({
@@ -278,6 +278,50 @@ def test_inbox_dismiss(client, state_file):
     assert r.status_code == 200
     assert r.json()["status"] == "dismissed"
     assert r.json()["dismissed_at"] is not None
+
+
+def test_inbox_read_brain_feedback(client, state_file):
+    async def _seed():
+        brain = await load_brain(state_file)
+        nid = add_note(brain, "hello", summary="s")
+        await save_brain(brain, state_file)
+        return nid
+
+    nid = asyncio.run(_seed())
+    m = Message(
+        title="FYI",
+        status="unread",
+        payload={BRAIN_NOTE_IDS_KEY: [nid]},
+    )
+    asyncio.run(save_outbox([m], state_file))
+
+    r = client.post(f"/api/inbox/{m.id}/read")
+    assert r.status_code == 200
+    assert r.json()["status"] == "read"
+
+    brain2 = asyncio.run(load_brain(state_file))
+    assert brain2.notes[nid]["positive_feedback"] >= 1
+
+
+def test_inbox_dismiss_brain_feedback(client, state_file):
+    async def _seed():
+        brain = await load_brain(state_file)
+        nid = add_note(brain, "hello", summary="s")
+        await save_brain(brain, state_file)
+        return nid
+
+    nid = asyncio.run(_seed())
+    m = Message(
+        title="FYI",
+        payload={BRAIN_NOTE_IDS_KEY: [nid]},
+    )
+    asyncio.run(save_outbox([m], state_file))
+
+    r = client.post(f"/api/inbox/{m.id}/dismiss")
+    assert r.status_code == 200
+
+    brain2 = asyncio.run(load_brain(state_file))
+    assert brain2.notes[nid]["negative_feedback"] >= 1
 
 
 def test_inbox_dismiss_not_found(client):

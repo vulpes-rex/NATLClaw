@@ -1264,6 +1264,111 @@ def record_contradiction(
     return True
 
 
+def _workspace_observer_word_set(text: str) -> set[str]:
+    import re
+
+    return set(re.findall(r"[a-zA-Z]{3,}", (text or "").lower()))
+
+
+def workspace_observer_contents_diverge(content_a: str, content_b: str) -> bool:
+    """Heuristic: two observer summaries disagree given the same evidence (Phase 4).
+
+    Uses token Jaccard on word-ish tokens; short strings are ignored to reduce noise.
+    """
+    a, b = (content_a or "").strip(), (content_b or "").strip()
+    if len(a) < 50 or len(b) < 50:
+        return False
+    sa, sb = _workspace_observer_word_set(a), _workspace_observer_word_set(b)
+    if len(sa) < 6 or len(sb) < 6:
+        return False
+    union = sa | sb
+    if not union:
+        return False
+    jaccard = len(sa & sb) / len(union)
+    return jaccard < 0.18
+
+
+def observer_evidence_overlap_sufficient(ev_norm: set[str], oev_norm: set[str]) -> bool:
+    """True when shared evidence is strong enough to justify a contradiction check.
+
+    A single path shared across two *large* evidence lists is often incidental (e.g. one
+    touched file in a big sweep). Require either two shared paths or a high Jaccard
+    ratio on the evidence sets themselves.
+    """
+    inter = ev_norm & oev_norm
+    if not inter:
+        return False
+    if len(inter) >= 2:
+        return True
+    union = ev_norm | oev_norm
+    if not union:
+        return False
+    return len(inter) / len(union) >= 0.2
+
+
+def reconcile_evidence_contradictions(brain: BrainState, note_id: str) -> None:
+    """If a note overlaps evidence with another from the same persona but narrates a different story, record it."""
+    note = brain.notes.get(note_id)
+    if not note:
+        return
+    if note.get("status") in {"archive", "invalid"}:
+        return
+    source = note.get("source")
+    if not isinstance(source, dict):
+        return
+    persona_name = source.get("persona")
+    if not persona_name:
+        return
+    evidence = note.get("evidence", [])
+    if not isinstance(evidence, list):
+        return
+    ev_norm = {str(e).strip().lower() for e in evidence if str(e).strip()}
+    if not ev_norm:
+        return
+    content = str(note.get("content", ""))
+    for oid, other in brain.notes.items():
+        if oid == note_id:
+            continue
+        osrc = other.get("source")
+        if not isinstance(osrc, dict) or osrc.get("persona") != persona_name:
+            continue
+        if other.get("status") in {"archive", "invalid"}:
+            continue
+        oev = other.get("evidence", [])
+        if not isinstance(oev, list):
+            continue
+        oev_norm = {str(e).strip().lower() for e in oev if str(e).strip()}
+        if not observer_evidence_overlap_sufficient(ev_norm, oev_norm):
+            continue
+        ocontent = str(other.get("content", ""))
+        if not workspace_observer_contents_diverge(content, ocontent):
+            continue
+        s_new = _note_strength(note)
+        s_old = _note_strength(other)
+        t_new = _parse_iso(str(note.get("created_at", "")))
+        t_old = _parse_iso(str(other.get("created_at", "")))
+        if t_new is None:
+            t_new = datetime.min.replace(tzinfo=timezone.utc)
+        if t_old is None:
+            t_old = datetime.min.replace(tzinfo=timezone.utc)
+        newer_wins_tie = t_new >= t_old
+        if s_new > s_old or (s_new == s_old and newer_wins_tie):
+            demoted, winner = oid, note_id
+        else:
+            demoted, winner = note_id, oid
+        demoted_note = brain.notes.get(demoted)
+        if demoted_note is None:
+            continue
+        if winner in (demoted_note.get("contradicted_by") or []):
+            continue
+        record_contradiction(
+            brain,
+            demoted,
+            winner,
+            reason="Overlapping evidence; divergent workspace summaries",
+        )
+
+
 def get_notes_by_category(brain: BrainState, category: str) -> list[dict]:
     """Return notes filtered by PARA category."""
     return [n for n in brain.notes.values() if n.get("category") == category]
@@ -1535,6 +1640,40 @@ def _rank_notes_hybrid(
     return [note for _, _, _, note in scored[:max_results]]
 
 
+def _notes_for_relevance_query(
+    brain: BrainState,
+    query: str,
+    max_notes: int,
+    *,
+    semantic: bool = True,
+) -> list[dict]:
+    """Pick notes for prompt injection using hybrid retrieval when possible."""
+    q = query.strip()
+    if not q:
+        return []
+    semantic_hits: dict[str, float] = {}
+    if semantic:
+        try:
+            from brain_index import semantic_search as _sem_search
+
+            raw_hits = _sem_search(q, k=max(max_notes * 4, 20))
+            semantic_hits = dict(raw_hits)
+        except Exception:
+            pass
+    if semantic_hits:
+        id_set = set(semantic_hits.keys())
+        notes_f = [n for n in brain.notes.values() if n.get("id") in id_set]
+        if notes_f:
+            return _rank_notes_hybrid(
+                notes_f,
+                brain.connections,
+                q,
+                semantic_scores=semantic_hits,
+                max_results=max_notes,
+            )
+    return search_notes(brain, q, max_results=max_notes, record_access=False)
+
+
 def search_notes(
     brain: BrainState,
     query: str,
@@ -1558,14 +1697,20 @@ def search_notes(
 
 def _token_overlap(a: str, b: str) -> float:
     """Compute Jaccard similarity over word tokens. Returns 0.0–1.0."""
-    tokens_a = set(a.lower().split())
-    tokens_b = set(b.lower().split())
+    import re
+
+    def _tokenize(text: str) -> set[str]:
+        raw = re.findall(r"[\w./_-]+", text.lower())
+        return {t.rstrip(".,;:!?") for t in raw if t.rstrip(".,;:!?")}
+
+    tokens_a = _tokenize(a)
+    tokens_b = _tokenize(b)
     if not tokens_a or not tokens_b:
         return 0.0
     return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
 
 
-def find_duplicate(brain: BrainState, content: str, threshold: float = 0.50) -> str | None:
+def find_duplicate(brain: BrainState, content: str, threshold: float = 0.38) -> str | None:
     """Return the ID of a near-duplicate recent note, or None."""
     recent = get_recent_notes(brain, 50)
     for note in recent:
@@ -2806,16 +2951,29 @@ def build_brain_summary_from_store(
     *,
     query_topic: str = "",
     max_pages: int = 10,
+    relevance_query: str = "",
+    semantic_relevance: bool = True,
 ) -> str:
     """Build brain summary for prompt injection directly from SQLite.
 
     This is the Phase 3 replacement for ``build_brain_summary(brain)``:
     it queries only the rows needed instead of loading the full brain.
+
+    When *relevance_query* is non-empty, note lines use hybrid search
+    (``search_notes_from_store``), which prefers vector similarity when
+    optional semantic dependencies are installed.
     """
     db_path = _brain_db_path(state_file)
     if not os.path.exists(db_path):
         brain = _load_brain_for_queries(state_file)
-        return build_brain_summary(brain, max_notes, query_topic=query_topic, max_pages=max_pages)
+        return build_brain_summary(
+            brain,
+            max_notes,
+            query_topic=query_topic,
+            max_pages=max_pages,
+            relevance_query=relevance_query,
+            semantic_relevance=semantic_relevance,
+        )
 
     try:
         conn = _ensure_brain_db(db_path)
@@ -2894,6 +3052,8 @@ def build_brain_summary_from_store(
                 lines.append("\nTopics: " + ", ".join(topic_strs))
 
             # Select notes for the prompt
+            selected: list[dict] = []
+            label = ""
             if query_topic:
                 # Topic-based recall via SQL
                 lower = query_topic.lower().strip()
@@ -2905,7 +3065,6 @@ def build_brain_summary_from_store(
                 if topic_row:
                     topic = json.loads(topic_row[0])
                     selected_ids = topic.get("note_ids", [])[:max_notes]
-                selected = []
                 if selected_ids:
                     ph = ",".join("?" for _ in selected_ids)
                     for nid, rj in conn.execute(
@@ -2917,38 +3076,45 @@ def build_brain_summary_from_store(
                             _normalize_note_dict(note, nid)
                             selected.append(note)
                 label = f"Knowledge related to '{query_topic}'"
-            elif pages_total > 0:
-                # When pages exist, only show recent unconsolidated notes
-                capped = min(max_notes, 5)
-                selected = []
-                for nid, rj in conn.execute(
-                    "SELECT id, raw_json FROM brain_notes "
-                    "WHERE category != 'archive' "
-                    "ORDER BY created_at DESC LIMIT ?",
-                    (capped * 3,),  # over-fetch to filter out consolidated
-                ).fetchall():
-                    if nid in consolidated_ids:
-                        continue
-                    note = json.loads(rj)
-                    if isinstance(note, dict):
-                        _normalize_note_dict(note, nid)
-                        selected.append(note)
-                    if len(selected) >= capped:
-                        break
-                label = "Recent unconsolidated notes"
-            else:
-                # No pages — show recent notes
-                selected = []
-                for nid, rj in conn.execute(
-                    "SELECT id, raw_json FROM brain_notes "
-                    "ORDER BY created_at DESC LIMIT ?",
-                    (max_notes,),
-                ).fetchall():
-                    note = json.loads(rj)
-                    if isinstance(note, dict):
-                        _normalize_note_dict(note, nid)
-                        selected.append(note)
-                label = "Recent knowledge"
+            elif relevance_query.strip():
+                selected = search_notes_from_store(
+                    state_file,
+                    relevance_query.strip(),
+                    max_results=max_notes,
+                    record_access=False,
+                    semantic=semantic_relevance,
+                )
+                label = "Notes relevant to current focus"
+
+            if not selected and not query_topic:
+                if pages_total > 0:
+                    capped = min(max_notes, 5)
+                    for nid, rj in conn.execute(
+                        "SELECT id, raw_json FROM brain_notes "
+                        "WHERE category != 'archive' "
+                        "ORDER BY created_at DESC LIMIT ?",
+                        (capped * 3,),
+                    ).fetchall():
+                        if nid in consolidated_ids:
+                            continue
+                        note = json.loads(rj)
+                        if isinstance(note, dict):
+                            _normalize_note_dict(note, nid)
+                            selected.append(note)
+                        if len(selected) >= capped:
+                            break
+                    label = "Recent unconsolidated notes"
+                else:
+                    for nid, rj in conn.execute(
+                        "SELECT id, raw_json FROM brain_notes "
+                        "ORDER BY created_at DESC LIMIT ?",
+                        (max_notes,),
+                    ).fetchall():
+                        note = json.loads(rj)
+                        if isinstance(note, dict):
+                            _normalize_note_dict(note, nid)
+                            selected.append(note)
+                    label = "Recent knowledge"
 
             if selected:
                 lines.append(f"\n{label}:")
@@ -2964,7 +3130,14 @@ def build_brain_summary_from_store(
     except (sqlite3.DatabaseError, ValueError, UnicodeDecodeError):
         logger.warning("build_brain_summary_from_store fallback", exc_info=True)
         brain = _load_brain_for_queries(state_file)
-        return build_brain_summary(brain, max_notes, query_topic=query_topic, max_pages=max_pages)
+        return build_brain_summary(
+            brain,
+            max_notes,
+            query_topic=query_topic,
+            max_pages=max_pages,
+            relevance_query=relevance_query,
+            semantic_relevance=semantic_relevance,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -3095,8 +3268,13 @@ def archive_consolidated_notes(brain: BrainState, note_ids: list[str]) -> int:
 
 
 def build_brain_summary(
-    brain: BrainState, max_notes: int = 10, *, query_topic: str = "",
+    brain: BrainState,
+    max_notes: int = 10,
+    *,
+    query_topic: str = "",
     max_pages: int = 10,
+    relevance_query: str = "",
+    semantic_relevance: bool = True,
 ) -> str:
     """Build a text summary of the brain's contents for prompt injection.
 
@@ -3106,6 +3284,9 @@ def build_brain_summary(
 
     When *query_topic* is provided, notes are selected via topic-graph
     traversal instead of simple recency.
+
+    When *relevance_query* is set (e.g. active-work text), notes are chosen
+    with hybrid lexical + semantic ranking when optional deps are installed.
     """
     try:
         unconsolidated = get_unconsolidated_notes(brain)
@@ -3138,23 +3319,34 @@ def build_brain_summary(
             topic_strs = [t["name"] + "(" + str(t["notes"]) + ")" for t in top_topics]
             lines.append("\nTopics: " + ", ".join(topic_strs))
 
-        # Select notes: topic-based when possible, else recent unconsolidated
+        # Select notes: topic-based, relevance-based, or recency
+        selected: list[dict] = []
+        label = ""
         if query_topic:
             selected = recall_by_topic(brain, query_topic, depth=1)[:max_notes]
             label = f"Knowledge related to '{query_topic}'"
-        elif brain.pages:
-            # When pages exist, only show recent unconsolidated notes (short-term)
-            capped = min(max_notes, 5)  # cap short-term window
-            sorted_uncons = sorted(
-                unconsolidated,
-                key=lambda n: n.get("created_at", ""),
-                reverse=True,
-            )[:capped]
-            selected = sorted_uncons
-            label = "Recent unconsolidated notes"
-        else:
-            selected = get_recent_notes(brain, max_notes)
-            label = "Recent knowledge"
+        elif relevance_query.strip():
+            selected = _notes_for_relevance_query(
+                brain,
+                relevance_query,
+                max_notes,
+                semantic=semantic_relevance,
+            )
+            label = "Notes relevant to current focus"
+
+        if not selected and not query_topic:
+            if brain.pages:
+                capped = min(max_notes, 5)  # cap short-term window
+                sorted_uncons = sorted(
+                    unconsolidated,
+                    key=lambda n: n.get("created_at", ""),
+                    reverse=True,
+                )[:capped]
+                selected = sorted_uncons
+                label = "Recent unconsolidated notes"
+            else:
+                selected = get_recent_notes(brain, max_notes)
+                label = "Recent knowledge"
 
         if selected:
             lines.append(f"\n{label}:")

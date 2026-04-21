@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "codenav": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["C:/Users/kvwul/source/repos/CodeIntel/src/codenav-mcp/dist/index.js"],
+      "env": {
+        "CODENAV_GRAMMARS_DIR": "C:/Users/kvwul/source/repos/CodeIntel/src/codenav-mcp/grammars"
+      }
+    },
+    "graphify": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "graphify.serve", "graphify-out/graph.json"]
+    }
+  }
+}

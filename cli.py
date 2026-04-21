@@ -737,6 +737,63 @@ def cmd_report(args: argparse.Namespace, config: AppConfig) -> None:
         print(f"\nSaved to {out_path}", file=sys.stderr)
 
 
+def cmd_standup(args: argparse.Namespace, config: AppConfig) -> None:
+    """Generate and print the daily standup report."""
+    from standup import (
+        run_team_standup,
+        load_standup_today,
+        load_standup,
+        format_report,
+        StandupEntry,
+    )
+    from tasks import load_tasks
+    from second_brain import load_brain
+    from persona_loader import load_personas_from_config
+
+    date_arg = getattr(args, "date", None)
+    show_only = getattr(args, "show", False)
+
+    if date_arg:
+        # Show historical standup for a specific date
+        report = load_standup(date_arg)
+        if report is None:
+            print(f"No standup found for {date_arg}")
+            return
+        print(report.formatted or "(empty)")
+        return
+
+    if show_only:
+        # Show today's saved standup without regenerating
+        report = load_standup_today()
+        if report is None:
+            print("No standup generated for today yet. Run 'natl standup' to generate one.")
+            return
+        print(report.formatted or "(empty)")
+        return
+
+    # Generate fresh standup
+    tasks_data = asyncio.run(load_tasks(config.state_file))
+    brain = asyncio.run(load_brain(config.state_file))
+
+    try:
+        personas_list = load_personas_from_config(config)
+        persona_names = [p.name for p in personas_list if p.name]
+    except Exception:
+        persona_names = []
+
+    if not persona_names:
+        # Fall back to the configured persona
+        from persona_loader import load_persona
+        persona = load_persona(config.persona)
+        persona_names = [persona.name] if persona.name else ["default"]
+
+    report = run_team_standup(persona_names, tasks_data, brain)
+    print(report.formatted)
+
+    if getattr(args, "save", True):
+        print(f"\nSaved to data/standup/{report.date}.json")
+
+
 def cmd_brief(args: argparse.Namespace, config: AppConfig) -> None:
     """Print a daily digest / morning briefing."""
     from daily_digest import build_digest, save_digest
@@ -765,6 +822,12 @@ def cmd_task_add(args: argparse.Namespace, config: AppConfig) -> None:
     from tasks import create_task, load_tasks, save_tasks
     from event_watcher import enqueue_event
 
+    depends_on: list[str] = []
+    raw_deps = getattr(args, "depends_on", None)
+    if raw_deps:
+        depends_on = [d.strip() for d in raw_deps.split(",") if d.strip()]
+    target = getattr(args, "target", "") or ""
+
     async def _add():
         tasks = await load_tasks(config.state_file)
         task = create_task(
@@ -772,11 +835,18 @@ def cmd_task_add(args: argparse.Namespace, config: AppConfig) -> None:
             description=args.description or args.title,
             priority=args.priority,
             max_heartbeats=args.max_heartbeats,
+            depends_on=depends_on,
+            target_persona=target,
         )
         tasks.append(task)
         await save_tasks(tasks, config.state_file)
         enqueue_event("task_created", {"task_id": task.id, "title": task.title})
-        print(f"Created task {task.id}: {task.title} (priority={task.priority})")
+        parts = [f"Created task {task.id}: {task.title} (priority={task.priority})"]
+        if depends_on:
+            parts.append(f"  depends on: {', '.join(depends_on)}")
+        if target:
+            parts.append(f"  routed to: @{target}")
+        print("\n".join(parts))
 
     asyncio.run(_add())
 
@@ -843,16 +913,28 @@ def cmd_task_answer(args: argparse.Namespace, config: AppConfig) -> None:
 
 def cmd_inbox_list(args: argparse.Namespace, config: AppConfig) -> None:
     """List messages in the inbox."""
-    from messaging import format_inbox, get_unread, load_outbox
+    from messaging import format_inbox, get_unread, load_inbox, load_outbox
 
     async def _list():
-        messages = await load_outbox(config.state_file)
+        direction = getattr(args, "direction", "all")
         show_all = getattr(args, "all", False)
+
+        if direction in ("outbound", "all"):
+            outbound = await load_outbox(config.state_file)
+        else:
+            outbound = []
+
+        if direction in ("inbound", "all"):
+            inbound = await load_inbox(config.state_file)
+        else:
+            inbound = []
+
+        messages = outbound + inbound
         if show_all:
             print(format_inbox(messages, show_read=True))
         else:
             print(format_inbox(messages))
-        unread = get_unread(messages)
+        unread = get_unread(outbound)
         if unread:
             needs_response = sum(1 for m in unread if m.requires_response)
             print(f"\n{len(unread)} unread message(s)", end="")
@@ -866,6 +948,7 @@ def cmd_inbox_list(args: argparse.Namespace, config: AppConfig) -> None:
 def cmd_inbox_show(args: argparse.Namespace, config: AppConfig) -> None:
     """Show a message in detail and mark it as read."""
     from messaging import find_message, format_message_detail, load_outbox, mark_read, save_outbox
+    from preference_feedback import apply_inbox_read_relevance_feedback
 
     async def _show():
         messages = await load_outbox(config.state_file)
@@ -873,8 +956,15 @@ def cmd_inbox_show(args: argparse.Namespace, config: AppConfig) -> None:
         if msg is None:
             print(f"Message '{args.message_id}' not found.")
             sys.exit(1)
+        prev = msg.status
         mark_read(msg)
         await save_outbox(messages, config.state_file)
+        await apply_inbox_read_relevance_feedback(
+            config.state_file,
+            msg,
+            enabled=getattr(config, "inbox_read_brain_feedback", True),
+            previous_status=prev,
+        )
         print(format_message_detail(msg))
 
     asyncio.run(_show())
@@ -883,20 +973,31 @@ def cmd_inbox_show(args: argparse.Namespace, config: AppConfig) -> None:
 def cmd_inbox_dismiss(args: argparse.Namespace, config: AppConfig) -> None:
     """Dismiss a message or all read messages."""
     from messaging import dismiss_all_read, find_message, load_outbox, mark_dismissed, save_outbox
+    from preference_feedback import apply_inbox_dismiss_relevance_feedback
 
     async def _dismiss():
         messages = await load_outbox(config.state_file)
+        feedback = getattr(config, "inbox_dismiss_brain_feedback", True)
         if getattr(args, "all", False):
+            to_dismiss = [m for m in messages if m.status == "read"]
             count = dismiss_all_read(messages)
             await save_outbox(messages, config.state_file)
+            for m in to_dismiss:
+                await apply_inbox_dismiss_relevance_feedback(
+                    config.state_file, m, enabled=feedback, previous_status="read",
+                )
             print(f"Dismissed {count} read message(s).")
         else:
             msg = find_message(messages, args.message_id)
             if msg is None:
                 print(f"Message '{args.message_id}' not found.")
                 sys.exit(1)
+            prev = msg.status
             mark_dismissed(msg)
             await save_outbox(messages, config.state_file)
+            await apply_inbox_dismiss_relevance_feedback(
+                config.state_file, msg, enabled=feedback, previous_status=prev,
+            )
             print(f"Dismissed message {msg.id}.")
 
     asyncio.run(_dismiss())
@@ -905,14 +1006,139 @@ def cmd_inbox_dismiss(args: argparse.Namespace, config: AppConfig) -> None:
 def cmd_inbox_clear(args: argparse.Namespace, config: AppConfig) -> None:
     """Clear all messages from the outbox."""
     from messaging import load_outbox, save_outbox
+    from preference_feedback import apply_inbox_dismiss_relevance_feedback
 
     async def _clear():
         messages = await load_outbox(config.state_file)
         count = len(messages)
+        feedback = getattr(config, "inbox_dismiss_brain_feedback", True)
+        for m in messages:
+            if m.status != "dismissed":
+                await apply_inbox_dismiss_relevance_feedback(
+                    config.state_file, m, enabled=feedback, previous_status=m.status,
+                )
         await save_outbox([], config.state_file)
         print(f"Cleared {count} message(s) from inbox.")
 
     asyncio.run(_clear())
+
+
+def cmd_reply(args: argparse.Namespace, config: AppConfig) -> None:
+    """Reply to an agent message and optionally answer a blocked task."""
+    from messaging import (
+        append_and_save_inbox, create_reply, find_message,
+        load_inbox, load_outbox,
+    )
+    from tasks import answer_task, find_task, load_tasks, save_tasks
+
+    async def _reply():
+        inbound = await load_inbox(config.state_file)
+        outbound = await load_outbox(config.state_file)
+        original = find_message(inbound + outbound, args.message_id)
+        if original is None:
+            print(f"Message {args.message_id} not found")
+            return
+
+        reply = create_reply(original, body=args.answer, sender="developer")
+        await append_and_save_inbox(reply, config.state_file)
+
+        # If message is tied to a blocked task, answer it too
+        task_answered = False
+        if original.task_id:
+            tasks_data = await load_tasks(config.state_file)
+            task = find_task(tasks_data, original.task_id)
+            if task and task.status == "blocked":
+                answer_task(task, args.answer)
+                await save_tasks(tasks_data, config.state_file)
+                task_answered = True
+                try:
+                    from event_watcher import enqueue_event
+                    enqueue_event("task_answered", {"task_id": task.id})
+                except Exception:
+                    pass
+
+        try:
+            from event_watcher import enqueue_event
+            enqueue_event("message", {"message_id": reply.id, "reply_to": args.message_id})
+        except Exception:
+            pass
+
+        print(f"Reply sent: {reply.id}  thread: {reply.thread_id}")
+        if task_answered:
+            print(f"Task {original.task_id} unblocked.")
+
+    asyncio.run(_reply())
+
+
+def cmd_msg_send(args: argparse.Namespace, config: AppConfig) -> None:
+    """Send an inbound message to the agent."""
+    from messaging import append_and_save_inbox, emit_inbound_message
+
+    async def _send():
+        msg = emit_inbound_message(
+            body=args.body,
+            sender="developer",
+            addressed_to=getattr(args, "addressed_to", ""),
+            title=getattr(args, "title", ""),
+            urgency=getattr(args, "urgency", "normal"),
+            reply_to=getattr(args, "reply_to", ""),
+            thread_id=getattr(args, "thread_id", ""),
+            task_id=getattr(args, "task_id", ""),
+        )
+        await append_and_save_inbox(msg, config.state_file)
+        try:
+            from event_watcher import enqueue_event
+            enqueue_event("message", {"message_id": msg.id, "addressed_to": msg.addressed_to})
+        except Exception:
+            pass
+        to_label = f" -> @{msg.addressed_to}" if msg.addressed_to else " (broadcast)"
+        print(f"Sent: {msg.id}{to_label}  thread: {msg.thread_id}")
+
+    asyncio.run(_send())
+
+
+def cmd_msg_list(args: argparse.Namespace, config: AppConfig) -> None:
+    """List inbound messages."""
+    from messaging import format_inbox, load_inbox
+
+    async def _list():
+        messages = await load_inbox(config.state_file)
+        addressed_to = getattr(args, "addressed_to", "")
+        status_filter = getattr(args, "status", "unread")
+        if addressed_to:
+            messages = [m for m in messages if m.addressed_to in ("", addressed_to)]
+        if status_filter != "all":
+            messages = [m for m in messages if m.status == status_filter]
+        show_read = status_filter in ("read", "all")
+        print(format_inbox(messages, show_read=show_read))
+
+    asyncio.run(_list())
+
+
+def cmd_msg_thread(args: argparse.Namespace, config: AppConfig) -> None:
+    """Display a full conversation thread."""
+    from messaging import format_message_detail, get_thread, load_inbox, load_outbox
+
+    async def _thread():
+        inbound = await load_inbox(config.state_file)
+        outbound = await load_outbox(config.state_file)
+        thread = get_thread(inbound + outbound, args.thread_id)
+        if not thread:
+            print(f"No messages found for thread: {args.thread_id}")
+            return
+        print(f"Thread: {args.thread_id}  ({len(thread)} message(s))\n")
+        for msg in thread:
+            direction = "<-" if msg.sender == "agent" else "->"
+            sender_label = msg.sender or "agent"
+            to_label = f" @{msg.addressed_to}" if msg.addressed_to else ""
+            print(f"[{msg.id}] {direction} {sender_label}{to_label}  {msg.created_at}")
+            print(f"  {msg.title}")
+            if msg.body and msg.body != msg.title:
+                for line in msg.body.splitlines()[:5]:
+                    print(f"    {line}")
+            print()
+
+    asyncio.run(_thread())
 
 
 def cmd_task_cancel(args: argparse.Namespace, config: AppConfig) -> None:
@@ -978,6 +1204,31 @@ def cmd_task_retry(args: argparse.Namespace, config: AppConfig) -> None:
     asyncio.run(_retry())
 
 
+def cmd_sync(args: argparse.Namespace, config: AppConfig) -> None:
+    """Bidirectional ADO <-> NATLClaw sync."""
+    from ado_sync import sync_from_config
+    from tasks import load_tasks, save_tasks
+
+    async def _sync():
+        tasks = await load_tasks(config.state_file)
+        result = sync_from_config(
+            config,
+            tasks,
+            pull=not args.push_only,
+            push=not args.pull_only,
+            post_progress=getattr(args, "post_progress", False),
+            dry_run=getattr(args, "dry_run", False),
+        )
+        if result.errors:
+            for err in result.errors:
+                print(f"  ERROR: {err}")
+        print(result.summary())
+        if not getattr(args, "dry_run", False):
+            await save_tasks(tasks, config.state_file)
+
+    asyncio.run(_sync())
+
+
 def cmd_config_show(args: argparse.Namespace, config: AppConfig) -> None:
     """Print resolved configuration."""
     from dataclasses import asdict
@@ -1007,6 +1258,57 @@ def cmd_api(args: argparse.Namespace, config: AppConfig) -> None:
         reload=reload,
         log_level="info",
     )
+
+
+def cmd_notify_test(args: argparse.Namespace, config: AppConfig) -> None:
+    """Send a test notification through the configured channels."""
+    from messaging import create_message
+    from notification_dispatch import _webhooks_from_config, dispatch_message
+
+    urgency = getattr(args, "urgency", "high")
+    msg = create_message(
+        "alert",
+        title="NATLClaw notification test",
+        body=f"Test notification fired from CLI (urgency={urgency}).",
+        urgency=urgency,
+        persona="cli",
+    )
+
+    webhooks = _webhooks_from_config(config)
+    os_toast = getattr(config, "notification_os_toast", False)
+
+    if not webhooks and not os_toast:
+        print(
+            "No notification channels configured.\n"
+            "Set NOTIFICATION_WEBHOOKS and/or NOTIFICATION_OS_TOAST=true in .env"
+        )
+        return
+
+    if webhooks:
+        print(f"Dispatching to {len(webhooks)} webhook(s): {', '.join(webhooks)}")
+    if os_toast:
+        print("Showing OS toast notification")
+
+    asyncio.run(dispatch_message(msg, config))
+    print(f"Test notification sent (id={msg.id})")
+
+
+def cmd_notify_config(args: argparse.Namespace, config: AppConfig) -> None:
+    """Show current notification configuration."""
+    from notification_dispatch import _webhooks_from_config
+
+    webhooks = _webhooks_from_config(config)
+    os_toast = getattr(config, "notification_os_toast", False)
+    min_urgency = getattr(config, "notification_min_urgency", "normal")
+
+    print(f"min_urgency : {min_urgency}")
+    print(f"os_toast    : {os_toast}")
+    if webhooks:
+        print(f"webhooks ({len(webhooks)}):")
+        for url in webhooks:
+            print(f"  {url}")
+    else:
+        print("webhooks    : (none — set NOTIFICATION_WEBHOOKS in .env)")
 
 
 def cmd_status(args: argparse.Namespace, config: AppConfig) -> None:
@@ -1657,7 +1959,8 @@ def cmd_chat(args: argparse.Namespace, config: AppConfig) -> None:
                 lines.append(f"  - {note['content'][:200]}{tag_str}")
             return "\n".join(lines)
 
-        # Combine persona tools with memory tools
+        # persona.tools is already base + extension (see inheritBaseTools). Chat adds
+        # interactive Second Brain memory tools only for this REPL (not scheduler).
         chat_tools = list(persona.tools or []) + [remember, recall]
 
         base_instructions = config.agent_instructions or persona.instructions
@@ -1841,6 +2144,12 @@ def build_parser() -> argparse.ArgumentParser:
     chat_p = sub.add_parser("chat", help="Start an interactive chat session with the agent")
 
     # brief — daily digest
+    standup_p = sub.add_parser("standup", help="Generate or view the daily standup report")
+    standup_p.add_argument("--date", default=None, metavar="YYYY-MM-DD",
+                           help="Show historical standup for a specific date")
+    standup_p.add_argument("--show", action="store_true",
+                           help="Show today's saved standup without regenerating")
+
     brief_p = sub.add_parser("brief", help="Print a daily digest / morning briefing")
     brief_p.add_argument("--save", action="store_true",
                          help="Also save digest to data/digests/YYYY-MM-DD.md")
@@ -1883,6 +2192,55 @@ def build_parser() -> argparse.ArgumentParser:
                                  help="Dismiss all read messages")
 
     inbox_sub.add_parser("clear", help="Clear all messages from inbox")
+
+    # inbox list: direction filter (Move A)
+    inbox_list_p.add_argument(
+        "--direction", choices=["inbound", "outbound", "all"], default="all",
+        help="Filter by message direction (default: all)",
+    )
+
+    # sync — bidirectional ADO <-> NATLClaw
+    sync_p = sub.add_parser("sync", help="Bidirectional ADO <-> NATLClaw sync")
+    sync_direction = sync_p.add_mutually_exclusive_group()
+    sync_direction.add_argument("--pull-only", action="store_true",
+                                help="Only import from ADO (no export)")
+    sync_direction.add_argument("--push-only", action="store_true",
+                                help="Only export to ADO (no import)")
+    sync_p.add_argument("--dry-run", action="store_true",
+                        help="Log intended changes without mutating state")
+    sync_p.add_argument("--post-progress", action="store_true",
+                        help="Post latest progress note as ADO comment on export")
+
+    # msg (Move A: bidirectional messaging)
+    reply_p = sub.add_parser("reply", help="Reply to an agent message (and unblock its task)")
+    reply_p.add_argument("message_id", help="Message ID to reply to")
+    reply_p.add_argument("answer", help="Your reply text")
+
+    msg_p = sub.add_parser("msg", help="Send and view messages to/from the agent")
+    msg_sub = msg_p.add_subparsers(dest="msg_command")
+
+    msg_send_p = msg_sub.add_parser("send", help="Send a message to a persona")
+    msg_send_p.add_argument("body", help="Message body text")
+    msg_send_p.add_argument("--to", dest="addressed_to", default="",
+                            metavar="PERSONA", help="Persona to address (default: broadcast)")
+    msg_send_p.add_argument("--reply-to", dest="reply_to", default="",
+                            metavar="MSG_ID", help="Message ID being replied to")
+    msg_send_p.add_argument("--thread", dest="thread_id", default="",
+                            metavar="THREAD_ID", help="Continue an existing thread")
+    msg_send_p.add_argument("--urgency", choices=["low", "normal", "high", "urgent"],
+                            default="normal")
+    msg_send_p.add_argument("--title", default="", help="Optional short title")
+    msg_send_p.add_argument("--task", dest="task_id", default="",
+                            metavar="TASK_ID", help="Link to a related task")
+
+    msg_list_p = msg_sub.add_parser("list", help="List inbound messages")
+    msg_list_p.add_argument("--to", dest="addressed_to", default="",
+                            metavar="PERSONA", help="Filter by addressed persona")
+    msg_list_p.add_argument("--status", choices=["unread", "read", "dismissed", "all"],
+                            default="unread")
+
+    msg_thread_p = msg_sub.add_parser("thread", help="Show a full conversation thread")
+    msg_thread_p.add_argument("thread_id", help="Thread ID to display")
 
     # brain
     brain_p = sub.add_parser("brain", help="Brain management commands")
@@ -1951,6 +2309,10 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Task priority (default: medium)")
     task_add_p.add_argument("--max-heartbeats", type=int, default=10,
                             help="Maximum heartbeats before auto-timeout (default: 10)")
+    task_add_p.add_argument("--depends-on", default=None,
+                            help="Comma-separated task IDs that must complete first")
+    task_add_p.add_argument("--target", default="",
+                            help="Persona name to route this task to")
 
     task_list_p = task_sub.add_parser("list", help="List tasks")
     task_list_p.add_argument("-s", "--status", default="all",
@@ -2048,6 +2410,15 @@ def build_parser() -> argparse.ArgumentParser:
     api_p.add_argument("--port", type=int, default=8321, help="Port (default: 8321)")
     api_p.add_argument("--reload", action="store_true", help="Auto-reload on code changes")
 
+    # notify
+    notify_p = sub.add_parser("notify", help="Notification management")
+    notify_sub = notify_p.add_subparsers(dest="notify_command")
+    notify_test_p = notify_sub.add_parser("test", help="Send a test notification")
+    notify_test_p.add_argument("--urgency", default="high",
+                               choices=["low", "normal", "high", "urgent"],
+                               help="Urgency level of the test message (default: high)")
+    notify_sub.add_parser("config", help="Show current notification configuration")
+
     return parser
 
 
@@ -2071,6 +2442,9 @@ def main(argv: list[str] | None = None) -> None:
         "status": cmd_status,
         "serve": cmd_serve,
         "chat": cmd_chat,
+        "standup": cmd_standup,
+        "reply": cmd_reply,
+        "sync": cmd_sync,
         "brief": cmd_brief,
         "report": cmd_report,
         "code": cmd_code,
@@ -2079,6 +2453,11 @@ def main(argv: list[str] | None = None) -> None:
             "show": cmd_inbox_show,
             "dismiss": cmd_inbox_dismiss,
             "clear": cmd_inbox_clear,
+        },
+        "msg": {
+            "send": cmd_msg_send,
+            "list": cmd_msg_list,
+            "thread": cmd_msg_thread,
         },
         "task": {
             "add": cmd_task_add,
@@ -2128,6 +2507,10 @@ def main(argv: list[str] | None = None) -> None:
             "test-error": cmd_telemetry_test_error,
         },
         "api": cmd_api,
+        "notify": {
+            "test": cmd_notify_test,
+            "config": cmd_notify_config,
+        },
     }
 
     cmd = args.command

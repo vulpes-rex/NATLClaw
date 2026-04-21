@@ -81,7 +81,7 @@ async def test_scheduler_recovers_from_stale_lock_file(tmp_path):
         assert lock_file.exists()
 
     q = asyncio.PriorityQueue()
-    q.put_nowait((3, "test_tick", {}))
+    q.put_nowait((3, 0, "test_tick", {}))
 
     patchers = [
         patch("scheduler._is_pid_alive", return_value=False),

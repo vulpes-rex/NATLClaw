@@ -8,6 +8,7 @@ Also exposes management endpoints:
   /api/tasks/*       -- task queue CRUD
   /api/brain/*       -- brain search & stats
   /api/personas      -- list / switch personas
+  /api/inbox/*       -- outbox messages (incl. POST .../read and .../dismiss)
   /api/heartbeat/*   -- heartbeat status & log
   /api/scheduler/*   -- start / stop scheduler
   /api/reports/*     -- workspace audit reports
@@ -49,7 +50,11 @@ from learning import build_context_block
 from metrics import MetricsStore
 from persona_loader import list_personas, load_persona
 from event_watcher import is_watcher_running, start_background_watcher, stop_background_watcher
-from messaging import load_outbox, save_outbox
+from messaging import (
+    load_outbox, mark_read, save_outbox,
+    load_inbox, append_and_save_inbox,
+    emit_inbound_message, get_thread,
+)
 from second_brain import (
     add_note,
     apply_relevance_feedback,
@@ -124,6 +129,9 @@ class TaskCreateRequest(BaseModel):
     description: str = ""
     priority: str = "medium"
     max_heartbeats: int = 10
+    depends_on: list[str] = []
+    target_persona: str = ""
+    file_locks: list[str] = []
 
 class TaskAnswerRequest(BaseModel):
     answer: str
@@ -165,6 +173,18 @@ class BrainDreamRunRequest(BaseModel):
 
 class SchedulerControlRequest(BaseModel):
     reason: str = ""
+
+
+class MessageSendRequest(BaseModel):
+    body: str
+    sender: str = "developer"
+    addressed_to: str = ""          # persona name; "" = broadcast
+    title: str = ""
+    urgency: str = "normal"         # low | normal | high | urgent
+    reply_to: str = ""              # message ID being replied to
+    thread_id: str = ""             # supply to continue an existing thread
+    task_id: str = ""
+    payload: dict = Field(default_factory=dict)
 
 
 # ── App factory ──────────────────────────────────────────────────────
@@ -492,6 +512,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "started_at": t.started_at, "completed_at": t.completed_at,
             "heartbeats_spent": t.heartbeats_spent,
             "max_heartbeats": t.max_heartbeats,
+            "depends_on": t.depends_on, "target_persona": t.target_persona,
+            "file_locks": t.file_locks,
             "progress_notes": t.progress_notes, "deliverables": t.deliverables,
             "questions": t.questions, "answers": t.answers,
         } for t in filtered]
@@ -502,10 +524,18 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         task = create_task(
             title=req.title, description=req.description or req.title,
             priority=req.priority, max_heartbeats=req.max_heartbeats,
+            depends_on=req.depends_on or [],
+            target_persona=req.target_persona,
         )
+        if req.file_locks:
+            task.file_locks = list(req.file_locks)
         tasks.append(task)
         await save_tasks(tasks, config.state_file)
-        return {"id": task.id, "title": task.title, "priority": task.priority, "status": task.status}
+        return {
+            "id": task.id, "title": task.title, "priority": task.priority,
+            "status": task.status, "depends_on": task.depends_on,
+            "target_persona": task.target_persona, "file_locks": task.file_locks,
+        }
 
     @app.get("/api/tasks/{task_id}")
     async def api_get_task(task_id: str):
@@ -520,6 +550,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "started_at": task.started_at, "completed_at": task.completed_at,
             "heartbeats_spent": task.heartbeats_spent,
             "max_heartbeats": task.max_heartbeats,
+            "depends_on": task.depends_on, "target_persona": task.target_persona,
+            "file_locks": task.file_locks,
             "progress_notes": task.progress_notes, "deliverables": task.deliverables,
             "questions": task.questions, "answers": task.answers,
         }
@@ -576,6 +608,71 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(409, str(exc)) from exc
         await save_tasks(tasks, config.state_file)
         return {"id": task.id, "status": task.status, "idempotent": False}
+
+    @app.get("/api/tasks/board")
+    async def api_task_board():
+        """Task board view: active, pending (with dependency status), blocked, file locks."""
+        from tasks import (
+            active_file_locks,
+            dependencies_met,
+            get_all_pending_tasks,
+            get_blocked_tasks,
+            unmet_dependencies,
+        )
+        tasks = await load_tasks(config.state_file)
+        active = [t for t in tasks if t.status in ("in_progress", "assigned")]
+        pending = get_all_pending_tasks(tasks)
+        blocked = get_blocked_tasks(tasks)
+        locks = active_file_locks(tasks)
+        return {
+            "active": [{
+                "id": t.id, "title": t.title, "assigned_to": t.assigned_to,
+                "heartbeats_spent": t.heartbeats_spent, "max_heartbeats": t.max_heartbeats,
+                "file_locks": t.file_locks,
+            } for t in active],
+            "pending": [{
+                "id": t.id, "title": t.title, "priority": t.priority,
+                "target_persona": t.target_persona,
+                "depends_on": t.depends_on,
+                "dependencies_met": dependencies_met(t, tasks),
+                "unmet_dependencies": unmet_dependencies(t, tasks),
+            } for t in pending],
+            "blocked": [{
+                "id": t.id, "title": t.title, "assigned_to": t.assigned_to,
+                "last_question": (t.questions[-1].get("question", "")[:200]
+                                  if t.questions else ""),
+            } for t in blocked],
+            "file_locks": {path: tid for path, tid in locks.items()},
+        }
+
+    # ── Notification endpoints ────────────────────────────────────
+
+    @app.get("/api/notifications/config")
+    async def api_notification_config():
+        """Return the active notification configuration."""
+        from notification_dispatch import _webhooks_from_config
+        return {
+            "webhooks": list(_webhooks_from_config(config)),
+            "os_toast": getattr(config, "notification_os_toast", False),
+            "min_urgency": getattr(config, "notification_min_urgency", "normal"),
+        }
+
+    @app.post("/api/notifications/test")
+    async def api_notification_test(urgency: str = "high"):
+        """Fire a test notification through the configured channels."""
+        from dataclasses import asdict
+        from messaging import create_message
+        from notification_dispatch import dispatch_message
+
+        msg = create_message(
+            "alert",
+            title="NATLClaw notification test",
+            body=f"This is a test notification (urgency={urgency}).",
+            urgency=urgency,
+            persona="api",
+        )
+        await dispatch_message(msg, config)
+        return {"dispatched": True, "message_id": msg.id, "urgency": urgency}
 
     # ── Brain endpoints ──────────────────────────────────────────
 
@@ -714,6 +811,129 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             await save_brain(brain, config.state_file)
         return report
 
+    # ── Inbound messages (human / agent → agent) ────────────────
+
+    @app.post("/api/messages")
+    async def api_send_message(req: MessageSendRequest):
+        """Send an inbound message to a persona (or broadcast to all).
+
+        Creates an entry in ``inbox.json`` and wakes the scheduler so the
+        agent can respond at its next heartbeat.
+        """
+        msg = emit_inbound_message(
+            body=req.body,
+            sender=req.sender,
+            addressed_to=req.addressed_to,
+            title=req.title,
+            urgency=req.urgency,
+            reply_to=req.reply_to,
+            thread_id=req.thread_id,
+            task_id=req.task_id,
+            payload=req.payload,
+        )
+        await append_and_save_inbox(msg, config.state_file)
+        try:
+            from event_watcher import enqueue_event
+            enqueue_event("message", {"message_id": msg.id, "addressed_to": msg.addressed_to})
+        except Exception:
+            pass  # best-effort wake; scheduler will pick up on next cycle if this fails
+        # Move C: push notification immediately on inbound message (webhook / OS toast)
+        try:
+            from notification_dispatch import dispatch_message as _dispatch
+            await _dispatch(msg, config)
+        except Exception:
+            pass  # fire-and-forget; never block the API response
+        return {"id": msg.id, "thread_id": msg.thread_id, "status": "delivered"}
+
+    @app.get("/api/messages")
+    async def api_list_messages(
+        status: str = Query("all", description="Filter: all, unread, read, dismissed"),
+        addressed_to: str = Query("", description="Filter by addressed_to persona name"),
+    ):
+        """List inbound messages (inbox.json)."""
+        messages = await load_inbox(config.state_file)
+        if status != "all":
+            messages = [m for m in messages if m.status == status]
+        if addressed_to:
+            messages = [m for m in messages if m.addressed_to in ("", addressed_to)]
+        return [asdict(m) for m in messages]
+
+    @app.post("/api/messages/{message_id}/reply")
+    async def api_reply_to_message(message_id: str, req: MessageSendRequest):
+        """Reply to an existing message (inbound or outbox), continuing its thread.
+
+        The reply is stored in inbox.json (developer -> agent direction).
+        If the original message has a ``task_id`` and the task is blocked,
+        the reply also answers the task so it can resume.
+        """
+        from messaging import create_reply, find_message
+        from tasks import load_tasks, save_tasks, answer_task, find_task
+        import asyncio
+
+        # Find the original message in inbox or outbox
+        inbound = await load_inbox(config.state_file)
+        outbound = await load_outbox(config.state_file)
+        original = find_message(inbound + outbound, message_id)
+        if original is None:
+            raise HTTPException(404, f"Message {message_id} not found")
+
+        reply = create_reply(
+            original,
+            body=req.body,
+            sender=req.sender or "developer",
+            urgency=req.urgency or "normal",
+            conversation_type=req.msg_type if req.msg_type in (
+                "clarification", "three_amigos", "handoff", "escalation", "broadcast"
+            ) else "",
+        )
+        await append_and_save_inbox(reply, config.state_file)
+
+        # If the original has a task_id and the task is blocked, answer it
+        if original.task_id:
+            try:
+                tasks_data = await asyncio.to_thread(load_tasks, config.state_file)
+                task = find_task(tasks_data, original.task_id)
+                if task and task.status == "blocked":
+                    answer_task(task, req.body)
+                    await asyncio.to_thread(save_tasks, tasks_data, config.state_file)
+                    try:
+                        from event_watcher import enqueue_event
+                        enqueue_event("task_answered", {"task_id": task.id})
+                    except Exception:
+                        pass
+            except Exception:
+                pass  # answer is best-effort; reply always goes through
+
+        try:
+            from event_watcher import enqueue_event
+            enqueue_event("message", {"message_id": reply.id, "reply_to": message_id})
+        except Exception:
+            pass
+
+        return {"id": reply.id, "thread_id": reply.thread_id, "status": "delivered"}
+
+    @app.get("/api/messages/{message_id}/thread")
+    async def api_get_message_thread(message_id: str):
+        """Return all messages in the same thread as *message_id*, oldest first."""
+        from messaging import find_message
+        inbound = await load_inbox(config.state_file)
+        outbound = await load_outbox(config.state_file)
+        all_msgs = inbound + outbound
+        original = find_message(all_msgs, message_id)
+        if original is None:
+            raise HTTPException(404, f"Message {message_id} not found")
+        thread_id = original.thread_id or message_id
+        thread = get_thread(all_msgs, thread_id)
+        return [asdict(m) for m in thread]
+
+    @app.get("/api/messages/thread/{thread_id}")
+    async def api_get_thread(thread_id: str):
+        """Return all messages (inbound + outbound) sharing *thread_id*, oldest first."""
+        inbound = await load_inbox(config.state_file)
+        outbound = await load_outbox(config.state_file)
+        thread = get_thread(inbound + outbound, thread_id)
+        return [asdict(m) for m in thread]
+
     # ── Inbox (outbox messages) ─────────────────────────────────
 
     @app.get("/api/inbox")
@@ -736,21 +956,58 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 return asdict(m)
         raise HTTPException(404, f"Message '{message_id}' not found")
 
-    @app.post("/api/inbox/{message_id}/dismiss")
-    async def api_dismiss_message(message_id: str):
+    @app.post("/api/inbox/{message_id}/read")
+    async def api_mark_inbox_read(message_id: str):
+        """Mark a message as read and apply positive relevance feedback for cited notes."""
+        from preference_feedback import apply_inbox_read_relevance_feedback
+
         messages = await load_outbox(config.state_file)
         for m in messages:
             if m.id == message_id:
+                prev = m.status
+                mark_read(m)
+                await save_outbox(messages, config.state_file)
+                await apply_inbox_read_relevance_feedback(
+                    config.state_file,
+                    m,
+                    enabled=getattr(config, "inbox_read_brain_feedback", True),
+                    previous_status=prev,
+                )
+                return asdict(m)
+        raise HTTPException(404, f"Message '{message_id}' not found")
+
+    @app.post("/api/inbox/{message_id}/dismiss")
+    async def api_dismiss_message(message_id: str):
+        from preference_feedback import apply_inbox_dismiss_relevance_feedback
+
+        messages = await load_outbox(config.state_file)
+        for m in messages:
+            if m.id == message_id:
+                prev = m.status
                 m.status = "dismissed"
                 m.dismissed_at = datetime.now(timezone.utc).isoformat()
                 await save_outbox(messages, config.state_file)
+                await apply_inbox_dismiss_relevance_feedback(
+                    config.state_file,
+                    m,
+                    enabled=getattr(config, "inbox_dismiss_brain_feedback", True),
+                    previous_status=prev,
+                )
                 return asdict(m)
         raise HTTPException(404, f"Message '{message_id}' not found")
 
     @app.post("/api/inbox/clear")
     async def api_clear_inbox():
+        from preference_feedback import apply_inbox_dismiss_relevance_feedback
+
         messages = await load_outbox(config.state_file)
         now = datetime.now(timezone.utc).isoformat()
+        feedback = getattr(config, "inbox_dismiss_brain_feedback", True)
+        for m in messages:
+            if m.status != "dismissed":
+                await apply_inbox_dismiss_relevance_feedback(
+                    config.state_file, m, enabled=feedback, previous_status=m.status,
+                )
         count = 0
         for m in messages:
             if m.status != "dismissed":
@@ -1030,14 +1287,65 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             return {"status": "already_running", "pid": proc.pid}
         cmd = [sys.executable, "-m", "cli", "report", "--save"]
         try:
+            # Do not use PIPE: the CLI prints the full report to stdout before
+            # saving; an unread pipe fills and blocks the child (no file written).
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 cwd=os.path.dirname(os.path.abspath(__file__)),
             )
             app.state.report_proc = proc
             return {"status": "started", "pid": proc.pid}
         except Exception as e:
             raise HTTPException(500, f"Failed to start report: {e}")
+
+    # ── Standup ──────────────────────────────────────────────────
+
+    @app.get("/api/standup/today")
+    async def api_standup_today():
+        """Return today's standup report as JSON, or 404 if not yet generated."""
+        from standup import load_standup_today
+        from dataclasses import asdict
+        report = load_standup_today()
+        if report is None:
+            raise HTTPException(404, "No standup generated for today yet")
+        return asdict(report)
+
+    @app.get("/api/standup/{date}")
+    async def api_standup_date(date: str):
+        """Return the standup report for a specific date (YYYY-MM-DD)."""
+        import re
+        from standup import load_standup
+        from dataclasses import asdict
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+            raise HTTPException(400, "date must be YYYY-MM-DD")
+        report = load_standup(date)
+        if report is None:
+            raise HTTPException(404, f"No standup for {date}")
+        return asdict(report)
+
+    @app.post("/api/standup/generate")
+    async def api_standup_generate():
+        """Trigger standup generation for all active personas right now."""
+        import asyncio
+        from standup import run_team_standup, load_standup_today
+        from dataclasses import asdict
+        from tasks import load_tasks
+        from second_brain import load_brain
+
+        async def _run():
+            tasks_data = await asyncio.to_thread(load_tasks, config.state_file)
+            brain = await asyncio.to_thread(load_brain, config.state_file)
+            personas_cfg = app.state.personas or []
+            persona_names = [p.name for p in personas_cfg] if personas_cfg else ["default"]
+            return run_team_standup(persona_names, tasks_data, brain)
+
+        try:
+            report = await _run()
+            return {"status": "ok", "date": report.date, "personas": len(report.entries)}
+        except Exception as exc:
+            raise HTTPException(500, f"Standup generation failed: {exc}")
 
     # ── Dashboard ────────────────────────────────────────────────
 
@@ -1155,6 +1463,18 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  /* ── Inbox ── */
+  .msg-item { padding: 10px 12px; border-radius: 6px; margin-bottom: 6px; background: var(--bg); border: 1px solid var(--border); cursor: pointer; transition: border-color .15s; }
+  .msg-item:hover { border-color: var(--accent); }
+  .msg-item.unread { border-left: 3px solid var(--accent); }
+  .msg-item.read { opacity: .75; }
+  .msg-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .msg-title { flex: 1; font-size: 14px; font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .msg-body-expanded { margin-top: 8px; font-size: 13px; white-space: pre-wrap; word-break: break-word; border-top: 1px solid var(--border); padding-top: 8px; display: none; }
+  .msg-body-expanded.open { display: block; }
+  .compose-box { border-top: 1px solid var(--border); margin-top: 12px; padding-top: 12px; }
+  .compose-textarea { width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13px; resize: vertical; min-height: 64px; font-family: inherit; margin-bottom: 8px; }
+  .compose-textarea:focus { border-color: var(--accent); outline: none; }
 </style>
 </head>
 <body>
@@ -1250,6 +1570,39 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
           </select>
         </div>
         <div id="dreamHistory" style="font-size:12px;color:var(--text-dim);margin-top:8px;max-height:130px;overflow-y:auto;"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="app">
+  <div class="card" style="margin-bottom:16px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+      <h2>Inbox <span class="count" id="inboxCount"></span></h2>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <select class="persona-select" id="inboxFilter" onchange="fetchInbox()" style="font-size:12px;padding:4px 8px;">
+          <option value="all">All</option>
+          <option value="unread" selected>Unread</option>
+          <option value="read">Read</option>
+        </select>
+        <button class="btn-sm btn-ghost" onclick="fetchInbox()">Refresh</button>
+        <button class="btn-sm btn-ghost" onclick="clearInbox()">Clear dismissed</button>
+      </div>
+    </div>
+    <div id="msgList" style="max-height:380px;overflow-y:auto;"></div>
+    <div class="compose-box">
+      <div style="font-size:13px;font-weight:600;color:var(--text-dim);margin-bottom:8px;">Send Message to Persona</div>
+      <textarea class="compose-textarea" id="composeBody" placeholder="Type a message to a persona..."></textarea>
+      <div class="form-row">
+        <select class="persona-select" id="composeTo" style="flex:1;"><option value="">Broadcast (all)</option></select>
+        <select class="persona-select" id="composeUrgency">
+          <option value="normal">Normal</option><option value="high">High</option>
+          <option value="urgent">Urgent</option><option value="low">Low</option>
+        </select>
+        <select class="persona-select" id="composeType">
+          <option value="fyi">FYI</option><option value="question">Question</option><option value="alert">Alert</option>
+        </select>
+        <button class="btn-sm btn-primary" onclick="sendMessage()">Send</button>
       </div>
     </div>
   </div>
@@ -1434,7 +1787,10 @@ async function fetchTasks() {
 
 async function fetchPersonas() {
   try { const r = await fetch(API + '/api/personas'); const personas = await r.json();
-    document.getElementById('personaSelect').innerHTML = personas.map(p => `<option value="${p.name}" ${p.active?'selected':''}>${p.name}</option>`).join('');
+    const opts = personas.map(p => `<option value="${p.name}" ${p.active?'selected':''}>${p.name}</option>`).join('');
+    document.getElementById('personaSelect').innerHTML = opts;
+    const ct = document.getElementById('composeTo');
+    if (ct) ct.innerHTML = '<option value="">Broadcast (all)</option>' + personas.map(p => `<option value="${p.name}">${p.name}</option>`).join('');
   } catch(e) {}
 }
 
@@ -1461,10 +1817,26 @@ async function loadReport(filename) {
 async function generateReport() {
   const btn = document.getElementById('reportGenBtn');
   btn.disabled = true; btn.textContent = 'Generating...';
-  try { await fetch(API + '/api/reports/generate', {method:'POST'});
-    btn.textContent = 'Running in background...';
+  try {
+    const r = await fetch(API + '/api/reports/generate', {method:'POST'});
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const msg = (d && d.detail) ? (Array.isArray(d.detail) ? d.detail.map(x => x.msg || x).join(' ') : d.detail) : (r.statusText || 'Request failed');
+      throw new Error(msg);
+    }
+    btn.textContent = d.status === 'already_running' ? 'Already running...' : 'Running in background...';
+    fetchReports();
+    let n = 0;
+    const poll = setInterval(() => {
+      fetchReports();
+      n += 1;
+      if (n >= 72) clearInterval(poll);
+    }, 5000);
     setTimeout(() => { btn.disabled = false; btn.textContent = 'Generate Audit Report'; fetchReports(); }, 30000);
-  } catch(e) { btn.disabled = false; btn.textContent = 'Generate Audit Report'; }
+  } catch(e) {
+    alert('Could not start audit report: ' + (e.message || e));
+    btn.disabled = false; btn.textContent = 'Generate Audit Report';
+  }
 }
 
 const TASK_ICONS = { pending:'\\u23f3', assigned:'\\u2192', in_progress:'\\u25b6\\ufe0f', blocked:'\\u23f8\\ufe0f', completed:'\\u2705', failed:'\\u274c' };
@@ -1547,10 +1919,96 @@ async function stopScheduler() { const btn = document.getElementById('schedStopB
 function switchPersona(name) { console.log('Switched to persona:', name); }
 function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
+// ── Inbox ─────────────────────────────────────────────────────────────
+const MSG_ICONS = { status: 'ℹ️', question: '❓', alert: '⚠️', handoff: '📦', fyi: '💬' };
+
+async function fetchInbox() {
+  const filter = document.getElementById('inboxFilter')?.value || 'unread';
+  const url = filter === 'all' ? '/api/inbox?status=all' : `/api/inbox?status=${filter}`;
+  try {
+    const r = await fetch(API + url);
+    const msgs = await r.json();
+    const unreadCount = filter === 'all' ? msgs.filter(m => m.status === 'unread').length : (filter === 'unread' ? msgs.length : 0);
+    const countEl = document.getElementById('inboxCount');
+    if (countEl) countEl.textContent = unreadCount > 0 ? `(${unreadCount} unread)` : msgs.length ? `(${msgs.length})` : '';
+    renderInbox(msgs);
+  } catch(e) {
+    const el = document.getElementById('msgList');
+    if (el) el.innerHTML = '<p style="color:var(--red);">Failed to load inbox.</p>';
+  }
+}
+
+function renderInbox(msgs) {
+  const el = document.getElementById('msgList');
+  if (!el) return;
+  const visible = msgs.filter(m => m.status !== 'dismissed');
+  if (!visible.length) { el.innerHTML = '<p style="color:var(--text-dim);font-size:13px;">Nothing to show.</p>'; return; }
+  const urgOrder = { urgent:0, high:1, normal:2, low:3 };
+  visible.sort((a,b) => {
+    if (a.status==='unread' && b.status!=='unread') return -1;
+    if (b.status==='unread' && a.status!=='unread') return 1;
+    return (urgOrder[a.urgency]||9) - (urgOrder[b.urgency]||9);
+  });
+  el.innerHTML = visible.slice(0, 60).map(m => {
+    const icon = MSG_ICONS[m.type] || '📩';
+    const t = m.created_at ? new Date(m.created_at).toLocaleString() : '';
+    const urgLabel = { urgent:'🔴 URGENT', high:'🟡 HIGH' }[m.urgency] || '';
+    const from = m.persona ? `@${m.persona}` : '';
+    const to = m.addressed_to ? ` → ${m.addressed_to}` : '';
+    const routing = `${from}${to}`;
+    const reqResp = m.requires_response ? `<div style="font-size:11px;color:var(--yellow);margin-top:3px;">⚡ Requires response</div>` : '';
+    const readBtn = m.status==='unread' ? `<button class="btn-sm btn-ghost" onclick="event.stopPropagation();readMsg('${m.id}')" style="padding:2px 8px;font-size:11px;">Read</button>` : '';
+    const dismissBtn = `<button class="btn-sm btn-ghost" onclick="event.stopPropagation();dismissMsg('${m.id}')" style="padding:2px 8px;font-size:11px;">Dismiss</button>`;
+    return `<div class="msg-item ${m.status}" id="msgcard-${m.id}" onclick="toggleMsg('${m.id}')">
+  <div class="msg-header">
+    <span title="${m.type}">${icon}</span>
+    ${urgLabel ? `<span style="font-size:11px;font-weight:700;">${escHtml(urgLabel)}</span>` : ''}
+    <span class="msg-title">${escHtml(m.title || (m.body||'').slice(0,80) || '(no title)')}</span>
+    ${routing ? `<span style="font-size:11px;color:var(--text-dim);">${escHtml(routing)}</span>` : ''}
+    <span style="font-size:11px;color:var(--text-dim);flex-shrink:0;">${escHtml(t)}</span>
+    <div style="display:flex;gap:4px;flex-shrink:0;">${readBtn}${dismissBtn}</div>
+  </div>
+  ${reqResp}
+  <div class="msg-body-expanded" id="msgbody-${m.id}">${escHtml(m.body || '')}</div>
+</div>`;
+  }).join('');
+}
+
+function toggleMsg(id) {
+  const b = document.getElementById('msgbody-' + id);
+  if (b) b.classList.toggle('open');
+}
+async function readMsg(id) { await fetch(API + `/api/inbox/${id}/read`, {method:'POST'}); fetchInbox(); }
+async function dismissMsg(id) { await fetch(API + `/api/inbox/${id}/dismiss`, {method:'POST'}); fetchInbox(); }
+async function clearInbox() {
+  await fetch(API + '/api/inbox/clear', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})});
+  fetchInbox();
+}
+async function sendMessage() {
+  const body = document.getElementById('composeBody')?.value.trim();
+  if (!body) return;
+  const addressed_to = document.getElementById('composeTo')?.value || '';
+  const urgency = document.getElementById('composeUrgency')?.value || 'normal';
+  const msg_type = document.getElementById('composeType')?.value || 'fyi';
+  try {
+    const r = await fetch(API + '/api/messages', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({body, addressed_to, urgency, msg_type, title: body.slice(0,80)}),
+    });
+    if (!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || r.statusText);
+    document.getElementById('composeBody').value = '';
+    // Show unread filter to see the new message
+    const f = document.getElementById('inboxFilter');
+    if (f) f.value = 'all';
+    fetchInbox();
+  } catch(e) { alert('Send failed: ' + (e.message || e)); }
+}
+
 async function init() {
-  await Promise.all([fetchHealth(), fetchBrainStats(), fetchDreamPanel(), fetchTasks(), fetchPersonas(), fetchHeartbeatStatus(), fetchHeartbeatLog(), fetchActivity(), fetchReports()]);
+  await Promise.all([fetchHealth(), fetchBrainStats(), fetchDreamPanel(), fetchTasks(), fetchPersonas(), fetchHeartbeatStatus(), fetchHeartbeatLog(), fetchActivity(), fetchReports(), fetchInbox()]);
   setInterval(() => { fetchHeartbeatStatus(); }, 15000);
   setInterval(() => { fetchHealth(); fetchBrainStats(); fetchDreamPanel(); fetchTasks(); fetchHeartbeatLog(); fetchActivity(); fetchReports(); }, 30000);
+  setInterval(() => { fetchInbox(); }, 12000);
 }
 init();
 </script>

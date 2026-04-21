@@ -8,6 +8,7 @@ import os
 import pytest
 
 from messaging import (
+    BRAIN_NOTE_IDS_KEY,
     Message,
     append_message,
     build_inbox_summary,
@@ -17,11 +18,14 @@ from messaging import (
     emit_alert,
     emit_escalation_alert,
     emit_fyi,
+    emit_handoff,
     emit_task_blocked,
     emit_task_completed,
     emit_task_failed,
+    emit_task_redirected,
     emit_task_started,
     emit_task_timed_out,
+    brain_note_ids_from_message,
     find_message,
     format_inbox,
     format_message_detail,
@@ -30,6 +34,7 @@ from messaging import (
     get_unread,
     load_outbox,
     mark_dismissed,
+    merge_brain_note_ids,
     mark_read,
     prune_old_messages,
     save_outbox,
@@ -103,6 +108,11 @@ class TestEmitHelpers:
         assert m.payload["deliverables"] == ["src/main.py", "tests/test.py"]
         assert m.payload["severity"] == "normal"
 
+    def test_emit_task_completed_includes_note_deliverables(self):
+        task = _FakeTask(deliverables=["note:n0042", "src/x.py"])
+        m = emit_task_completed(task)
+        assert m.payload.get(BRAIN_NOTE_IDS_KEY) == ["n0042"]
+
     def test_emit_task_blocked(self):
         task = _FakeTask()
         m = emit_task_blocked(task, "What database?", persona="dev", heartbeat=3)
@@ -167,6 +177,67 @@ class TestEmitHelpers:
         assert m.type == "fyi"
         assert m.urgency == "low"
         assert m.payload["severity"] == "low"
+
+    def test_emit_fyi_brain_note_ids(self):
+        m = emit_fyi("Tip", "Body", brain_note_ids=["n0001", "n0002"])
+        assert m.payload.get(BRAIN_NOTE_IDS_KEY) == ["n0001", "n0002"]
+
+    def test_brain_note_ids_from_message(self):
+        m = create_message("fyi", "t", payload={BRAIN_NOTE_IDS_KEY: ["a", "b"]})
+        assert brain_note_ids_from_message(m) == ["a", "b"]
+
+    def test_merge_brain_note_ids(self):
+        pl = merge_brain_note_ids({"severity": "low"}, ["n1", "n2"])
+        assert pl["severity"] == "low"
+        assert pl[BRAIN_NOTE_IDS_KEY] == ["n1", "n2"]
+
+    def test_emit_task_redirected(self):
+        task = _FakeTask()
+        m = emit_task_redirected(task, "workspace_observer", "out of scope", persona="coordinator")
+        assert m.type == "status"
+        assert "redirected" in m.title.lower()
+        assert "workspace_observer" in m.title
+        assert "out of scope" in m.body
+        assert m.payload["redirected_to"] == "workspace_observer"
+
+    def test_emit_handoff_basic(self):
+        from handoff import HandoffContext
+        task = _FakeTask(id="t99", title="Analyse logs")
+        hc = HandoffContext(
+            summary="Logs show memory pressure",
+            findings=["heap grows each cycle"],
+            files_touched=["logs/app.log"],
+        )
+        m = emit_handoff(task, hc, addressed_to="workspace_observer", sender="coordinator", persona="coordinator")
+        assert m.type == "fyi"
+        assert m.task_id == "t99"
+        assert "workspace_observer" in m.title
+        assert m.sender == "coordinator"
+        assert m.addressed_to == "workspace_observer"
+        assert m.thread_id == m.id  # starts its own thread
+        assert m.payload["summary"] == "Logs show memory pressure"
+        assert m.payload["files_touched"] == ["logs/app.log"]
+
+    def test_emit_handoff_sender_defaults_to_coordinator(self):
+        from handoff import HandoffContext
+        task = _FakeTask()
+        hc = HandoffContext(summary="brief summary")
+        m = emit_handoff(task, hc, addressed_to="obs")
+        assert m.sender == "coordinator"
+
+    def test_emit_handoff_body_uses_prompt_block(self):
+        from handoff import HandoffContext
+        task = _FakeTask()
+        hc = HandoffContext(summary="Work done", findings=["finding A"])
+        m = emit_handoff(task, hc, addressed_to="obs")
+        assert "== HANDOFF CONTEXT ==" in m.body
+
+    def test_emit_handoff_empty_context_uses_fallback_body(self):
+        from handoff import HandoffContext
+        task = _FakeTask(id="t1")
+        hc = HandoffContext()  # all empty — to_prompt_block() returns ""
+        m = emit_handoff(task, hc, addressed_to="obs")
+        assert "t1" in m.body or "obs" in m.body  # fallback summary
 
 
 # ── State transitions ─────────────────────────────────────────────────

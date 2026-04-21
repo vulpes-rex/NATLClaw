@@ -102,6 +102,7 @@ Each persona is a named entry under `personas`:
 | `instructions` | `string` | Yes | Relative path to a markdown file with the system prompt |
 | `heartbeatTask` | `string` | Yes | Prompt used during the "capture" step of each heartbeat |
 | `mcpServers` | `string[]` | No | Names of MCP servers from the top-level `mcpServers` pool |
+| `inheritBaseTools` | `boolean` | No | Default `true`. Merge `core_agent_tools.get_base_tools()` with this persona’s extension tools; extension wins on duplicate function names. Set `false` to use only the persona’s `tools` module/file. |
 | `tools` | `object` | No | Local Python tool configuration |
 | `tools.module` | `string` | Yes (if `tools`) | Dotted Python module path to import |
 | `tools.functions` | `string[]` | No | Specific function names to load. If omitted, all public functions are loaded. |
@@ -115,10 +116,13 @@ Each persona is a named entry under `personas`:
 2. Load mcp.json from project root
 3. Look up persona by name in personas{}
 4. Read instructions markdown file → system prompt
-5. Import tools.module, resolve tools.functions → callable list
-6. Resolve mcpServers[] → typed MCP server configs from top-level pool
-7. Pass instructions + tools + mcp_servers to GitHubCopilotAgent
+5. Import tools.module (or tools.file), resolve tools.functions → extension callable list
+6. Merge core base tools + extension (unless inheritBaseTools is false); extension overrides base on same __name__
+7. Resolve mcpServers[] → typed MCP server configs from top-level pool
+8. Pass instructions + merged tools + mcp_servers to the agent runtime
 ```
+
+Core base tools live in `core_agent_tools.py` (`get_base_tools()`). Persona-specific tools remain in `personas/<name>/tools.py` (or an external module). The resolved list is stored on `Persona.tools`; raw manifest tools are also available as `Persona.extension_tools` for debugging.
 
 ---
 
@@ -164,7 +168,7 @@ Brief role description.
 5. Add the persona entry to `personas` in `mcp.json`
 6. Set `PERSONA=<name>` in `.env` and run the agent
 
-No agent code changes required.
+You do not need to edit Python to register a persona. Base tools are merged automatically unless you set `inheritBaseTools` to `false`.
 
 ---
 

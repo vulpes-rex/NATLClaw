@@ -75,10 +75,10 @@ class TestPushEvent:
             _push_event("file_change", {"path": "test.py"})
             assert not q.empty()
             event = q.get_nowait()
-            # New format: (priority, event_type, payload)
+            # (priority, seq, event_type, payload)
             assert event[0] == 2  # file_change priority
-            assert event[1] == "file_change"
-            assert event[2] == {"path": "test.py"}
+            assert event[2] == "file_change"
+            assert event[3] == {"path": "test.py"}
         finally:
             event_watcher._event_queue = None
 
@@ -130,10 +130,10 @@ class TestEventWatcherPolling:
 
         assert count == 1
         event = q.get_nowait()
-        # New format: (priority, event_type, payload)
+        # (priority, seq, event_type, payload)
         assert event[0] == 2  # file_created priority
-        assert event[1] == "file_created"
-        assert event[2]["path"] == "new.py"
+        assert event[2] == "file_created"
+        assert event[3]["path"] == "new.py"
 
     def test_poll_detects_modified_file(self, tmp_path):
         (tmp_path / "mod.py").write_text("v1", encoding="utf-8")
@@ -148,9 +148,9 @@ class TestEventWatcherPolling:
 
         assert count == 1
         event = q.get_nowait()
-        # New format: (priority, event_type, payload)
+        # (priority, seq, event_type, payload)
         assert event[0] == 2  # file_modified priority
-        assert event[1] == "file_modified"
+        assert event[2] == "file_modified"
 
     def test_poll_detects_deleted_file(self, tmp_path):
         f = tmp_path / "gone.py"
@@ -164,9 +164,9 @@ class TestEventWatcherPolling:
 
         assert count == 1
         event = q.get_nowait()
-        # New format: (priority, event_type, payload)
+        # (priority, seq, event_type, payload)
         assert event[0] == 2  # file_deleted priority
-        assert event[1] == "file_deleted"
+        assert event[2] == "file_deleted"
 
     def test_poll_returns_zero_when_no_changes(self, tmp_path):
         (tmp_path / "stable.py").write_text("ok", encoding="utf-8")
@@ -304,7 +304,7 @@ class TestCrossProcessEvents:
 
         # Verify events are in the queue with correct priority
         ev1 = q.get_nowait()
-        assert ev1[1] in ("task_created", "task_answered")
+        assert ev1[2] in ("task_created", "task_answered")
 
     def test_drain_returns_zero_when_no_file(self, tmp_path, monkeypatch):
         ndjson = tmp_path / "nonexistent.ndjson"
@@ -337,17 +337,19 @@ class TestCrossProcessEvents:
         assert count == 1
         assert q.qsize() == 1
         event = q.get_nowait()
-        assert event[1] == "task_created"
-        assert event[2] == {"task_id": "t001"}
+        assert event[2] == "task_created"
+        assert event[3] == {"task_id": "t001"}
 
     def test_push_event_nowait_includes_priority(self):
-        """_push_event_nowait should produce (priority, event_type, payload) tuples."""
+        """_push_event_nowait should produce (priority, seq, event_type, payload) tuples."""
         q = asyncio.PriorityQueue(maxsize=10)
         event_watcher._event_queue = q
         try:
             _push_event_nowait("git_commit", {"hash": "abc123"})
             event = q.get_nowait()
-            assert event == (1, "git_commit", {"hash": "abc123"})
+            assert event[0] == 1
+            assert event[2] == "git_commit"
+            assert event[3] == {"hash": "abc123"}
         finally:
             event_watcher._event_queue = None
 
@@ -361,7 +363,7 @@ class TestCrossProcessEvents:
         count = drain_pending_events(q)
         assert count == 1
         assert q.qsize() == 1
-        priority, event_type, payload = q.get_nowait()
+        priority, _seq, event_type, payload = q.get_nowait()
         assert priority == 2
         assert event_type == "file_change"
         assert payload["path"] == "src/main.py"

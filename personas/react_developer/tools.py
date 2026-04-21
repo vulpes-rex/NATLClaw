@@ -153,7 +153,8 @@ ALLOWED_COMMANDS = {
         'validate_positional': lambda arg: True
     },
     'git': {
-        'allowed_args': ['--version', '-m', 'status', 'pull', 'push', 'clone', 'commit', 'add', 'branch'],
+        'allowed_args': ['--version', '-m', '-b', '-u', 'status', 'pull', 'push',
+                         'clone', 'commit', 'add', 'branch', 'checkout', 'log', 'diff'],
         'allow_positional': True,
         'validate_positional': lambda arg: True
     }
@@ -384,3 +385,131 @@ def run_shell_command(
     if not success:
         return f"Blocked: {output}"
     return output
+
+
+# ── ADO pull request tools ─────────────────────────────────────────────
+
+
+def _ado_connector_from_env():
+    """Build an AzureDevOpsConnector from environment variables.
+
+    Returns None when ADO credentials are not configured.
+    """
+    import os
+    try:
+        from connectors.ado import AzureDevOpsConnector
+        url = os.getenv("ADO_URL", "")
+        pat = os.getenv("ADO_PAT", "")
+        project = os.getenv("ADO_PROJECT", "")
+        team = os.getenv("ADO_TEAM", "")
+        if not (url and pat and project):
+            return None
+        return AzureDevOpsConnector(url=url, pat=pat, project=project, team=team)
+    except Exception:
+        return None
+
+
+def create_pull_request(
+    title: Annotated[str, "PR title (concise, under 70 chars)"],
+    source_branch: Annotated[str, "Source branch name, e.g. 'feature/auth-refactor'"],
+    description: Annotated[str, "PR description / body (Markdown supported)"] = "",
+    work_item_ids: Annotated[str, "Comma-separated ADO work item IDs to link, e.g. '4821,4834'"] = "",
+    repository: Annotated[str, "Git repository name in ADO"] = "",
+    target_branch: Annotated[str, "Target branch (default: 'main')"] = "main",
+) -> str:
+    """Open a pull request in Azure DevOps.
+
+    IMPORTANT: You open PRs — you NEVER merge them. Human reviews and merges.
+    Call this only after tests pass and the code is ready for review.
+    """
+    connector = _ado_connector_from_env()
+    if connector is None:
+        return "ADO not configured (ADO_URL / ADO_PAT / ADO_PROJECT env vars missing)"
+
+    wi_ids: list[int] = []
+    for part in work_item_ids.split(","):
+        part = part.strip()
+        if part.isdigit():
+            wi_ids.append(int(part))
+
+    try:
+        pr = connector.create_pull_request(
+            repository=repository,
+            title=title,
+            source_branch=source_branch,
+            target_branch=target_branch,
+            description=description,
+            work_item_ids=wi_ids or None,
+        )
+        if pr is None:
+            return "PR creation failed — check ADO_URL, credentials, and repository name"
+        return (
+            f"PR #{pr.id} created: {pr.title}\n"
+            f"URL: {pr.url}\n"
+            f"Status: {pr.status}\n"
+            f"Branch: {pr.source_branch} -> {pr.target_branch}"
+        )
+    except Exception as exc:
+        return f"PR creation error: {exc}"
+
+
+def get_pull_request_status(
+    pr_id: Annotated[int, "ADO pull request ID"],
+    repository: Annotated[str, "Git repository name in ADO"],
+) -> str:
+    """Fetch the status of an existing pull request."""
+    connector = _ado_connector_from_env()
+    if connector is None:
+        return "ADO not configured"
+    try:
+        pr = connector.get_pull_request(repository=repository, pr_id=pr_id)
+        if pr is None:
+            return f"PR #{pr_id} not found"
+        return (
+            f"PR #{pr.id}: {pr.title}\n"
+            f"Status: {pr.status}\n"
+            f"URL: {pr.url}\n"
+            f"Branch: {pr.source_branch} -> {pr.target_branch}"
+        )
+    except Exception as exc:
+        return f"Error fetching PR: {exc}"
+
+
+def parse_jest_results(
+    json_output: Annotated[str, "JSON output from 'npm test -- --json'"],
+) -> str:
+    """Parse Jest JSON test output and return a human-readable summary."""
+    import json as _json
+    try:
+        data = _json.loads(json_output)
+    except _json.JSONDecodeError as exc:
+        return f"Invalid JSON: {exc}"
+
+    num_suites = data.get("numTotalTestSuites", 0)
+    num_passed = data.get("numPassedTests", 0)
+    num_failed = data.get("numFailedTests", 0)
+    num_total = data.get("numTotalTests", 0)
+    success = data.get("success", False)
+
+    lines = [
+        f"Jest results: {'PASS' if success else 'FAIL'}",
+        f"Tests: {num_passed}/{num_total} passed, {num_failed} failed",
+        f"Suites: {num_suites}",
+    ]
+
+    # Surface failing test names
+    failures: list[str] = []
+    for suite in data.get("testResults", []):
+        for result in suite.get("testResults", []):
+            if result.get("status") == "failed":
+                name = result.get("fullName") or result.get("title", "unknown")
+                msg = (result.get("failureMessages") or [""])[0][:200]
+                failures.append(f"  FAIL: {name}\n       {msg}")
+
+    if failures:
+        lines.append("\nFailing tests:")
+        lines.extend(failures[:10])  # cap at 10
+        if len(failures) > 10:
+            lines.append(f"  ... and {len(failures) - 10} more")
+
+    return "\n".join(lines)

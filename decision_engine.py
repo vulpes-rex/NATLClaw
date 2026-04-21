@@ -213,8 +213,8 @@ class DecisionContext:
     pending_tasks: list = field(default_factory=list)
     blocked_tasks: list = field(default_factory=list)
 
-    # Events drained this cycle
-    events: list[tuple[int, str, dict]] = field(default_factory=list)
+    # Events drained this cycle: (priority, seq, event_type, payload)
+    events: list[tuple[int, int, str, dict]] = field(default_factory=list)
 
     # Goals
     active_goals: list[dict] = field(default_factory=list)
@@ -344,7 +344,7 @@ def _count_domain_matches(text: str, notes: list[dict]) -> int:
 def _score_events(ctx: DecisionContext, policy: DecisionPolicy) -> list[ActionCandidate]:
     """Score each pending event as a candidate action."""
     candidates = []
-    for priority, event_type, payload in ctx.events:
+    for priority, _seq, event_type, payload in ctx.events:
         base = _EVENT_SCORE.get(priority, 20.0)
 
         # Task-mutation events get an extra boost
@@ -807,7 +807,7 @@ def collect_escalation_signals(ctx: DecisionContext) -> list[dict[str, Any]]:
     # 1) Repeated bug-fix work pattern.
     bug_tokens = ("bug", "fix", "hotfix", "regression", "incident")
     bug_signal_count = 0
-    for _priority, event_type, payload in ctx.events:
+    for _priority, _seq, event_type, payload in ctx.events:
         haystack = f"{event_type} {payload}".lower()
         if any(token in haystack for token in bug_tokens):
             bug_signal_count += 1
@@ -832,7 +832,7 @@ def collect_escalation_signals(ctx: DecisionContext) -> list[dict[str, Any]]:
     # 2) TODO unchanged despite repeated touches.
     touched_counts: dict[str, int] = {}
     explicit_unchanged = False
-    for _priority, event_type, payload in ctx.events:
+    for _priority, _seq, event_type, payload in ctx.events:
         if event_type not in ("file_change", "file_modified"):
             continue
         path = str(payload.get("path", "")).strip()
@@ -1097,7 +1097,7 @@ def route_event(event_type: str, payload: dict) -> dict:
 
 
 def has_preempting_event(
-    events: list[tuple[int, str, dict]],
+    events: list[tuple[int, int, str, dict]],
     policy: DecisionPolicy | None = None,
 ) -> bool:
     """Check whether any event in the batch should pre-empt the sleep timer."""
@@ -1105,7 +1105,7 @@ def has_preempting_event(
     if policy and policy.event_routing:
         for k, v in policy.event_routing.items():
             merged[k] = {"action": v.action, "preempt": v.preempt, "score_boost": v.boost}
-    for _priority, event_type, _payload in events:
+    for _priority, _seq, event_type, _payload in events:
         routing = merged.get(event_type, {"preempt": False})
         if routing.get("preempt") or routing.get("preempt") is True:
             return True
@@ -1121,7 +1121,7 @@ def build_decision_context(
     brain,
     tasks: list,
     outbox: list,
-    events: list[tuple[int, str, dict]],
+    events: list[tuple[int, int, str, dict]],
     persona,
     *,
     get_active_task_fn=None,
@@ -1141,7 +1141,7 @@ def build_decision_context(
     brain : BrainState
     tasks : list[Task]
     outbox : list[Message]
-    events : list of (priority, event_type, payload)
+    events : list of (priority, seq, event_type, payload)
     persona : Persona
     """
     # Lazy imports to avoid circular deps at module level
@@ -1197,7 +1197,7 @@ def build_decision_context(
         recent_preference_notes=recent_preferences,
         brain_lint_issues=lint_issues,
         active_task=get_active_task_fn(tasks, persona.name),
-        pending_tasks=get_pending_tasks_fn(tasks),
+        pending_tasks=get_pending_tasks_fn(tasks, persona.name),
         blocked_tasks=get_blocked_tasks_fn(tasks),
         events=events,
         active_goals=get_active_goals_fn(state),

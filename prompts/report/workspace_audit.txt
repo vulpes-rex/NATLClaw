@@ -12,8 +12,21 @@ Use your tools systematically to examine the workspace:
    to understand the codebase layout, module sizes, and dependency graph.
 
 2. **Documentation vs reality** — Use `check_docs_vs_implementation` to find
-   planned features, then use `search_codebase` and `read_file` to verify
+   candidates, then use `search_codebase` and `read_file` to verify
    whether each is actually implemented.
+
+   **Citation grounding (mandatory):** You may only list an item under
+   **Unfinished Features** if you can tie it to evidence you actually saw:
+   - The **Source** must be a repo-relative path to a file that **exists**
+     and that you **read with a tool** (`read_file` or output of
+     `list_directory` / `check_docs_vs_implementation` that includes that path).
+   - Do **not** invent doc paths, feature names, or “planned” work that is not
+     written in this repository. Do not assume a generic product backlog
+     (profiles, email, payments, etc.) unless the docs or code mention it.
+   - If you cannot find any documented planned feature with a verifiable source
+     file, write under **Unfinished Features** exactly:
+     `No documented gaps verified this run (no matching doc claims found, or tools did not return evidence).`
+     Do not fill the section with speculative items.
 
 3. **Code health** — Use `scan_todos` to find TODO/FIXME/HACK markers.
    Use `check_imports` on key modules to find broken imports.
@@ -50,12 +63,12 @@ Generated: [date]
   Fix: [what to do]
 
 ## Unfinished Features
-[Features that are planned/documented but not implemented or only partial]
+[Only items evidenced by a real doc or roadmap file you read. See grounding rules above.]
 - Feature: [name]
-  Source: [which doc mentions it]
+  Source: [repo-relative path — must exist and have been read this run]
   Status: NOT STARTED | PARTIAL
-  What exists: [if partial, what's done]
-  What's missing: [specific gaps]
+  What exists: [if partial, what's done — cite code paths you inspected]
+  What's missing: [specific gaps — must follow from that source + code check]
 
 ## Code Quality
 [Patterns that could be improved, duplication, inconsistencies]
@@ -83,5 +96,9 @@ Generated: [date]
 
 Be specific. Reference file paths and line numbers. Do not pad with
 generic advice — every item must be grounded in what you observed.
+
+**Do not cite** a path you did not successfully open, or a feature not
+mentioned in the files you read. Prefer fewer, verified bullets over many
+plausible-sounding ones.
 
 Return ONLY the markdown report, no conversational text around it.

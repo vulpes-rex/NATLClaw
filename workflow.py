@@ -4,8 +4,15 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
+from typing import Any
 
 from config import AppConfig
+from capture_policy import (
+    DEFAULT_CAPTURE_POLICY,
+    CapturePolicy,
+    has_substantive_evidence,
+    run_after_capture_hook,
+)
 from execution_log import append_entry as _log_entry
 from goals import build_goals_block
 from learning import extract_lessons
@@ -34,6 +41,14 @@ from state import AgentState
 logger = logging.getLogger(__name__)
 
 
+def _effective_capture_policy(persona: Any) -> CapturePolicy:
+    """Return the persona's capture policy, or defaults (for tests using bare mocks)."""
+    pol = getattr(persona, "capture_policy", None)
+    if isinstance(pol, CapturePolicy):
+        return pol
+    return DEFAULT_CAPTURE_POLICY
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Core step runner
 # ──────────────────────────────────────────────────────────────────────
@@ -45,6 +60,7 @@ async def _run_step(
     state: AgentState,
     *,
     seen_fps: set[str] | None = None,
+    _text_sink: list[str] | None = None,
 ) -> str:
     """Run a single workflow step: call agent, record history, extract lessons.
 
@@ -54,6 +70,10 @@ async def _run_step(
         Shared fingerprint set for within-heartbeat dedup.  When multiple
         steps run in the same heartbeat, passing the same set prevents
         duplicate lessons across steps.
+    _text_sink:
+        Optional mutable list.  When provided, the raw agent response text
+        is appended so callers can scan for structured output (e.g. REPLY TO
+        blocks) after all steps complete.
     """
     start = time.monotonic()
     try:
@@ -85,6 +105,9 @@ async def _run_step(
     except Exception as e:
         logger.warning("[%s] Failed to extract lessons: %s", step_name, str(e))
 
+    if _text_sink is not None:
+        _text_sink.append(text)
+
     return text
 
 
@@ -93,7 +116,14 @@ async def _run_step(
 # ──────────────────────────────────────────────────────────────────────
 
 async def run_heartbeat(
-    agent, state: AgentState, brain: BrainState, config: AppConfig, persona: Persona
+    agent,
+    state: AgentState,
+    brain: BrainState,
+    config: AppConfig,
+    persona: Persona,
+    *,
+    inbox: list | None = None,
+    outbox: list | None = None,
 ) -> None:
     """Dispatch to the correct workflow based on persona.workflow.
 
@@ -115,16 +145,114 @@ async def run_heartbeat(
     coordinator
         Multi-persona orchestration. Runs one or all personas from the
         roster each heartbeat and synthesises their outputs.
+
+    Move A: inbox / outbox
+        When *inbox* and *outbox* are supplied the workflow will scan agent
+        responses for ``REPLY TO <msg_id>: text`` blocks and convert them
+        into outbound messages (appended to *outbox*) while marking the
+        originals in *inbox* as read.  Callers are responsible for
+        persisting both after this function returns.
     """
+    # Collect raw step texts so we can scan for REPLY TO blocks after the workflow.
+    _text_sink: list[str] | None = [] if (inbox is not None and outbox is not None) else None
+
     mode = persona.workflow
     if mode == "freeform":
-        await _run_freeform_heartbeat(agent, state, brain, config, persona)
+        await _run_freeform_heartbeat(agent, state, brain, config, persona, _text_sink=_text_sink)
     elif mode == "steps":
-        await _run_steps_heartbeat(agent, state, brain, config, persona)
+        await _run_steps_heartbeat(agent, state, brain, config, persona, _text_sink=_text_sink)
     elif mode == "coordinator":
-        await _run_coordinator_heartbeat(agent, state, brain, config, persona)
+        await _run_coordinator_heartbeat(agent, state, brain, config, persona, _text_sink=_text_sink)
     else:
-        await _run_second_brain_heartbeat(agent, state, brain, config, persona)
+        await _run_second_brain_heartbeat(agent, state, brain, config, persona, _text_sink=_text_sink)
+
+    # Move A: process any REPLY TO blocks the agent emitted during this heartbeat
+    if _text_sink and inbox is not None and outbox is not None:
+        combined = "\n".join(_text_sink)
+        replies = _extract_replies(combined)
+        if replies:
+            await _process_agent_replies(
+                replies, inbox, outbox,
+                persona_name=persona.name,
+                state_file=config.state_file,
+            )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Task negotiation helper (Move B)
+# ──────────────────────────────────────────────────────────────────────
+
+async def _run_negotiation_step(
+    agent,
+    state: AgentState,
+    brain: BrainState,
+    task,
+    persona: Persona,
+    *,
+    seen_fps: set | None = None,
+) -> dict:
+    """Run a single negotiation step asking the agent whether to accept/redirect/clarify.
+
+    Returns a dict with keys:
+        action: "accept" | "redirect" | "blocked"
+        to_persona: str  (for redirect)
+        reason: str      (for redirect / blocked)
+    """
+    from tasks import build_task_context
+    seen_fps = seen_fps or set()
+    task_ctx = build_task_context(task)
+    brain_summary = build_brain_summary(brain, max_notes=3)
+
+    prompt = load_prompt("task", "negotiate", task_context=task_ctx, brain_summary=brain_summary)
+    if not prompt:
+        prompt = (
+            f"You have been offered a new task:\n\n{task_ctx}\n\n"
+            f"Brain context:\n{brain_summary}\n\n"
+            f"Before accepting, review the task and respond with ONE of:\n"
+            f"  ACCEPT TASK {task.id} — you can do this work\n"
+            f"  REDIRECT TASK {task.id} TO @<persona>: <reason> — another persona is better suited\n"
+            f"  CLARIFY TASK {task.id}: <question> — you need more information first\n\n"
+            f"Respond with just one of those lines."
+        )
+
+    raw = await _run_step(agent, "task_negotiate", prompt, state, seen_fps=seen_fps)
+    return _parse_negotiation_response(raw, task.id)
+
+
+def _parse_negotiation_response(text: str, task_id: str) -> dict:
+    """Parse agent negotiation output into an action dict."""
+    import re
+
+    # ACCEPT TASK <id>
+    if re.search(rf"ACCEPT\s+TASK\s+{re.escape(task_id)}", text, re.IGNORECASE):
+        return {"action": "accept", "to_persona": "", "reason": ""}
+
+    # REDIRECT TASK <id> TO @<persona>: <reason>
+    redirect_m = re.search(
+        rf"REDIRECT\s+TASK\s+{re.escape(task_id)}\s+TO\s+@([\w_-]+)\s*:?\s*(.*)",
+        text, re.IGNORECASE,
+    )
+    if redirect_m:
+        return {
+            "action": "redirect",
+            "to_persona": redirect_m.group(1).strip(),
+            "reason": redirect_m.group(2).strip(),
+        }
+
+    # CLARIFY TASK <id>: <question>
+    clarify_m = re.search(
+        rf"CLARIFY\s+TASK\s+{re.escape(task_id)}\s*:?\s*(.*)",
+        text, re.IGNORECASE,
+    )
+    if clarify_m:
+        return {
+            "action": "blocked",
+            "to_persona": "",
+            "reason": clarify_m.group(1).strip(),
+        }
+
+    # Default: accept (if agent didn't give a recognized response, proceed)
+    return {"action": "accept", "to_persona": "", "reason": ""}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -151,15 +279,48 @@ async def run_task_heartbeat(
     responsible for appending them to the outbox and persisting.
     """
     from tasks import (
-        advance_task, assign_task, block_task, build_task_context,
-        complete_task, fail_task, start_task,
+        advance_task, assign_task, accept_negotiated_task, block_task,
+        build_task_context, complete_task, fail_task, negotiate_task,
+        redirect_task, start_task,
     )
 
     _outbox: list = []  # collects Message objects for the caller
     try:
         seen_fps: set[str] = set()
-        if task.status == "pending":
+
+        # Negotiation gate (Move B): if enabled, run a pre-work negotiation step
+        # so the agent can accept, redirect, or clarify before committing.
+        if task.status == "pending" and getattr(config, "task_negotiation_enabled", False):
+            negotiate_task(task, persona.name)
+            negotiation_result = await _run_negotiation_step(
+                agent, state, brain, task, persona, seen_fps=seen_fps,
+            )
+            from messaging import emit_task_blocked, emit_task_redirected
+            action = negotiation_result.get("action", "accept")
+            if action == "redirect":
+                to_persona = negotiation_result.get("to_persona", "")
+                reason = negotiation_result.get("reason", "")
+                redirect_task(task, to_persona, reason)
+                _outbox.append(emit_task_redirected(
+                    task, to_persona, reason, persona=persona.name, heartbeat=state.execution_count,
+                ))
+                logger.info("[task] Redirected '%s' to @%s", task.title, to_persona)
+                return _outbox
+            elif action == "blocked":
+                question = negotiation_result.get("reason", "Agent needs clarification")
+                block_task(task, question, state.execution_count)
+                _outbox.append(emit_task_blocked(
+                    task, question, persona=persona.name, heartbeat=state.execution_count,
+                ))
+                logger.info("[task] Blocked at negotiation: '%s' — %s", task.title, question[:80])
+                return _outbox
+            else:
+                # accept (or unknown): move forward
+                accept_negotiated_task(task)
+
+        elif task.status == "pending":
             assign_task(task, persona.name)
+
         start_task(task)
 
         task_ctx = build_task_context(task)
@@ -209,7 +370,9 @@ async def run_task_heartbeat(
             check_prompt = (
                 f"Task: {task.title}\n"
                 f"Work done: {execute_result[:600]}\n\n"
-                f"Is this task DONE, should it CONTINUE, is it BLOCKED, or has it FAILED?"
+                f"Is this task DONE, should it CONTINUE, is it BLOCKED, or has it FAILED?\n"
+                f"If requirements are unclear and need PM + Dev + QA alignment before you can start, "
+                f"say THREE_AMIGOS: <open question>."
             )
         verdict = await _run_step(
             agent, "task_check", check_prompt, state, seen_fps=seen_fps,
@@ -218,6 +381,7 @@ async def run_task_heartbeat(
         # Step 4: Apply verdict and emit messages
         from messaging import (
             emit_task_blocked, emit_task_completed, emit_task_failed,
+            emit_three_amigos,
         )
 
         verdict_upper = verdict.strip().upper()
@@ -229,10 +393,17 @@ async def run_task_heartbeat(
             _outbox.append(emit_task_completed(
                 task, persona=persona.name, heartbeat=state.execution_count,
             ))
+        elif verdict_upper.startswith("THREE_AMIGOS:"):
+            question = verdict.split(":", 1)[1].strip() if ":" in verdict else verdict
+            block_task(task, question, state.execution_count)
+            logger.info("[task] Three amigos needed: %s -- %s", task.title, question[:100])
+            _outbox.append(emit_three_amigos(
+                task, question, persona=persona.name, heartbeat=state.execution_count,
+            ))
         elif verdict_upper.startswith("BLOCKED:"):
             question = verdict.split(":", 1)[1].strip() if ":" in verdict else verdict
             block_task(task, question, state.execution_count)
-            logger.info("[task] Blocked: %s — %s", task.title, question[:100])
+            logger.info("[task] Blocked: %s -- %s", task.title, question[:100])
             _outbox.append(emit_task_blocked(
                 task, question, persona=persona.name, heartbeat=state.execution_count,
             ))
@@ -272,6 +443,7 @@ async def run_task_heartbeat(
         note_id = _store_capture(
             brain, capture_result,
             persona_name=persona.name,
+            capture_policy=_effective_capture_policy(persona),
             heartbeat_number=state.execution_count,
             step=f"task_{task.id}",
         )
@@ -305,12 +477,88 @@ def _extract_deliverables(verdict: str) -> list[str]:
     return deliverables[:20]
 
 
+def _extract_replies(text: str) -> list[dict]:
+    """Parse ``REPLY TO <msg_id>: body`` blocks from agent output.
+
+    The agent is instructed (via the inbound message block) to use this
+    format to reply to specific messages.  Multiple REPLY TO blocks in a
+    single response are supported.
+
+    Returns a list of ``{"reply_to": str, "body": str}`` dicts.
+    """
+    import re
+
+    pattern = re.compile(
+        r"REPLY\s+TO\s+([a-zA-Z0-9]+)\s*:\s*(.*?)(?=REPLY\s+TO\s+[a-zA-Z0-9]+\s*:|$)",
+        re.DOTALL | re.IGNORECASE,
+    )
+    replies = []
+    for match in pattern.finditer(text):
+        msg_id = match.group(1).strip()
+        body = match.group(2).strip()
+        if msg_id and body:
+            replies.append({"reply_to": msg_id, "body": body[:2000]})
+    return replies
+
+
+async def _process_agent_replies(
+    replies: list[dict],
+    inbox_messages: list,
+    outbox: list,
+    persona_name: str,
+    state_file: str,
+) -> None:
+    """Convert extracted reply dicts into outbound messages and mark originals read.
+
+    *inbox_messages* and *outbox* are mutated in-place; the caller is
+    responsible for persisting both after this function returns.
+    """
+    from messaging import (
+        Message,
+        append_message,
+        create_message,
+        find_message,
+        mark_read,
+    )
+
+    for r in replies:
+        original = find_message(inbox_messages, r["reply_to"])
+        thread_id = original.thread_id if original else r["reply_to"]
+        addressed_to = original.sender if original else "developer"
+
+        reply_msg = create_message(
+            "fyi",
+            title=f"Reply from @{persona_name} to {r['reply_to']}",
+            body=r["body"],
+            persona=persona_name,
+        )
+        reply_msg.sender = persona_name
+        reply_msg.addressed_to = addressed_to
+        reply_msg.reply_to = r["reply_to"]
+        reply_msg.thread_id = thread_id
+
+        append_message(outbox, reply_msg)
+
+        if original:
+            mark_read(original)
+            logger.info(
+                "[replies] Agent @%s replied to %s (thread=%s)",
+                persona_name, r["reply_to"], thread_id,
+            )
+        else:
+            logger.warning(
+                "[replies] Agent @%s wrote REPLY TO %s but that message was not found in inbox",
+                persona_name, r["reply_to"],
+            )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Mode 1: second_brain
 # ──────────────────────────────────────────────────────────────────────
 
 async def _run_second_brain_heartbeat(
-    agent, state: AgentState, brain: BrainState, config: AppConfig, persona: Persona
+    agent, state: AgentState, brain: BrainState, config: AppConfig, persona: Persona,
+    *, _text_sink: list[str] | None = None,
 ) -> None:
     """Original 4-step knowledge-capture workflow."""
     try:
@@ -348,7 +596,7 @@ async def _run_second_brain_heartbeat(
                 f"Give a brief (2-3 sentence) status assessment of the system and knowledge base."
                 + goals_suffix
             )
-        status_result = await _run_step(agent, "status_check", status_prompt, state, seen_fps=seen_fps)
+        status_result = await _run_step(agent, "status_check", status_prompt, state, seen_fps=seen_fps, _text_sink=_text_sink)
 
         # Step 2: Capture — structured JSON note
         capture_prompt = load_prompt(
@@ -369,10 +617,11 @@ async def _run_second_brain_heartbeat(
                 f'"tags": ["tag1", "tag2"], "category": "resources"}}\n'
                 f"Return ONLY the JSON object, no extra text."
             )
-        capture_result = await _run_step(agent, "capture", capture_prompt, state, seen_fps=seen_fps)
+        capture_result = await _run_step(agent, "capture", capture_prompt, state, seen_fps=seen_fps, _text_sink=_text_sink)
         note_id = _store_capture(
             brain, capture_result,
             persona_name=persona.name,
+            capture_policy=_effective_capture_policy(persona),
             heartbeat_number=state.execution_count,
         )
         if note_id:
@@ -396,7 +645,7 @@ async def _run_second_brain_heartbeat(
                     f"Return as JSON: {{\"from\": \"<id>\", \"to\": \"<id>\", \"reason\": \"...\"}}\n"
                     f"Return ONLY the JSON object, no extra text."
                 )
-            connect_result = await _run_step(agent, "connect", connect_prompt, state, seen_fps=seen_fps)
+            connect_result = await _run_step(agent, "connect", connect_prompt, state, seen_fps=seen_fps, _text_sink=_text_sink)
             _store_connection(brain, connect_result)
 
         # Step 3b (conditional): Consolidate — promote notes to wiki pages
@@ -443,7 +692,7 @@ async def _run_second_brain_heartbeat(
                 + ("\nEvaluate progress on active goals — should any be advanced, completed, or abandoned?"
                    if goals_block else "")
             )
-        review_result = await _run_step(agent, "review", review_prompt, state, seen_fps=seen_fps)
+        review_result = await _run_step(agent, "review", review_prompt, state, seen_fps=seen_fps, _text_sink=_text_sink)
         brain.last_review = datetime.now(timezone.utc).isoformat()
         brain.review_log.append({
             "timestamp": brain.last_review,
@@ -613,7 +862,8 @@ def _apply_wiki_lint(brain: BrainState, raw: str) -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 async def _run_freeform_heartbeat(
-    agent, state: AgentState, brain: BrainState, config: AppConfig, persona: Persona
+    agent, state: AgentState, brain: BrainState, config: AppConfig, persona: Persona,
+    *, _text_sink: list[str] | None = None,
 ) -> None:
     """Three-step free-form workflow for action-oriented personas.
 
@@ -655,7 +905,7 @@ async def _run_freeform_heartbeat(
                 f"Give a brief (2-3 sentence) status assessment relevant to your role."
                 + goals_suffix
             )
-        status_result = await _run_step(agent, "status_check", status_prompt, state, seen_fps=seen_fps)
+        status_result = await _run_step(agent, "status_check", status_prompt, state, seen_fps=seen_fps, _text_sink=_text_sink)
 
         # Step 2: Main task — fully freeform, tools available
         task_prompt = load_prompt(
@@ -668,7 +918,7 @@ async def _run_freeform_heartbeat(
                 f"Status: {status_result[:200]}\n\n"
                 f"{persona.heartbeat_task}"
             )
-        task_result = await _run_step(agent, "task", task_prompt, state, seen_fps=seen_fps)
+        task_result = await _run_step(agent, "task", task_prompt, state, seen_fps=seen_fps, _text_sink=_text_sink)
 
         # Step 3: Capture — save a plain-text insight to the brain
         capture_prompt = load_prompt(
@@ -684,10 +934,11 @@ async def _run_freeform_heartbeat(
                 f'"tags": ["tag1", "tag2"], "category": "resources"}}\n'
                 f"Return ONLY the JSON object, no extra text."
             )
-        capture_result = await _run_step(agent, "capture", capture_prompt, state, seen_fps=seen_fps)
+        capture_result = await _run_step(agent, "capture", capture_prompt, state, seen_fps=seen_fps, _text_sink=_text_sink)
         note_id = _store_capture(
             brain, capture_result,
             persona_name=persona.name,
+            capture_policy=_effective_capture_policy(persona),
             heartbeat_number=state.execution_count,
         )
         if note_id:
@@ -716,7 +967,7 @@ async def _run_freeform_heartbeat(
                 + ("\nEvaluate progress on active goals — should any be advanced, completed, or abandoned?"
                    if goals_block else "")
             )
-        review_result = await _run_step(agent, "review", review_prompt, state, seen_fps=seen_fps)
+        review_result = await _run_step(agent, "review", review_prompt, state, seen_fps=seen_fps, _text_sink=_text_sink)
         brain.last_review = datetime.now(timezone.utc).isoformat()
         brain.review_log.append({
             "timestamp": brain.last_review,
@@ -732,7 +983,8 @@ async def _run_freeform_heartbeat(
 # ──────────────────────────────────────────────────────────────────────
 
 async def _run_steps_heartbeat(
-    agent, state: AgentState, brain: BrainState, config: AppConfig, persona: Persona
+    agent, state: AgentState, brain: BrainState, config: AppConfig, persona: Persona,
+    *, _text_sink: list[str] | None = None,
 ) -> None:
     """Execute persona-defined steps from mcp.json.
 
@@ -759,7 +1011,7 @@ async def _run_steps_heartbeat(
                 "Persona '%s' has workflow=steps but no steps defined; falling back to freeform",
                 persona.name,
             )
-            await _run_freeform_heartbeat(agent, state, brain, config, persona)
+            await _run_freeform_heartbeat(agent, state, brain, config, persona, _text_sink=_text_sink)
             return
 
         brain_summary = build_brain_summary(brain, max_notes=5)
@@ -771,9 +1023,9 @@ async def _run_steps_heartbeat(
 
         seen_fps: set[str] = set()
         if persona.stepwise:
-            await _run_one_step(agent, state, brain, config, persona, brain_summary, default_context, seen_fps=seen_fps)
+            await _run_one_step(agent, state, brain, config, persona, brain_summary, default_context, seen_fps=seen_fps, _text_sink=_text_sink)
         else:
-            await _run_all_steps(agent, state, brain, persona, brain_summary, default_context, seen_fps=seen_fps)
+            await _run_all_steps(agent, state, brain, persona, brain_summary, default_context, seen_fps=seen_fps, _text_sink=_text_sink)
 
         brain.last_review = datetime.now(timezone.utc).isoformat()
     except Exception as e:
@@ -784,7 +1036,7 @@ async def _run_steps_heartbeat(
 async def _run_all_steps(
     agent, state: AgentState, brain: BrainState, persona: Persona,
     brain_summary: str, initial_prev: str,
-    *, seen_fps: set[str] | None = None,
+    *, seen_fps: set[str] | None = None, _text_sink: list[str] | None = None,
 ) -> None:
     """Run all persona steps in a single heartbeat cycle."""
     try:
@@ -794,11 +1046,11 @@ async def _run_all_steps(
             prompt = step_def.get("prompt", "").replace("{prev}", prev).replace("{brain}", brain_summary)
             store = step_def.get("storeToBrain", False)
 
-            result = await _run_step(agent, name, prompt, state, seen_fps=seen_fps)
+            result = await _run_step(agent, name, prompt, state, seen_fps=seen_fps, _text_sink=_text_sink)
             prev = result
 
             if store:
-                await _distil_to_brain(agent, state, brain, name, result, persona_name=persona.name)
+                await _distil_to_brain(agent, state, brain, name, result, persona=persona)
     except Exception as e:
         logger.error("Error in _run_all_steps: %s", str(e))
         logger.debug("Error details:", exc_info=True)
@@ -807,7 +1059,7 @@ async def _run_all_steps(
 async def _run_one_step(
     agent, state: AgentState, brain: BrainState, config: AppConfig, persona: Persona,
     brain_summary: str, default_context: str,
-    *, seen_fps: set[str] | None = None,
+    *, seen_fps: set[str] | None = None, _text_sink: list[str] | None = None,
 ) -> None:
     """Run exactly one step this heartbeat, advancing the stepwise pointer."""
     try:
@@ -835,14 +1087,14 @@ async def _run_one_step(
         logger.info("[steps] Persona '%s': step %d/%d — %s", persona.name, idx + 1, total, name)
 
         prompt = step_def.get("prompt", "").replace("{prev}", prev).replace("{brain}", brain_summary)
-        result = await _run_step(agent, name, prompt, state, seen_fps=seen_fps)
+        result = await _run_step(agent, name, prompt, state, seen_fps=seen_fps, _text_sink=_text_sink)
 
         # Persist progress for the next heartbeat
         state.context[idx_key] = idx + 1
         state.context[prev_key] = result[:2000]  # cap stored context size
 
         if store:
-            await _distil_to_brain(agent, state, brain, name, result, persona_name=persona.name)
+            await _distil_to_brain(agent, state, brain, name, result, persona=persona)
     except Exception as e:
         logger.error("Error in _run_one_step: %s", str(e))
         logger.debug("Error details:", exc_info=True)
@@ -850,7 +1102,7 @@ async def _run_one_step(
 
 async def _distil_to_brain(
     agent, state: AgentState, brain: BrainState, step_name: str, result: str,
-    *, persona_name: str = "",
+    *, persona: Persona,
 ) -> None:
     """Ask the agent to extract an insight and store it as a brain note."""
     try:
@@ -870,9 +1122,10 @@ async def _distil_to_brain(
         distil_result = await _run_step(agent, f"{step_name}_capture", distil_prompt, state)
         note_id = _store_capture(
             brain, distil_result,
-            persona_name=persona_name,
+            persona_name=persona.name,
             heartbeat_number=state.execution_count,
             step=step_name,
+            capture_policy=_effective_capture_policy(persona),
         )
         if note_id:
             logger.info("[%s] stored as note %s", step_name, note_id)
@@ -885,8 +1138,65 @@ async def _distil_to_brain(
 # Mode 4: coordinator (multi-persona orchestration)
 # ──────────────────────────────────────────────────────────────────────
 
+
+def _build_task_board_block(tasks: list, roster: list[str]) -> str:
+    """Format a task-board summary for the coordinator synthesis prompt."""
+    from tasks import (
+        Task,
+        active_file_locks,
+        get_all_pending_tasks,
+        get_active_task,
+        get_blocked_tasks,
+        unmet_dependencies,
+    )
+
+    lines: list[str] = ["== TASK BOARD =="]
+
+    # Per-persona active work
+    for pname in roster:
+        active = get_active_task(tasks, pname)
+        if active:
+            locks = ", ".join(active.file_locks[:5]) if active.file_locks else "(none)"
+            lines.append(
+                f"  @{pname}: [{active.id}] {active.title} "
+                f"({active.heartbeats_spent}/{active.max_heartbeats} hb, locks: {locks})"
+            )
+        else:
+            lines.append(f"  @{pname}: idle")
+
+    # Pending queue
+    pending = get_all_pending_tasks(tasks)
+    if pending:
+        lines.append(f"\nPending ({len(pending)}):")
+        for t in pending[:8]:
+            target = f" ->@{t.target_persona}" if t.target_persona else ""
+            deps = ""
+            unmet = unmet_dependencies(t, tasks)
+            if unmet:
+                deps = f" [waiting: {','.join(unmet)}]"
+            lines.append(f"  [{t.id}] {t.title}{target}{deps}")
+
+    # Blocked
+    blocked = get_blocked_tasks(tasks)
+    if blocked:
+        lines.append(f"\nBlocked ({len(blocked)}):")
+        for t in blocked[:5]:
+            q = t.questions[-1].get("question", "")[:60] if t.questions else "?"
+            lines.append(f"  [{t.id}] {t.title} — Q: {q}")
+
+    # File lock summary
+    locks = active_file_locks(tasks)
+    if locks:
+        lines.append(f"\nFile locks ({len(locks)}):")
+        for path, tid in sorted(locks.items())[:10]:
+            lines.append(f"  {path} <- {tid}")
+
+    return "\n".join(lines)
+
+
 async def _run_coordinator_heartbeat(
-    agent, state: AgentState, brain: BrainState, config: AppConfig, persona: Persona
+    agent, state: AgentState, brain: BrainState, config: AppConfig, persona: Persona,
+    *, _text_sink: list[str] | None = None,
 ) -> None:
     """Run one or all personas from the roster and synthesise outputs.
 
@@ -894,7 +1204,15 @@ async def _run_coordinator_heartbeat(
     --------------
     round_robin  Run the next persona in the roster (cycles).
     all          Run every persona in sequence, then synthesise.
+    task_routed  Only run personas that have routed tasks waiting.
     """
+    from tasks import (
+        check_file_conflicts,
+        get_active_task,
+        get_pending_tasks as get_pending_tasks_fn,
+        load_tasks,
+    )
+
     try:
         roster = persona.roster
         if not roster:
@@ -908,7 +1226,22 @@ async def _run_coordinator_heartbeat(
         schedule = persona.schedule or "round_robin"
         idx_key = f"coordinator_{persona.name}_idx"
 
-        if schedule == "round_robin":
+        tasks = await load_tasks(config.state_file)
+
+        if schedule == "task_routed":
+            # Only run personas that have routed pending tasks or active work
+            selected = []
+            for pname in roster:
+                has_active = get_active_task(tasks, pname) is not None
+                has_pending = len(get_pending_tasks_fn(tasks, pname)) > 0
+                if has_active or has_pending:
+                    selected.append(pname)
+            if not selected:
+                # Nothing routed; fall back to round_robin for general work
+                idx = state.context.get(idx_key, 0) % len(roster)
+                selected = [roster[idx]]
+                state.context[idx_key] = idx + 1
+        elif schedule == "round_robin":
             idx = state.context.get(idx_key, 0) % len(roster)
             selected = [roster[idx]]
             state.context[idx_key] = idx + 1
@@ -919,8 +1252,25 @@ async def _run_coordinator_heartbeat(
         for pname in selected:
             try:
                 sub_persona = load_persona(pname)
+
+                # Check for file lock conflicts before running
+                active = get_active_task(tasks, pname)
+                if active and active.file_locks:
+                    conflicts = check_file_conflicts(active, tasks)
+                    if conflicts:
+                        conflict_detail = ", ".join(
+                            f"{p} (held by {tid})" for p, tid in conflicts
+                        )
+                        logger.warning(
+                            "[coordinator] Skipping '%s': file conflicts — %s",
+                            pname, conflict_detail,
+                        )
+                        outputs.append(
+                            f"{pname}: SKIPPED — file lock conflict ({conflict_detail})"
+                        )
+                        continue
+
                 logger.info("[coordinator] Running sub-persona '%s'", pname)
-                # Delegate to the sub-persona's own workflow
                 await run_heartbeat(agent, state, brain, config, sub_persona)
                 outputs.append(f"{pname}: completed heartbeat")
             except Exception as sub_err:
@@ -929,6 +1279,8 @@ async def _run_coordinator_heartbeat(
 
         # Synthesis step — summarise across all persona outputs
         goals_block = build_goals_block(state)
+        task_board = _build_task_board_block(tasks, roster)
+
         synth_prompt = load_prompt(
             "coordinator", "synthesis",
             agent_name=config.agent_name,
@@ -938,6 +1290,7 @@ async def _run_coordinator_heartbeat(
             note_count=len(brain.notes),
             connection_count=len(brain.connections),
             goals_block=goals_block,
+            task_board=task_board,
         )
         if not synth_prompt:
             synth_prompt = (
@@ -945,12 +1298,20 @@ async def _run_coordinator_heartbeat(
                 f"Heartbeat #{state.execution_count}.\n"
                 f"Personas run this cycle: {', '.join(selected)}\n"
                 f"Results:\n" + "\n".join(f"  - {o}" for o in outputs) + "\n\n"
+                f"{task_board}\n\n"
                 f"Brain has {len(brain.notes)} notes, {len(brain.connections)} connections.\n"
                 f"{goals_block}\n\n"
-                f"Write a 2-3 sentence synthesis of what was accomplished and what to focus next."
+                "Synthesise what was accomplished. If you want to delegate work to a "
+                "specific persona, return JSON: {\"delegate\": [{\"persona\": \"name\", "
+                "\"task\": \"description\", \"files\": [\"path\", ...]}]}\n"
+                "Otherwise write a 2-3 sentence synthesis of progress and next focus."
             )
         seen_fps: set[str] = set()
-        synth_result = await _run_step(agent, "coordinator_synthesis", synth_prompt, state, seen_fps=seen_fps)
+        synth_result = await _run_step(agent, "coordinator_synthesis", synth_prompt, state, seen_fps=seen_fps, _text_sink=_text_sink)
+
+        # Parse delegation instructions from synthesis output
+        await _process_coordinator_delegations(synth_result, config, roster)
+
         brain.last_review = datetime.now(timezone.utc).isoformat()
         brain.review_log.append({
             "timestamp": brain.last_review,
@@ -959,6 +1320,91 @@ async def _run_coordinator_heartbeat(
     except Exception as e:
         logger.error("Error in coordinator workflow: %s", str(e))
         logger.debug("Workflow error details:", exc_info=True)
+
+
+async def _process_coordinator_delegations(
+    synth_result: str, config: AppConfig, roster: list[str],
+) -> None:
+    """If the synthesis output contains delegation JSON, create routed tasks."""
+    from tasks import create_task, load_tasks, save_tasks
+
+    try:
+        delegations = _extract_delegations(synth_result, roster)
+    except Exception:
+        return
+    if not delegations:
+        return
+
+    from handoff import build_handoff_from_delegation
+    tasks = await load_tasks(config.state_file)
+    created = 0
+    for d in delegations:
+        task = create_task(
+            title=d["task"],
+            description=d["task"],
+            target_persona=d["persona"],
+        )
+        if d.get("files"):
+            task.file_locks = list(d["files"])
+        # Move B: attach structured handoff context when coordinator provides it
+        hc = build_handoff_from_delegation(d)
+        if hc:
+            task.handoff_context = hc.to_dict()
+        tasks.append(task)
+        created += 1
+        logger.info(
+            "[coordinator] Delegated task %s to @%s: %s",
+            task.id, d["persona"], d["task"][:80],
+        )
+    if created:
+        await save_tasks(tasks, config.state_file)
+
+
+def _extract_delegations(text: str, roster: list[str]) -> list[dict]:
+    """Parse delegation JSON from coordinator synthesis output."""
+    # Try each '{' as a potential JSON object start
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        # Find matching closing brace via depth counting
+        depth = 0
+        for j in range(i, len(text)):
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+            if depth == 0:
+                candidate = text[i : j + 1]
+                try:
+                    data = json.loads(candidate)
+                except (json.JSONDecodeError, TypeError):
+                    break
+                raw = data.get("delegate")
+                if not isinstance(raw, list):
+                    break
+                valid = []
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    pname = str(item.get("persona", "")).strip()
+                    task_text = str(item.get("task", "")).strip()
+                    if pname and task_text and pname in roster:
+                        files = item.get("files", [])
+                        if not isinstance(files, list):
+                            files = []
+                        valid.append({
+                            "persona": pname,
+                            "task": task_text,
+                            "files": [str(f) for f in files[:20] if f],
+                            # Move B: pass through handoff context fields
+                            "context": str(item.get("context", "")),
+                            "findings": item.get("findings", []),
+                            "brain_note_ids": item.get("brain_note_ids", []),
+                            "open_questions": item.get("open_questions", []),
+                            "recommendations": item.get("recommendations", []),
+                        })
+                return valid
+    return []
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1010,27 +1456,6 @@ def _coerce_confidence(value: object) -> int | None:
     return max(0, min(100, score))
 
 
-def _has_required_observer_evidence(evidence: list[str]) -> bool:
-    """Workspace observer evidence must include commit hash or file path."""
-    for item in evidence:
-        text = item.strip()
-        if not text:
-            continue
-        lowered = text.lower()
-        # Commit-style evidence: explicit keyword or sha-like token.
-        if "commit" in lowered:
-            return True
-        compact = text.replace(" ", "")
-        if len(compact) >= 7 and all(c in "0123456789abcdefABCDEF" for c in compact[:12]):
-            return True
-        # File-style evidence: path separator or known source/doc suffix.
-        if "/" in text or "\\" in text:
-            return True
-        if lowered.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".md", ".json", ".yml", ".yaml")):
-            return True
-    return False
-
-
 def _parse_iso_utc(value: object) -> datetime | None:
     """Parse an ISO timestamp to timezone-aware UTC datetime."""
     if not value:
@@ -1044,20 +1469,21 @@ def _parse_iso_utc(value: object) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
-def _find_recent_observer_note_by_evidence(
+def _find_recent_note_by_evidence_overlap(
     brain: BrainState,
     evidence: list[str],
     *,
-    window_minutes: int = 20,
+    persona_name: str,
+    window_minutes: int,
 ) -> str | None:
-    """Find a recent workspace_observer note that overlaps evidence paths."""
-    if not evidence:
+    """Find a recent note from *persona_name* whose evidence overlaps *evidence*."""
+    if not evidence or not persona_name or window_minutes <= 0:
         return None
     now = datetime.now(timezone.utc)
     evidence_set = {item.lower() for item in evidence}
     for note_id, note in reversed(list(brain.notes.items())):
         source = note.get("source")
-        if not isinstance(source, dict) or source.get("persona") != "workspace_observer":
+        if not isinstance(source, dict) or source.get("persona") != persona_name:
             continue
         created_at = _parse_iso_utc(note.get("created_at"))
         if created_at is None:
@@ -1079,6 +1505,7 @@ def _store_capture(
     raw: str,
     *,
     persona_name: str = "",
+    capture_policy: CapturePolicy | None = None,
     heartbeat_number: int = 0,
     step: str = "capture",
 ) -> str | None:
@@ -1087,12 +1514,13 @@ def _store_capture(
     If a near-duplicate note already exists, the existing note is updated
     instead of creating a new one.
     """
+    cap = capture_policy or DEFAULT_CAPTURE_POLICY
     try:
         data = _extract_json(raw, required_key="content")
         if data is None:
             logger.warning("_store_capture: no JSON object with 'content' key found")
-            if persona_name == "workspace_observer":
-                logger.warning("_store_capture: dropping workspace_observer note without JSON capture")
+            if cap.reject_if_no_json:
+                logger.warning("_store_capture: reject_if_no_json — dropping capture without JSON")
                 return None
             return add_note(brain, content=raw[:300], source="heartbeat")
         content = data.get("content", raw[:300])
@@ -1108,12 +1536,11 @@ def _store_capture(
             evidence_list = [text] if text else []
 
         confidence = _coerce_confidence(data.get("confidence"))
-        is_workspace_observer = persona_name == "workspace_observer"
-        has_required_evidence = _has_required_observer_evidence(evidence_list)
+        has_required_evidence = has_substantive_evidence(evidence_list)
         low_quality = not has_required_evidence
-        if is_workspace_observer and low_quality:
+        if cap.reject_if_missing_evidence and low_quality:
             logger.warning(
-                "_store_capture: dropping workspace_observer note missing required evidence"
+                "_store_capture: reject_if_missing_evidence — dropping capture without substantive evidence"
             )
             return None
         if low_quality and "low_quality" not in tags:
@@ -1128,8 +1555,13 @@ def _store_capture(
         elif confidence is None:
             confidence = 70
 
-        if is_workspace_observer and evidence_list:
-            recent_dup_id = _find_recent_observer_note_by_evidence(brain, evidence_list)
+        if cap.evidence_burst_merge_window_minutes > 0 and evidence_list and persona_name:
+            recent_dup_id = _find_recent_note_by_evidence_overlap(
+                brain,
+                evidence_list,
+                persona_name=persona_name,
+                window_minutes=cap.evidence_burst_merge_window_minutes,
+            )
             if recent_dup_id:
                 existing = brain.notes[recent_dup_id]
                 existing["content"] = content
@@ -1150,9 +1582,10 @@ def _store_capture(
                     assign_note_to_topic(brain, recent_dup_id, tag)
                 _relate_cooccurring_tags(brain, tags)
                 logger.info(
-                    "[capture] merged observer burst note into %s (evidence overlap)",
+                    "[capture] merged burst note into %s (evidence overlap)",
                     recent_dup_id,
                 )
+                run_after_capture_hook(cap.after_capture, brain, recent_dup_id)
                 return recent_dup_id
 
         # Dedup check — merge into existing note if near-duplicate
@@ -1185,6 +1618,7 @@ def _store_capture(
                 index_note(dup_id, brain.notes[dup_id])
             except Exception:
                 pass
+            run_after_capture_hook(cap.after_capture, brain, dup_id)
             return dup_id
 
         source_meta: dict | str = {
@@ -1213,13 +1647,14 @@ def _store_capture(
             for tag in tags:
                 assign_note_to_topic(brain, note_id, tag)
             _relate_cooccurring_tags(brain, tags)
+            run_after_capture_hook(cap.after_capture, brain, note_id)
 
         return note_id
     except (json.JSONDecodeError, AttributeError, UnicodeDecodeError) as e:
         logger.warning("_store_capture failed to parse JSON: %s", str(e))
         logger.debug("JSON parsing error details:", exc_info=True)
-        if persona_name == "workspace_observer":
-            logger.warning("_store_capture: dropping workspace_observer note on parse failure")
+        if cap.reject_on_parse_failure:
+            logger.warning("_store_capture: reject_on_parse_failure — dropping capture on parse failure")
             return None
         try:
             return add_note(brain, content=raw[:300], source="heartbeat")

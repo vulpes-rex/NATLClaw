@@ -29,14 +29,14 @@ def drain_events() -> str:
     Events are newline-delimited JSON objects appended by file watchers
     and git hooks between heartbeats.
     """
-    queue: asyncio.PriorityQueue[tuple[int, str, dict]] = asyncio.PriorityQueue()
+    queue: asyncio.PriorityQueue[tuple[int, int, str, dict]] = asyncio.PriorityQueue()
     drained = event_watcher.drain_pending_events(queue)
     if drained <= 0:
         return "No pending events."
     records: list[str] = []
     while not queue.empty():
         try:
-            priority, event_type, payload = queue.get_nowait()
+            priority, _seq, event_type, payload = queue.get_nowait()
         except asyncio.QueueEmpty:
             break
         records.append(
@@ -75,6 +75,41 @@ def read_git_log(
         return "git log timed out"
     except Exception as e:
         return f"Git log failed: {e}"
+
+
+def run_git_log(
+    count: Annotated[int, "Number of recent commits to show"] = 10,
+) -> str:
+    """Alias for :func:`read_git_log` — some clients expect this tool name."""
+    return read_git_log(count)
+
+
+def analyse_current_git_commit() -> str:
+    """Inspect the latest commit (same as ``read_git_log(1)``)."""
+    return read_git_log(1)
+
+
+def ingest() -> str:
+    """Scheduler step ``ingest`` — use drain_events, read_git_log, codenav list_files/get_file_structure."""
+    return (
+        "For the ingest step, use drain_events and read_git_log, then codenav tools as listed in the prompt; "
+        "write your bullet summary as the step output."
+    )
+
+
+def analyse() -> str:
+    """Scheduler step ``analyse`` — use codenav get_symbols, get_call_graph, find_references; then JSON."""
+    return (
+        "For the analyse step, use codenav tools per the prompt, then return the JSON object required."
+    )
+
+
+def connect() -> str:
+    """Scheduler step ``connect`` — link two notes using IDs from ``{brain}``."""
+    return (
+        "For the connect step, use note IDs from the brain summary; "
+        'reply with JSON {"from","to","reason"}.'
+    )
 
 
 def read_git_diff(

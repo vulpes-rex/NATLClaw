@@ -316,6 +316,29 @@ def get_active_work_snapshot(project: Project, *, max_files: int = 5) -> dict[st
     }
 
 
+def format_active_work_search_query(
+    snapshot: dict[str, Any] | None, *, max_len: int = 800
+) -> str:
+    """Flatten active-work snapshot into a short string for semantic / hybrid brain retrieval."""
+    if not snapshot or not isinstance(snapshot, dict):
+        return ""
+    parts: list[str] = []
+    ci = (snapshot.get("commit_intent") or "").strip()
+    if ci:
+        parts.append(ci)
+    summ = (snapshot.get("summary") or "").strip()
+    if summ:
+        parts.append(summ)
+    for f in (snapshot.get("files") or [])[:8]:
+        if f:
+            parts.append(str(f))
+    br = snapshot.get("branch")
+    if br and str(br) not in " ".join(parts):
+        parts.append(str(br))
+    text = " ".join(parts).strip()
+    return text[:max_len]
+
+
 def save_project(project: Project, state_file: str) -> None:
     """Save project metadata to disk."""
     projects_file = os.path.join(os.path.dirname(state_file), "projects.json")

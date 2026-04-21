@@ -36,14 +36,14 @@ def drain_events() -> str:
     Events are newline-delimited JSON objects appended by file watchers
     and git hooks between heartbeats.
     """
-    queue: asyncio.PriorityQueue[tuple[int, str, dict]] = asyncio.PriorityQueue()
+    queue: asyncio.PriorityQueue[tuple[int, int, str, dict]] = asyncio.PriorityQueue()
     drained = event_watcher.drain_pending_events(queue)
     if drained <= 0:
         return "No pending events."
     records: list[str] = []
     while not queue.empty():
         try:
-            priority, event_type, payload = queue.get_nowait()
+            priority, _seq, event_type, payload = queue.get_nowait()
         except asyncio.QueueEmpty:
             break
         records.append(
@@ -82,6 +82,13 @@ def read_git_log(
         return "git log timed out"
     except Exception as e:
         return f"Git log failed: {e}"
+
+
+def run_git_log(
+    count: Annotated[int, "Number of recent commits to show"] = 10,
+) -> str:
+    """Alias for :func:`read_git_log` — some clients expect this tool name."""
+    return read_git_log(count)
 
 
 def read_git_diff(
@@ -127,6 +134,63 @@ def read_git_branch() -> str:
         )
     except Exception as e:
         return f"Could not read branches: {e}"
+
+
+def analyse_current_git_commit() -> str:
+    """Inspect the latest commit (same output shape as ``read_git_log(1)``)."""
+    return read_git_log(1)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Step-name compatibility (some hosts list scheduler step labels as tools)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def gather() -> str:
+    """Scheduler step label ``gather`` — use drain_events, read_git_log, read_git_branch, list_recently_modified."""
+    return (
+        "For the gather step, call drain_events, read_git_log, read_git_branch, list_recently_modified; "
+        "then write your bullet summary as the step output."
+    )
+
+
+def analyse() -> str:
+    """Scheduler step label ``analyse`` — use read_git_diff, scan_todos, read_file, read_git_log; then return step JSON."""
+    return (
+        "For the analyse step, call read_git_diff / scan_todos / read_file / read_git_log as needed; "
+        "then return the JSON object required by the analyse step prompt."
+    )
+
+
+def connect() -> str:
+    """Scheduler step label ``connect`` — link notes using IDs from ``{brain}`` in the prompt."""
+    return (
+        "For the connect step, use note IDs from the brain summary in your instructions; "
+        'reply with JSON {"from","to","reason"} or {"skip":true}.'
+    )
+
+
+def observer_step_gather() -> str:
+    """Same guidance as :func:`gather` — use if the host omits short tool names."""
+    return gather()
+
+
+def observer_step_analyse() -> str:
+    """Same guidance as :func:`analyse` — use if the host omits short tool names."""
+    return analyse()
+
+
+def observer_step_connect() -> str:
+    """Same guidance as :func:`connect` — use if the host blocks the name ``connect``."""
+    return connect()
+
+
+def analyse_capture() -> str:
+    """When the UI shows ``analyse_capture`` — still the analyse step + brain capture; use git/file tools then return JSON."""
+    return (
+        "This is the analyse step with storeToBrain: use read_git_diff, scan_todos, read_file, read_git_log; "
+        "then return the JSON object (content, tags, evidence, confidence) required by the prompt."
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -21,6 +21,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from capture_policy import DEFAULT_CAPTURE_POLICY
+
 # Mock external dependencies before importing workflow
 with patch.dict("sys.modules", {
     "agent_framework_github_copilot": MagicMock(),
@@ -80,6 +82,7 @@ def config():
     cfg.state_file = "data/test.json"
     cfg.max_history = 100
     cfg.agent_instructions = ""
+    cfg.task_negotiation_enabled = False
     return cfg
 
 
@@ -655,7 +658,7 @@ class TestCoordinatorHeartbeat:
         agent = _json_agent("synth")
         call_log = []
 
-        async def mock_run_hb(ag, st, br, cfg, pers):
+        async def mock_run_hb(ag, st, br, cfg, pers, **_kw):
             call_log.append(pers.name)
 
         mock_sub_x = MagicMock()
@@ -717,14 +720,20 @@ class TestDistilToBrain:
             "category": "resources",
         })
         agent = _json_agent(distil_json)
+        persona = MagicMock()
+        persona.name = "tester"
+        persona.capture_policy = DEFAULT_CAPTURE_POLICY
 
-        asyncio.run(_distil_to_brain(agent, state, brain, "test_step", "Some output"))
+        asyncio.run(_distil_to_brain(agent, state, brain, "test_step", "Some output", persona=persona))
         assert len(brain.notes) == 1
 
     def test_exception_does_not_crash(self, state, brain):
         agent = MagicMock()
         agent.run = AsyncMock(side_effect=Exception("distil failed"))
-        asyncio.run(_distil_to_brain(agent, state, brain, "test_step", "output"))
+        persona = MagicMock()
+        persona.name = "tester"
+        persona.capture_policy = DEFAULT_CAPTURE_POLICY
+        asyncio.run(_distil_to_brain(agent, state, brain, "test_step", "output", persona=persona))
         # Should not raise
 
     def test_persona_name_passed_through(self, state, brain):
@@ -735,9 +744,12 @@ class TestDistilToBrain:
             "category": "resources",
         })
         agent = _json_agent(distil_json)
+        persona = MagicMock()
+        persona.name = "dev"
+        persona.capture_policy = DEFAULT_CAPTURE_POLICY
 
         asyncio.run(_distil_to_brain(
-            agent, state, brain, "step", "output", persona_name="dev"
+            agent, state, brain, "step", "output", persona=persona,
         ))
         note = list(brain.notes.values())[0]
         assert note["source"]["persona"] == "dev"
